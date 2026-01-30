@@ -1214,7 +1214,7 @@ def _parse_openai_error(resp: requests.Response) -> Tuple[str, str]:
     except Exception:
         return "error", resp.text
 
-def call_openai_chat_json(system: str, user: str, model: str = "gpt-4.1-mini", temperature: float = 0.2) -> Dict[str, Any]:
+def call_openai_chat_json(system: str, user: str, model: str = "gpt-5.2", temperature: float = 0.2) -> Dict[str, Any]:
     api_key = os.environ.get("LLM_API_KEY")
     if not api_key:
         raise RuntimeError("Missing API key. Set environment variable LLM_API_KEY.")
