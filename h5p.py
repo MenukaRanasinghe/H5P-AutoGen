@@ -1,4 +1,4 @@
-
+import math
 import os
 import re
 import json
@@ -35,6 +35,15 @@ if "LLM_API_KEY" in st.secrets and not os.environ.get("LLM_API_KEY"):
 
 if "FREEPIK_API_KEY" in st.secrets and not os.environ.get("FREEPIK_API_KEY"):
     os.environ["FREEPIK_API_KEY"] = st.secrets["FREEPIK_API_KEY"]
+
+# Re-read keys after Streamlit secrets injection (globals above were read before os.environ was updated)
+LLM_API_KEY = os.getenv("LLM_API_KEY") or LLM_API_KEY
+FREEPIK_API_KEY = os.getenv("FREEPIK_API_KEY") or FREEPIK_API_KEY
+
+# Freepik API configuration
+FREEPIK_API_BASE = os.getenv("FREEPIK_API_BASE", "https://api.freepik.com/v1").rstrip("/")
+FREEPIK_LANG = os.getenv("FREEPIK_LANG", "en-US")
+FREEPIK_DEFAULT_IMAGE_SIZE = os.getenv("FREEPIK_IMAGE_SIZE", "large")  # small|medium|large|original or px string
 
 # Filter out files that are likely to contain text overlays, logos, icons, diagrams, banners, etc.
 _BAD_TITLE_TERMS = {
@@ -128,128 +137,203 @@ def wikimedia_find_image_url(query: str, limit: int = 25) -> Optional[Dict[str, 
         url = info.get("url")
         if not url or w < 450 or h < 300:
             continue
+def _freepik_headers() -> Dict[str, str]:
+    """
+    Freepik expects the API key in `x-freepik-api-key` and optionally an Accept-Language header.
+    (Language defaults to "en-US" if you don't send one.)
+    """
+    h = {"User-Agent": USER_AGENT, "Accept-Language": FREEPIK_LANG}
+    if FREEPIK_API_KEY:
+        h["x-freepik-api-key"] = FREEPIK_API_KEY
+    return h
 
-        score = _title_score(title, q_terms)
-        # Hard reject completely irrelevant titles if we have terms and none match.
-        if q_terms and score == 0:
+
+def _freepik_build_params(
+    *,
+    term: str,
+    page: int,
+    limit: int,
+    order: str,
+    filters: Optional[Dict[str, Any]] = None,
+) -> List[Tuple[str, Any]]:
+    """
+    Freepik docs define `filters` as a query-object. In practice, APIs typically accept this as:
+      filters[content_type][]=photo&filters[license][]=freemium ...
+    We'll encode it this way (and fall back to JSON-string encoding if the API rejects it).
+    """
+    params: List[Tuple[str, Any]] = [("term", term), ("page", page), ("limit", limit), ("order", order)]
+
+    if not filters:
+        return params
+
+    for key, val in filters.items():
+        if val is None:
             continue
 
-        candidates.append({"url": url, "mime": mime, "width": w, "height": h, "title": title, "score": score})
+        # allow either list[str] (recommended) or dict[str,bool] (from some wrappers)
+        if isinstance(val, dict):
+            selected = [k for k, enabled in val.items() if enabled]
+            for v in selected:
+                params.append((f"filters[{key}][]", v))
+            continue
 
-    if not candidates:
-        return None
+        if isinstance(val, (list, tuple, set)):
+            for v in val:
+                params.append((f"filters[{key}][]", v))
+            continue
 
-    # Highest score first, then largest pixel area.
-    candidates.sort(key=lambda x: (x["score"], x["width"] * x["height"]), reverse=True)
-    return candidates[0]
+        params.append((f"filters[{key}]", val))
+
+    return params
 
 
-def _freepik_headers() -> Dict[str, str]:
-    return {
-        "User-Agent": USER_AGENT,
-        "x-freepik-api-key": FREEPIK_API_KEY,
-        "Accept-Language": FREEPIK_LANG,
-    }
+def _tokenise(s: str) -> List[str]:
+    return re.findall(r"[a-z0-9]+", (s or "").lower())
+
 
 def freepik_find_image_url(query: str, limit: int = 25) -> Optional[Dict[str, Any]]:
     """
     Search Freepik resources and return a best-match candidate dict:
-    {id, title, page_url, preview_url, author_name, license_url}
+      {id, title, page_url, preview_url, author_name, license_url, score}
 
-    Uses /v1/resources with the `term` parameter.
+    Uses:
+      - GET /v1/resources (search) to get candidates
+      - Heuristics (downloads/likes + text match) to approximate "website-like" ranking
     """
     if not FREEPIK_API_KEY:
         return None
+
     q = (query or "").strip()
     if not q:
         return None
 
-    params = {"term": q, "limit": min(max(int(limit), 1), 100), "order": "relevance"}
-    try:
-        r = requests.get(
-            f"{FREEPIK_API_BASE}/resources",
-            params=params,
-            headers=_freepik_headers(),
-            timeout=30,
+    url = f"{FREEPIK_API_BASE}/resources"
+
+    # Website search generally feels "better" because it can surface popular assets;
+    # the public API only offers `relevance` and `recent` ordering, so we pull a bigger pool
+    # and do our own lightweight popularity + textual scoring.
+    per_page = min(max(25, limit), 80)
+    max_pages = 3  # keep it small to avoid rate limits
+
+    # Start by preferring photos (common for course content), then relax if needed.
+    filter_sets: List[Optional[Dict[str, Any]]] = [
+        {"content_type": ["photo"]},
+        {"content_type": ["photo", "vector", "psd"]},
+    ]
+
+    q_tokens = set(_tokenise(q))
+
+    def score_item(item: Dict[str, Any]) -> float:
+        title = item.get("title") or ""
+        title_tokens = set(_tokenise(title))
+
+        # popularity proxies from API list response
+        stats = item.get("stats") or {}
+        downloads = int(stats.get("downloads") or 0)
+        likes = int(stats.get("likes") or 0)
+
+        overlap = len(q_tokens & title_tokens)
+        exact_phrase = 2.0 if q.lower() in title.lower() else 0.0
+
+        is_new = bool((item.get("meta") or {}).get("is_new"))
+        # final score (tune as you like)
+        return (
+            overlap * 5.0
+            + exact_phrase * 3.0
+            + math.log1p(downloads) * 2.0
+            + math.log1p(likes) * 1.0
+            + (1.0 if is_new else 0.0)
         )
-        r.raise_for_status()
+
+    best: Optional[Dict[str, Any]] = None
+    best_score: float = -1e9
+
+    for filters in filter_sets:
+        # gather candidates across pages
+        items: List[Dict[str, Any]] = []
+        for page in range(1, max_pages + 1):
+            params = _freepik_build_params(term=q, page=page, limit=per_page, order="relevance", filters=filters)
+            try:
+                r = requests.get(url, headers=_freepik_headers(), params=params, timeout=20)
+                # if the server doesn't like deepObject params, retry with JSON encoding
+                if r.status_code in (400, 422) and filters:
+                    r = requests.get(
+                        url,
+                        headers=_freepik_headers(),
+                        params={"term": q, "page": page, "limit": per_page, "order": "relevance", "filters": json.dumps(filters)},
+                        timeout=20,
+                    )
+                if r.status_code != 200:
+                    continue
+                data = r.json() or {}
+                items.extend(data.get("data") or [])
+                meta = data.get("meta") or {}
+                last_page = int(meta.get("last_page") or page)
+                if page >= last_page:
+                    break
+            except Exception:
+                continue
+
+        if not items:
+            continue
+
+        for item in items:
+            if (item.get("image") or {}).get("source", {}).get("url") is None:
+                continue
+            s = score_item(item)
+            if s > best_score:
+                best_score = s
+                best = item
+
+        if best:
+            break
+
+    if not best:
+        return None
+
+    img = best.get("image") or {}
+    src = (img.get("source") or {}).get("url")
+    author = best.get("author") or {}
+    licenses = best.get("licenses") or []
+
+    return {
+        "id": best.get("id"),
+        "title": best.get("title"),
+        "page_url": best.get("url"),
+        "preview_url": src,
+        "author_name": author.get("name"),
+        "license_url": (licenses[0].get("url") if licenses else None),
+        "score": round(best_score, 2),
+    }
+
+
+def freepik_download_signed_url(resource_id: int, image_size: str = None) -> Optional[Dict[str, Any]]:
+    """
+    Returns a dict with at least:
+      {signed_url, filename, url}
+
+    Uses GET /v1/resources/{resource-id}/download.
+    For photos you can request image_size: small|medium|large|original or "1000px".."2000px".
+    """
+    if not FREEPIK_API_KEY or not resource_id:
+        return None
+
+    url = f"{FREEPIK_API_BASE}/resources/{int(resource_id)}/download"
+    size = (image_size or FREEPIK_DEFAULT_IMAGE_SIZE or "").strip() or None
+
+    params: Dict[str, Any] = {}
+    if size:
+        params["image_size"] = size
+
+    try:
+        r = requests.get(url, headers=_freepik_headers(), params=params, timeout=30)
+        if r.status_code != 200:
+            return None
         data = r.json() or {}
+        return data.get("data") or None
     except Exception:
         return None
 
-    items = data.get("data") or []
-    if not isinstance(items, list) or not items:
-        return None
-
-    q_terms = _terms(q)
-    candidates: List[Dict[str, Any]] = []
-
-    for it in items:
-        img = it.get("image") or {}
-        img_type = (img.get("type") or "").lower()
-
-        # Prefer photos by default.
-        if img_type and img_type != "photo":
-            continue
-
-        src_obj = (img.get("source") or {})
-        preview_url = src_obj.get("url") or ""
-        if not preview_url.startswith("http"):
-            continue
-
-        title = it.get("title") or ""
-        score = _title_score(title, q_terms)
-        if q_terms and score == 0:
-            continue
-
-        author = it.get("author") or {}
-        author_name = author.get("name") or ""
-
-        licenses = it.get("licenses") or []
-        lic_url = ""
-        if isinstance(licenses, list) and licenses:
-            lic_url = (licenses[0] or {}).get("url") or ""
-
-        candidates.append(
-            {
-                "id": it.get("id"),
-                "title": title,
-                "page_url": it.get("url") or "",
-                "preview_url": preview_url,
-                "author_name": author_name,
-                "license_url": lic_url,
-                "score": score,
-            }
-        )
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
-    return candidates[0]
-
-def freepik_download_signed_url(resource_id: int, image_size: str = "large") -> Optional[Dict[str, Any]]:
-    """
-    Get a signed download URL for a Freepik resource via:
-    GET /v1/resources/{resource-id}/download
-
-    Returns a dict that usually contains `signed_url` (or `url`).
-    """
-    if not FREEPIK_API_KEY:
-        return None
-    try:
-        r = requests.get(
-            f"{FREEPIK_API_BASE}/resources/{int(resource_id)}/download",
-            params={"image_size": image_size},
-            headers=_freepik_headers(),
-            timeout=30,
-        )
-        r.raise_for_status()
-        data = r.json() or {}
-        d = data.get("data") or {}
-        return d if isinstance(d, dict) else None
-    except Exception:
-        return None
 
 _PLACEHOLDER_PNG_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO3G7qkAAAAASUVORK5CYII="
