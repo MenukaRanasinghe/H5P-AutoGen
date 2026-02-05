@@ -1,0 +1,92 @@
+{
+  "recommendations": [
+    {
+      "activity_type": "Course Presentation",
+      "score_0_to_5": 5,
+      "why": "Ideal for delivering structured content on statutory guidance, roles, and legislation in an engaging format.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "Chapter-01-Unit-01-7.pdf",
+        "locator": "Page 3",
+        "quote": "The SENCO plays a crucial role in ensuring that children with special educational needs and disabilities (SEND) receive the support they need in early years settings."
+      }
+    },
+    {
+      "activity_type": "Multiple Choice",
+      "score_0_to_5": 5,
+      "why": "Effective for assessing understanding of key legislation and statutory requirements such as the SEND Code of Practice and Equality Act.",
+      "suggested_item_count": 8,
+      "evidence": {
+        "source_file": "Chapter-01-Unit-01-7.pdf",
+        "locator": "Page 4",
+        "quote": "The provision for SEND is governed by key legislation, including the Children and Families Act 2014, the SEND Code of Practice (2015), and the Equality Act 2010."
+      }
+    },
+    {
+      "activity_type": "Fill in the Blanks",
+      "score_0_to_5": 4,
+      "why": "Useful for reinforcing terminology and key concepts such as the Graduated Approach and EHC plans.",
+      "suggested_item_count": 6,
+      "evidence": {
+        "source_file": "Chapter-01-Unit-01-7.pdf",
+        "locator": "Page 6",
+        "quote": "Early years settings must follow the Assess, Plan, Do, Review cycle."
+      }
+    },
+    {
+      "activity_type": "Summary",
+      "score_0_to_5": 4,
+      "why": "Helps learners consolidate knowledge on statutory compliance and key responsibilities of SENCOs.",
+      "suggested_item_count": 5,
+      "evidence": {
+        "source_file": "Chapter-01-Unit-01-7.pdf",
+        "locator": "Page 11",
+        "quote": "By meeting these requirements, early years settings create an inclusive environment where children with SEND receive early, targeted support."
+      }
+    },
+    {
+      "activity_type": "Dialog Cards",
+      "score_0_to_5": 4,
+      "why": "Supports memorization of definitions and key terms such as SEND categories and legislation.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "Chapter-01-Unit-01-7.pdf",
+        "locator": "Page 5",
+        "quote": "The SEND Code of Practice categorises them into four broad areas: Communication and Interaction, Cognition and Learning, Social, Emotional, and Mental Health, Sensory and Physical Needs."
+      }
+    },
+    {
+      "activity_type": "Interactive Book",
+      "score_0_to_5": 4,
+      "why": "Allows presentation of detailed content with embedded questions and multimedia for deeper engagement.",
+      "suggested_item_count": 1,
+      "evidence": {
+        "source_file": "Chapter-01-Unit-01-7.pdf",
+        "locator": "Page 1",
+        "quote": "Understand the Principles, Statutory Guidance and Legislation Underpinning Practice for Children with Special Educational Needs and Disability (SEND) in an Early Years Setting."
+      }
+    },
+    {
+      "activity_type": "Mark the Words",
+      "score_0_to_5": 3,
+      "why": "Good for identifying key terms and concepts within statutory guidance texts.",
+      "suggested_item_count": 5,
+      "evidence": {
+        "source_file": "Chapter-01-Unit-01-7.pdf",
+        "locator": "Page 8",
+        "quote": "Practitioners should use regular observations, assessments, and discussions with parents to monitor children’s progress."
+      }
+    },
+    {
+      "activity_type": "Quiz",
+      "score_0_to_5": 5,
+      "why": "Comprehensive tool to test knowledge on all aspects including legislation, SENCO roles, and statutory compliance.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "Chapter-01-Unit-01-7.pdf",
+        "locator": "Page 11",
+        "quote": "Early years providers must ensure that: They follow the SEND Code of Practice and EYFS framework."
+      }
+    }
+  ]
+}

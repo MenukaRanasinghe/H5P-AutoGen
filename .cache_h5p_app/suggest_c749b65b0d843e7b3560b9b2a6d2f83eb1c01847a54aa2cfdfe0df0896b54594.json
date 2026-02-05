@@ -1,0 +1,92 @@
+{
+  "recommendations": [
+    {
+      "activity_type": "Course Presentation",
+      "score_0_to_5": 5,
+      "why": "Ideal for delivering structured content and introducing key concepts in adult care.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "prince 2 cover 1.pdf",
+        "locator": "Page 1",
+        "quote": "Module 1 Agile Overview"
+      }
+    },
+    {
+      "activity_type": "Interactive Book",
+      "score_0_to_5": 5,
+      "why": "Allows comprehensive coverage of detailed topics with multimedia and interactive elements.",
+      "suggested_item_count": 3,
+      "evidence": {
+        "source_file": "prince 2 cover 1.pdf",
+        "locator": "Page 1",
+        "quote": "Material in this document has been sourced from PRINCE2 Agile®."
+      }
+    },
+    {
+      "activity_type": "Multiple Choice",
+      "score_0_to_5": 5,
+      "why": "Effective for assessing knowledge retention and understanding of adult care principles.",
+      "suggested_item_count": 15,
+      "evidence": {
+        "source_file": "prince 2 cover 1.pdf",
+        "locator": "Page 1",
+        "quote": "Module 1 Agile Overview"
+      }
+    },
+    {
+      "activity_type": "Fill in the Blanks",
+      "score_0_to_5": 4,
+      "why": "Good for reinforcing terminology and key concepts specific to adult care.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "prince 2 cover 1.pdf",
+        "locator": "Page 1",
+        "quote": "Material in this document has been sourced from PRINCE2 Agile®."
+      }
+    },
+    {
+      "activity_type": "Summary",
+      "score_0_to_5": 4,
+      "why": "Helps learners consolidate knowledge by summarizing key points from modules.",
+      "suggested_item_count": 5,
+      "evidence": {
+        "source_file": "prince 2 cover 1.pdf",
+        "locator": "Page 1",
+        "quote": "Module 1 Agile Overview"
+      }
+    },
+    {
+      "activity_type": "Dialog Cards",
+      "score_0_to_5": 3,
+      "why": "Useful for memorizing important terms and definitions in adult care.",
+      "suggested_item_count": 20,
+      "evidence": {
+        "source_file": "prince 2 cover 1.pdf",
+        "locator": "Page 1",
+        "quote": "Material in this document has been sourced from PRINCE2 Agile®."
+      }
+    },
+    {
+      "activity_type": "Drag the Words",
+      "score_0_to_5": 3,
+      "why": "Engages learners in matching key terms with their definitions or concepts.",
+      "suggested_item_count": 8,
+      "evidence": {
+        "source_file": "prince 2 cover 1.pdf",
+        "locator": "Page 1",
+        "quote": "Module 1 Agile Overview"
+      }
+    },
+    {
+      "activity_type": "Mark the Words",
+      "score_0_to_5": 3,
+      "why": "Encourages attention to detail by identifying important terms within text passages.",
+      "suggested_item_count": 5,
+      "evidence": {
+        "source_file": "prince 2 cover 1.pdf",
+        "locator": "Page 1",
+        "quote": "Material in this document has been sourced from PRINCE2 Agile®."
+      }
+    }
+  ]
+}

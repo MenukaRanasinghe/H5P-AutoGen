@@ -1,0 +1,92 @@
+{
+  "recommendations": [
+    {
+      "activity_type": "Course Presentation",
+      "score_0_to_5": 5,
+      "why": "Ideal for delivering comprehensive content on legislation, principles, and leadership in adult care with structured slides.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "Chapter-1_Unit-4-NCFE-CACHE-L4D.pdf",
+        "locator": "Page 3",
+        "quote": "This unit provides an in-depth understanding of the complex relationship between equality, diversity, and inclusion (EDI)."
+      }
+    },
+    {
+      "activity_type": "Multiple Choice",
+      "score_0_to_5": 5,
+      "why": "Effective for assessing knowledge of key legislation and principles such as the Equality Act 2010 and Mental Capacity Act 2005.",
+      "suggested_item_count": 15,
+      "evidence": {
+        "source_file": "Chapter-1_Unit-4-NCFE-CACHE-L4D.pdf",
+        "locator": "Page 5",
+        "quote": "The Equality Act 2010 is a cornerstone of equality legislation in the UK."
+      }
+    },
+    {
+      "activity_type": "Fill in the Blanks",
+      "score_0_to_5": 4,
+      "why": "Useful for reinforcing terminology and key concepts related to equality, diversity, and inclusion.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "Chapter-1_Unit-4-NCFE-CACHE-L4D.pdf",
+        "locator": "Page 4",
+        "quote": "Equality centres on ensuring fair treatment and equal opportunities for all; diversity celebrates the uniqueness of individuals; and inclusion focuses on ensuring people feel safe."
+      }
+    },
+    {
+      "activity_type": "Summary",
+      "score_0_to_5": 4,
+      "why": "Helps learners consolidate understanding of complex topics such as barriers to equality and their impact.",
+      "suggested_item_count": 5,
+      "evidence": {
+        "source_file": "Chapter-1_Unit-4-NCFE-CACHE-L4D.pdf",
+        "locator": "Page 16",
+        "quote": "In adult care settings, barriers to equality can significantly hinder the well-being, rights, and opportunities of individuals."
+      }
+    },
+    {
+      "activity_type": "Dialog Cards",
+      "score_0_to_5": 4,
+      "why": "Supports memorization of legislation details, definitions, and key principles by pairing questions and answers.",
+      "suggested_item_count": 20,
+      "evidence": {
+        "source_file": "Chapter-1_Unit-4-NCFE-CACHE-L4D.pdf",
+        "locator": "Page 6",
+        "quote": "The Equality Act 2010 consolidates the protection offered by the Race Relations Act 1976, the Disability Discrimination Act 1995, and others."
+      }
+    },
+    {
+      "activity_type": "Mark the Words",
+      "score_0_to_5": 3,
+      "why": "Engages learners in identifying key terms related to equality, diversity, and inclusion within text excerpts.",
+      "suggested_item_count": 8,
+      "evidence": {
+        "source_file": "Chapter-1_Unit-4-NCFE-CACHE-L4D.pdf",
+        "locator": "Page 14",
+        "quote": "Adopting an inclusive approach also ensures that decisions reflect individuals’ cultural, religious, social and personal backgrounds."
+      }
+    },
+    {
+      "activity_type": "Interactive Book",
+      "score_0_to_5": 4,
+      "why": "Allows integration of multiple content types and activities for an in-depth exploration of EDI topics and legislation.",
+      "suggested_item_count": 1,
+      "evidence": {
+        "source_file": "Chapter-1_Unit-4-NCFE-CACHE-L4D.pdf",
+        "locator": "Page 3",
+        "quote": "This unit aims to strengthen the learner’s ability to promote, lead, and sustain inclusive practice within their adult care setting."
+      }
+    },
+    {
+      "activity_type": "Quiz",
+      "score_0_to_5": 5,
+      "why": "Comprehensive assessment tool to evaluate understanding of legislation, leadership responsibilities, and barriers to equality.",
+      "suggested_item_count": 20,
+      "evidence": {
+        "source_file": "Chapter-1_Unit-4-NCFE-CACHE-L4D.pdf",
+        "locator": "Page 9",
+        "quote": "Legislation, codes of practice and organisational policies guide how equality, diversity and inclusion should be understood and applied within the work role."
+      }
+    }
+  ]
+}

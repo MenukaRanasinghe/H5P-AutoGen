@@ -250,7 +250,9 @@ def cache_write_json(key: str, data):
 # =========================
 
 
-ALL_H5P_TYPES = [
+# "Best" H5P types to suggest (keeps recommendations high-signal).
+# The generator can still build ANY type that exists as a .h5p template in ./templates.
+BEST_H5P_TYPES = [
     "Course Presentation",
     "Dialog Cards",
     "Drag the Words",
@@ -299,6 +301,47 @@ def discover_templates(templates_dir: str = "templates") -> Dict[str, str]:
         label = os.path.splitext(os.path.basename(p))[0]
         out[label] = p
     return out
+
+def _norm_label(s: str) -> str:
+    """Normalise labels for fuzzy matching user-entered types to template filenames."""
+    s = (s or "").strip().lower()
+    s = re.sub(r"[\(\)\[\]\{\}]", " ", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def resolve_template_label(user_input: str, templates_map: Dict[str, str]) -> Tuple[Optional[str], List[str]]:
+    """
+    Attempt to map user-entered activity type to an existing template label.
+
+    Returns:
+      (matched_label or None, suggestions list)
+    """
+    import difflib
+
+    raw = (user_input or "").strip()
+    if not raw:
+        return None, []
+
+    # Exact match
+    if raw in templates_map:
+        return raw, []
+
+    norm_map = {_norm_label(k): k for k in templates_map.keys()}
+    n = _norm_label(raw)
+
+    if n in norm_map:
+        return norm_map[n], []
+
+    # Extra heuristics for common typos/spacing
+    n2 = n.replace("h5p ", "").replace(" h5p", "").strip()
+    if n2 in norm_map:
+        return norm_map[n2], []
+
+    close = difflib.get_close_matches(n, list(norm_map.keys()), n=5, cutoff=0.72)
+    suggestions = [norm_map[c] for c in close]
+    return (suggestions[0] if suggestions else None), suggestions
+
 
 
 def unzip_h5p(h5p_path: str, out_dir: str) -> None:
@@ -1281,7 +1324,7 @@ def llm_suggest_activities(chunks: List[ContentChunk], course_name: str) -> Dict
 Recommend suitable H5P activity types for this course: {course_name}
 
 Consider these H5P types (exact labels):
-{ALL_H5P_TYPES}
+{BEST_H5P_TYPES}
 
 Return ONLY the best 8 recommendations.
 
@@ -1807,19 +1850,23 @@ def compute_inputs_key(files: List[Any], course: str) -> str:
         parts.append(f.name)
         parts.append(file_sha256(b))
     return hashlib.sha256(("|".join(parts)).encode("utf-8")).hexdigest()
-
 def ensure_chunks(files: List[Any]) -> List[ContentChunk]:
-    # Cache by fingerprints of uploaded PDFs
     fps = [(f.name, file_sha256(f.getvalue())) for f in files]
-    if st.session_state["pdf_fingerprints"] == fps and st.session_state["chunks_cache"] is not None and st.session_state["pdf_bytes_map"] is not None:
+    if (
+        st.session_state["pdf_fingerprints"] == fps
+        and st.session_state["chunks_cache"] is not None
+        and st.session_state["pdf_bytes_map"] is not None
+    ):
         return st.session_state["chunks_cache"]
 
     chunks: List[ContentChunk] = []
     pdf_map: Dict[str, bytes] = {}
+
     for f in files:
         b = f.getvalue()
         pdf_map[f.name] = b
         chunks.extend(extract_pdf_chunks_from_bytes(f.name, b))
+
     if not chunks:
         raise RuntimeError("No readable text found in the uploaded PDF(s). (If PDFs are scanned images, use OCR PDFs.)")
 
@@ -1827,6 +1874,7 @@ def ensure_chunks(files: List[Any]) -> List[ContentChunk]:
     st.session_state["chunks_cache"] = chunks
     st.session_state["pdf_bytes_map"] = pdf_map
     return chunks
+
 
     chunks: List[ContentChunk] = []
     for f in files:
@@ -1899,23 +1947,25 @@ if suggest_clicked:
     finally:
         st.session_state["busy"] = False
 
-# Show suggestions and generation
+        # Show suggestions and generation
 if st.session_state["suggestions"]:
     recs = (st.session_state["suggestions"].get("recommendations") or [])
-    # Constrain to the templates/types we actually support in this build
-    allowed = set(ALL_H5P_TYPES)
+    allowed = set(BEST_H5P_TYPES)
     recs = [r for r in recs if isinstance(r, dict) and (r.get("activity_type") in allowed)]
 
-    if not isinstance(recs, list) or not recs:
+    if not recs:
         st.info("No suggestions returned. Try again.")
         st.stop()
 
     st.markdown("---")
     st.markdown("### Choose one suggested type")
 
-    # Make a compact radio list with template availability
-    options = []
-    meta = {}
+    other_label = "Other (choose from templates)"
+
+    # Make a compact radio list with template availability (plus an "Other" option)
+    options: List[str] = []
+    meta: Dict[str, Dict[str, Any]] = {}
+
     for r in recs:
         typ = r.get("activity_type", "")
         score = int(r.get("score_0_to_5", 0) or 0)
@@ -1923,36 +1973,70 @@ if st.session_state["suggestions"]:
         suggested_n = int(r.get("suggested_item_count", 5) or 5)
         ev = r.get("evidence", {}) or {}
 
-        template_ok = (typ in templates) if typ not in ("Quiz","Multiple Choice") else ("Quiz" in templates)
-        status = "OK" if template_ok else "Missing template"
-        label = f"{typ} (score {score}/5) — {status}"
+        template_ok = (typ in templates) if typ not in ("Quiz", "Multiple Choice") else ("Quiz" in templates)
+        status = "" if template_ok else " (Missing template)"
+        label = f"{typ}{status}"
+
         options.append(label)
-        meta[label] = {"type": typ, "why": why, "n": suggested_n, "ev": ev, "template_ok": template_ok}
+        meta[label] = {
+            "type": typ,
+            "why": why,
+            "n": suggested_n,
+            "ev": ev,
+            "template_ok": template_ok,
+            "score": score,
+        }
+
+    options.append(other_label)
+    meta[other_label] = {
+        "type": "__OTHER__",
+        "why": "",
+        "n": 8,
+        "ev": {},
+        "template_ok": True,
+        "score": 0,
+    }
 
     choice = st.radio("Suggested types", options=options, index=0)
     chosen = meta[choice]
 
-    st.caption(chosen["why"] if chosen["why"] else "—")
-    ev = chosen["ev"] or {}
-    if ev:
-        st.caption(f"Evidence: {ev.get('source_file','')} {ev.get('locator','')} — “{str(ev.get('quote',''))[:170]}”")
+    # Resolve selected type (including Other)
+    resolved_type = chosen["type"]
+
+    if resolved_type == "__OTHER__":
+        st.markdown("#### Other type")
+
+        template_labels = sorted(list(templates.keys()))
+        resolved_type = st.selectbox(
+            "Pick an available template",
+            options=template_labels,
+            index=0
+        )
+
+        st.caption(f"Using template: **{resolved_type}**")
+
+    # Apply resolved type back to chosen and re-check template availability
+    chosen["type"] = resolved_type
+    chosen["template_ok"] = (resolved_type in templates) if resolved_type not in ("Quiz", "Multiple Choice") else ("Quiz" in templates)
 
     st.markdown("---")
     st.markdown("### Generate H5P")
-    default_n = max(5, chosen["n"]) if chosen["type"] in ("Quiz","Multiple Choice") else max(3, chosen["n"])
+
+    default_n = max(5, chosen["n"]) if chosen["type"] in ("Quiz", "Multiple Choice") else max(3, chosen["n"])
     n_items = st.number_input("Number of items/questions", min_value=3, max_value=30, value=int(default_n), step=1)
 
     gen = st.button("Generate H5P file", type="primary", use_container_width=True, disabled=st.session_state["busy"])
+
 
     if gen:
         try:
             st.session_state["busy"] = True
 
             if not chosen["template_ok"]:
-                if chosen["type"] in ("Quiz","Multiple Choice"):
+                if chosen["type"] in ("Quiz", "Multiple Choice"):
                     st.error("Missing template: templates/Quiz.h5p (required for Question Set generation).")
                 else:
-                    st.error(f"Missing template: templates/{'Quiz' if chosen['type'] in ('Quiz','Multiple Choice') else chosen['type']}.h5p")
+                    st.error(f"Missing template: templates/{chosen['type']}.h5p")
                 st.stop()
 
             chunks = ensure_chunks(uploads)
@@ -1960,197 +2044,193 @@ if st.session_state["suggestions"]:
             with tempfile.TemporaryDirectory() as tmp:
                 typ = chosen["type"]
                 run_n = int(n_items)
+
                 if typ == "Quiz":
-                        tf = call_llm_truefalse_statements(chunks, run_n, course_name.strip())
+                    tf = call_llm_truefalse_statements(chunks, run_n, course_name.strip())
 
-                        qs_dir = os.path.join(tmp, "_work_qs_tf")
-                        unzip_h5p(templates["Quiz"], qs_dir)
+                    qs_dir = os.path.join(tmp, "_work_qs_tf")
+                    unzip_h5p(templates["Quiz"], qs_dir)
 
-                        title = tf.get("title", f"True/False Quiz - {course_name.strip()}")
-                        desc = tf.get("description", "Answer the True/False questions.")
-                        qa_items = build_question_set_truefalse(qs_dir, title, desc, tf.get("items", []))
+                    title = tf.get("title", f"True/False Quiz - {course_name.strip()}")
+                    desc = tf.get("description", "Answer the True/False questions.")
+                    qa_items = build_question_set_truefalse(qs_dir, title, desc, tf.get("items", []))
 
-                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                        zip_dir_to_file(qs_dir, out_h5p)
+                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                    zip_dir_to_file(qs_dir, out_h5p)
 
-                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                        write_qa_report_html(out_qa, title, "Quiz (Question Set) — True/False", qa_items)
+                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                    write_qa_report_html(out_qa, title, "Quiz (Question Set) — True/False", qa_items)
 
                 elif typ == "Multiple Choice":
-                        mc = call_llm_multichoice_questions(chunks, run_n, course_name.strip())
+                    mc = call_llm_multichoice_questions(chunks, run_n, course_name.strip())
 
-                        qs_dir = os.path.join(tmp, "_work_qs_mc")
-                        unzip_h5p(templates["Quiz"], qs_dir)
+                    qs_dir = os.path.join(tmp, "_work_qs_mc")
+                    unzip_h5p(templates["Quiz"], qs_dir)
 
-                        title = mc.get("title", f"Multiple Choice Quiz - {course_name.strip()}")
-                        desc = mc.get("description", "Answer the multiple choice questions.")
-                        qa_items = build_question_set_multichoice(qs_dir, title, desc, mc.get("items", []))
+                    title = mc.get("title", f"Multiple Choice Quiz - {course_name.strip()}")
+                    desc = mc.get("description", "Answer the multiple choice questions.")
+                    qa_items = build_question_set_multichoice(qs_dir, title, desc, mc.get("items", []))
 
-                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                        zip_dir_to_file(qs_dir, out_h5p)
+                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                    zip_dir_to_file(qs_dir, out_h5p)
 
-                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                        write_qa_report_html(out_qa, title, "Quiz (Question Set) — Multiple Choice", qa_items)
+                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                    write_qa_report_html(out_qa, title, "Quiz (Question Set) — Multiple Choice", qa_items)
 
                 elif typ == "Dialog Cards":
-                        work_dir = os.path.join(tmp, "_work_dialog")
-                        unzip_h5p(templates["Dialog Cards"], work_dir)
+                    work_dir = os.path.join(tmp, "_work_dialog")
+                    unzip_h5p(templates["Dialog Cards"], work_dir)
 
-                        gen_data = call_llm_dialog_cards(chunks, run_n, course_name.strip())
-                        title = gen_data.get("title", f"Dialog Cards - {course_name.strip()}")
-                        desc = gen_data.get("description", "")
+                    gen_data = call_llm_dialog_cards(chunks, run_n, course_name.strip())
+                    title = gen_data.get("title", f"Dialog Cards - {course_name.strip()}")
+                    desc = gen_data.get("description", "")
 
-                        qa_items = update_dialog_cards_template(work_dir, title, desc, gen_data.get("cards", []), course=course_name.strip())
+                    qa_items = update_dialog_cards_template(work_dir, title, desc, gen_data.get("cards", []), course=course_name.strip())
 
-                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                        zip_dir_to_file(work_dir, out_h5p)
+                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                    zip_dir_to_file(work_dir, out_h5p)
 
-                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                        write_qa_report_html(out_qa, title, typ, qa_items)
+                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                    write_qa_report_html(out_qa, title, typ, qa_items)
 
                 elif typ == "Page":
-                        work_dir = os.path.join(tmp, "_work_page")
-                        unzip_h5p(templates["Page"], work_dir)
+                    work_dir = os.path.join(tmp, "_work_page")
+                    unzip_h5p(templates["Page"], work_dir)
 
-                        gen_data = call_llm_page_content(chunks, n_sections=min(6, max(3, run_n//2)), course=course_name.strip())
-                        title = gen_data.get("title", f"Page - {course_name.strip()}")
-                        qa_items = update_page_template_with_images(work_dir, title, gen_data.get("sections", []), course=course_name.strip())
+                    gen_data = call_llm_page_content(chunks, n_sections=min(6, max(3, run_n // 2)), course=course_name.strip())
+                    title = gen_data.get("title", f"Page - {course_name.strip()}")
+                    qa_items = update_page_template_with_images(work_dir, title, gen_data.get("sections", []), course=course_name.strip())
 
-                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                        zip_dir_to_file(work_dir, out_h5p)
+                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                    zip_dir_to_file(work_dir, out_h5p)
 
-                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                        write_qa_report_html(out_qa, title, typ, qa_items)
-
+                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                    write_qa_report_html(out_qa, title, typ, qa_items)
 
                 elif typ == "Course Presentation":
-                        work_dir = os.path.join(tmp, "_work_course_presentation")
-                        unzip_h5p(templates["Course Presentation"], work_dir)
+                    work_dir = os.path.join(tmp, "_work_course_presentation")
+                    unzip_h5p(templates["Course Presentation"], work_dir)
 
-                        gen_data = call_llm_course_presentation(chunks, n_slides=run_n, course=course_name.strip())
-                        title = gen_data.get("title", f"Course Presentation - {course_name.strip()}")
-                        desc = gen_data.get("description", "")
+                    gen_data = call_llm_course_presentation(chunks, n_slides=run_n, course=course_name.strip())
+                    title = gen_data.get("title", f"Course Presentation - {course_name.strip()}")
+                    desc = gen_data.get("description", "")
 
-                        qa_items = update_course_presentation_template_with_images(
-                            work_dir,
-                            title=title,
-                            description=desc,
-                            slides=gen_data.get("slides", []),
-                            course=course_name.strip(),
-                        )
+                    qa_items = update_course_presentation_template_with_images(
+                        work_dir,
+                        title=title,
+                        description=desc,
+                        slides=gen_data.get("slides", []),
+                        course=course_name.strip(),
+                    )
 
-                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                        zip_dir_to_file(work_dir, out_h5p)
+                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                    zip_dir_to_file(work_dir, out_h5p)
 
-                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                        write_qa_report_html(out_qa, title, typ, qa_items)
+                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                    write_qa_report_html(out_qa, title, typ, qa_items)
 
                 elif typ == "Interactive Book":
-                        work_dir = os.path.join(tmp, "_work_interactive_book")
-                        unzip_h5p(templates["Interactive Book"], work_dir)
+                    work_dir = os.path.join(tmp, "_work_interactive_book")
+                    unzip_h5p(templates["Interactive Book"], work_dir)
 
-                        gen_data = call_llm_interactive_book(chunks, n_chapters=max(2, min(6, run_n // 2)), course=course_name.strip())
-                        title = gen_data.get("title", f"Interactive Book - {course_name.strip()}")
-                        desc = gen_data.get("description", "")
+                    gen_data = call_llm_interactive_book(chunks, n_chapters=max(2, min(6, run_n // 2)), course=course_name.strip())
+                    title = gen_data.get("title", f"Interactive Book - {course_name.strip()}")
+                    desc = gen_data.get("description", "")
 
-                        qa_items = update_interactive_book_template_with_images(
-                            work_dir,
-                            title=title,
-                            description=desc,
-                            chapters=gen_data.get("chapters", []),
-                            course=course_name.strip(),
-                        )
+                    qa_items = update_interactive_book_template_with_images(
+                        work_dir,
+                        title=title,
+                        description=desc,
+                        chapters=gen_data.get("chapters", []),
+                        course=course_name.strip(),
+                    )
 
-                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                        zip_dir_to_file(work_dir, out_h5p)
+                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                    zip_dir_to_file(work_dir, out_h5p)
 
-                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                        write_qa_report_html(out_qa, title, typ, qa_items)
+                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                    write_qa_report_html(out_qa, title, typ, qa_items)
 
                 elif typ in BUILTIN_TEXT_TYPES:
-                        meta_t = BUILTIN_TEXT_TYPES[typ]
-                        work_dir = os.path.join(tmp, "_work_text")
-                        unzip_h5p(templates[typ], work_dir)
+                    meta_t = BUILTIN_TEXT_TYPES[typ]
+                    work_dir = os.path.join(tmp, "_work_text")
+                    unzip_h5p(templates[typ], work_dir)
 
-                        if meta_t["mode"] == "dragtext":
-                            gen_data = call_llm_drag_words(chunks, run_n, course_name.strip())
-                            textfield = make_dragtext_textfield(gen_data["items"])
-                            update_text_based_template(work_dir, gen_data["title"], gen_data["description"], textfield, gen_data.get("overall_feedback"), meta_t["textfield_keys"])
-                            title = gen_data["title"]
-                            # Apply distractors if the template supports it
-                            all_dis = []
-                            for it in gen_data.get("items", []):
-                                all_dis.extend(it.get("distractors") or [])
-                            maybe_set_distractors(work_dir, all_dis)
-                            qa_items = [{"label": "Drag the Words", "content": it.get("sentence",""), "expected": it.get("missing_word",""), "evidence": it.get("evidence", {})}
-                                        for i, it in enumerate(gen_data["items"])]
+                    if meta_t["mode"] == "dragtext":
+                        gen_data = call_llm_drag_words(chunks, run_n, course_name.strip())
+                        textfield = make_dragtext_textfield(gen_data["items"])
+                        update_text_based_template(work_dir, gen_data["title"], gen_data["description"], textfield, gen_data.get("overall_feedback"), meta_t["textfield_keys"])
+                        title = gen_data["title"]
+                        all_dis = []
+                        for it in gen_data.get("items", []):
+                            all_dis.extend(it.get("distractors") or [])
+                        maybe_set_distractors(work_dir, all_dis)
+                        qa_items = [{"label": "Drag the Words", "content": it.get("sentence", ""), "expected": it.get("missing_word", ""), "evidence": it.get("evidence", {})}
+                                    for it in gen_data.get("items", [])]
 
-                        elif meta_t["mode"] == "blanks":
-                            gen_data = call_llm_fill_blanks(chunks, run_n, course_name.strip())
-                            textfield = make_blanks_textfield(gen_data["items"])
-                            update_text_based_template(work_dir, gen_data["title"], gen_data["description"], textfield, gen_data.get("overall_feedback"), meta_t["textfield_keys"])
-                            title = gen_data["title"]
-                            # Apply distractors if the template supports it
-                            all_dis = []
-                            for it in gen_data.get("items", []):
-                                all_dis.extend(it.get("distractors") or [])
-                            maybe_set_distractors(work_dir, all_dis)
-                            qa_items = [{"label": f"Item {i+1}", "content": f"{it['sentence']} (answer: {it['answer']})", "evidence": it.get("evidence", {})}
-                                        for i, it in enumerate(gen_data["items"])]
+                    elif meta_t["mode"] == "blanks":
+                        gen_data = call_llm_fill_blanks(chunks, run_n, course_name.strip())
+                        textfield = make_blanks_textfield(gen_data["items"])
+                        update_text_based_template(work_dir, gen_data["title"], gen_data["description"], textfield, gen_data.get("overall_feedback"), meta_t["textfield_keys"])
+                        title = gen_data["title"]
+                        qa_items = [{"label": f"Item {i+1}", "content": f"{it['sentence']} (answer: {it['answer']})", "evidence": it.get("evidence", {})}
+                                    for i, it in enumerate(gen_data.get("items", []))]
 
-                        else:  # markwords
-                            gen_data = call_llm_mark_words(chunks, run_n, course_name.strip())
-                            textfield = make_mark_words_textfield(gen_data["items"])
-                            update_text_based_template(work_dir, gen_data["title"], gen_data["description"], textfield, None, meta_t["textfield_keys"])
-                            title = gen_data["title"]
-                            qa_items = [{"label": f"Item {i+1}", "content": f"{it['paragraph'][:160]}... (marked: {', '.join(it['marked_words'])})", "evidence": it.get("evidence", {})}
-                                        for i, it in enumerate(gen_data["items"])]
+                    else:  # markwords
+                        gen_data = call_llm_mark_words(chunks, run_n, course_name.strip())
+                        textfield = make_mark_words_textfield(gen_data["items"])
+                        update_text_based_template(work_dir, gen_data["title"], gen_data["description"], textfield, None, meta_t["textfield_keys"])
+                        title = gen_data["title"]
+                        qa_items = [{"label": f"Item {i+1}", "content": f"{it['paragraph'][:160]}... (marked: {', '.join(it['marked_words'])})", "evidence": it.get("evidence", {})}
+                                    for i, it in enumerate(gen_data.get("items", []))]
 
-                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                        zip_dir_to_file(work_dir, out_h5p)
+                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                    zip_dir_to_file(work_dir, out_h5p)
 
-                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                        write_qa_report_html(out_qa, title, typ, qa_items)
+                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                    write_qa_report_html(out_qa, title, typ, qa_items)
 
                 elif typ == "Summary":
-                        work_dir = os.path.join(tmp, "_work_summary")
-                        unzip_h5p(templates["Summary"], work_dir)
-                        gen_data = call_llm_summary(chunks, run_n, course_name.strip())
-                        update_summary_template(work_dir, gen_data["title"], gen_data["description"], gen_data["items"])
-                        title = gen_data["title"]
-                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                        zip_dir_to_file(work_dir, out_h5p)
+                    work_dir = os.path.join(tmp, "_work_summary")
+                    unzip_h5p(templates["Summary"], work_dir)
+                    gen_data = call_llm_summary(chunks, run_n, course_name.strip())
+                    update_summary_template(work_dir, gen_data["title"], gen_data["description"], gen_data["items"])
+                    title = gen_data["title"]
 
-                        qa_items = [{"label": f"Item {i+1}", "content": f"{it['statement']} (is_correct: {it['is_correct']})", "evidence": it.get("evidence", {})}
-                                    for i, it in enumerate(gen_data["items"])]
-                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                        write_qa_report_html(out_qa, title, typ, qa_items)
+                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                    zip_dir_to_file(work_dir, out_h5p)
+
+                    qa_items = [{"label": f"Item {i+1}", "content": f"{it['statement']} (is_correct: {it['is_correct']})", "evidence": it.get("evidence", {})}
+                                for i, it in enumerate(gen_data.get("items", []))]
+
+                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                    write_qa_report_html(out_qa, title, typ, qa_items)
 
                 else:
-                        work_dir = os.path.join(tmp, "_work_generic")
-                        unzip_h5p(templates[typ], work_dir)
+                    work_dir = os.path.join(tmp, "_work_generic")
+                    unzip_h5p(templates[typ], work_dir)
 
-                        tpl_h5p = json.loads(open(os.path.join(work_dir, "h5p.json"), "r", encoding="utf-8").read())
-                        tpl_content = json.loads(open(os.path.join(work_dir, "content", "content.json"), "r", encoding="utf-8").read())
+                    tpl_h5p = json.loads(open(os.path.join(work_dir, "h5p.json"), "r", encoding="utf-8").read())
+                    tpl_content = json.loads(open(os.path.join(work_dir, "content", "content.json"), "r", encoding="utf-8").read())
 
-                        gen_data = call_llm_generic_patch(
-                            chunks=chunks,
-                            course_name=course_name.strip(),
-                            activity_type=typ,
-                            template_h5p_json=tpl_h5p,
-                            template_content_json=tpl_content,
-                            item_count=run_n,
-                        )
+                    gen_data = call_llm_generic_patch(
+                        chunks=chunks,
+                        course_name=course_name.strip(),
+                        activity_type=typ,
+                        template_h5p_json=tpl_h5p,
+                        template_content_json=tpl_content,
+                        item_count=run_n,
+                    )
 
-                        update_h5p_title(work_dir, gen_data["title"])
-                        _save_json(work_dir, "content/content.json", gen_data["patched_content_json"])
+                    update_h5p_title(work_dir, gen_data["title"])
+                    _save_json(work_dir, "content/content.json", gen_data["patched_content_json"])
 
-                        title = gen_data["title"]
-                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                        zip_dir_to_file(work_dir, out_h5p)
+                    title = gen_data["title"]
+                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                    zip_dir_to_file(work_dir, out_h5p)
 
-                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                        write_qa_report_html(out_qa, title, typ, gen_data.get("qa_items", []))
+                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                    write_qa_report_html(out_qa, title, typ, gen_data.get("qa_items", []))
 
                 st.success("Done.")
 
@@ -2170,7 +2250,6 @@ if st.session_state["suggestions"]:
                 st.error(msg)
         finally:
             st.session_state["busy"] = False
-
 
 # Persistent downloads (visible even after button click reruns)
 if st.session_state.get("last_h5p_bytes"):
