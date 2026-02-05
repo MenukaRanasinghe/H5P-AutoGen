@@ -26,6 +26,15 @@ from pypdf import PdfReader
 # ----------------------------
 WIKIMEDIA_API = "https://commons.wikimedia.org/w/api.php"
 USER_AGENT = os.environ.get("H5P_IMG_USER_AGENT", "H5PActivityGenerator/1.0 (contact: content@imperiallearning.co.uk)")
+LLM_API_KEY = os.getenv("LLM_API_KEY")
+FREEPIK_API_KEY = os.getenv("FREEPIK_API_KEY")
+
+# Pull keys from Streamlit secrets (Cloud + local secrets.toml)
+if "LLM_API_KEY" in st.secrets and not os.environ.get("LLM_API_KEY"):
+    os.environ["LLM_API_KEY"] = st.secrets["LLM_API_KEY"]
+
+if "FREEPIK_API_KEY" in st.secrets and not os.environ.get("FREEPIK_API_KEY"):
+    os.environ["FREEPIK_API_KEY"] = st.secrets["FREEPIK_API_KEY"]
 
 # Filter out files that are likely to contain text overlays, logos, icons, diagrams, banners, etc.
 _BAD_TITLE_TERMS = {
@@ -134,6 +143,114 @@ def wikimedia_find_image_url(query: str, limit: int = 25) -> Optional[Dict[str, 
     candidates.sort(key=lambda x: (x["score"], x["width"] * x["height"]), reverse=True)
     return candidates[0]
 
+
+def _freepik_headers() -> Dict[str, str]:
+    return {
+        "User-Agent": USER_AGENT,
+        "x-freepik-api-key": FREEPIK_API_KEY,
+        "Accept-Language": FREEPIK_LANG,
+    }
+
+def freepik_find_image_url(query: str, limit: int = 25) -> Optional[Dict[str, Any]]:
+    """
+    Search Freepik resources and return a best-match candidate dict:
+    {id, title, page_url, preview_url, author_name, license_url}
+
+    Uses /v1/resources with the `term` parameter.
+    """
+    if not FREEPIK_API_KEY:
+        return None
+    q = (query or "").strip()
+    if not q:
+        return None
+
+    params = {"term": q, "limit": min(max(int(limit), 1), 100), "order": "relevance"}
+    try:
+        r = requests.get(
+            f"{FREEPIK_API_BASE}/resources",
+            params=params,
+            headers=_freepik_headers(),
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json() or {}
+    except Exception:
+        return None
+
+    items = data.get("data") or []
+    if not isinstance(items, list) or not items:
+        return None
+
+    q_terms = _terms(q)
+    candidates: List[Dict[str, Any]] = []
+
+    for it in items:
+        img = it.get("image") or {}
+        img_type = (img.get("type") or "").lower()
+
+        # Prefer photos by default.
+        if img_type and img_type != "photo":
+            continue
+
+        src_obj = (img.get("source") or {})
+        preview_url = src_obj.get("url") or ""
+        if not preview_url.startswith("http"):
+            continue
+
+        title = it.get("title") or ""
+        score = _title_score(title, q_terms)
+        if q_terms and score == 0:
+            continue
+
+        author = it.get("author") or {}
+        author_name = author.get("name") or ""
+
+        licenses = it.get("licenses") or []
+        lic_url = ""
+        if isinstance(licenses, list) and licenses:
+            lic_url = (licenses[0] or {}).get("url") or ""
+
+        candidates.append(
+            {
+                "id": it.get("id"),
+                "title": title,
+                "page_url": it.get("url") or "",
+                "preview_url": preview_url,
+                "author_name": author_name,
+                "license_url": lic_url,
+                "score": score,
+            }
+        )
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
+    return candidates[0]
+
+def freepik_download_signed_url(resource_id: int, image_size: str = "large") -> Optional[Dict[str, Any]]:
+    """
+    Get a signed download URL for a Freepik resource via:
+    GET /v1/resources/{resource-id}/download
+
+    Returns a dict that usually contains `signed_url` (or `url`).
+    """
+    if not FREEPIK_API_KEY:
+        return None
+    try:
+        r = requests.get(
+            f"{FREEPIK_API_BASE}/resources/{int(resource_id)}/download",
+            params={"image_size": image_size},
+            headers=_freepik_headers(),
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json() or {}
+        d = data.get("data") or {}
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
 _PLACEHOLDER_PNG_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO3G7qkAAAAASUVORK5CYII="
 )
@@ -144,10 +261,54 @@ def _write_placeholder_png(path: str) -> None:
     with open(path, "wb") as f:
         f.write(base64.b64decode(_PLACEHOLDER_PNG_B64))
 
-def download_image_to_h5p(images_dir: str, query: str, stem: str) -> Optional[Dict[str, str]]:
-    """Download an image for query into content/images and return dict with rel path + mime."""
+def download_image_to_h5p(images_dir: str, query: str, stem: str) -> Optional[Dict[str, Any]]:
+    """Download an image for query into content/images and return dict with rel path + mime + optional credit.
+
+    Preference order:
+      1) Freepik (if FREEPIK_API_KEY is set)
+      2) Wikimedia Commons
+    """
     os.makedirs(images_dir, exist_ok=True)
-    found = wikimedia_find_image_url(query)
+    q = (query or "").strip()
+    if not q:
+        return None
+
+    # --- Freepik (preferred) ---
+    if FREEPIK_API_KEY:
+        cand = freepik_find_image_url(q)
+        if cand and cand.get("id"):
+            dl_meta = freepik_download_signed_url(int(cand["id"]), image_size="large")
+            signed = ""
+            if isinstance(dl_meta, dict):
+                signed = dl_meta.get("signed_url") or dl_meta.get("url") or ""
+            if signed:
+                try:
+                    rr = requests.get(signed, headers={"User-Agent": USER_AGENT}, timeout=60)
+                    rr.raise_for_status()
+                    mime = (rr.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                    if not mime.startswith("image/"):
+                        mime = "image/jpeg" if signed.lower().endswith((".jpg", ".jpeg")) else "image/png"
+                    ext = ".jpg" if ("jpeg" in mime or "jpg" in mime) else ".png"
+                    fname = f"{safe_filename(stem)}{ext}"
+                    abs_path = os.path.join(images_dir, fname)
+                    with open(abs_path, "wb") as f:
+                        f.write(rr.content)
+                    return {
+                        "path": f"images/{fname}",
+                        "mime": mime,
+                        "credit": {
+                            "provider": "freepik",
+                            "source": cand.get("page_url") or "",
+                            "title": cand.get("title") or "",
+                            "author": cand.get("author_name") or "",
+                            "license_url": cand.get("license_url") or "",
+                        },
+                    }
+                except Exception:
+                    pass  # fall through to Wikimedia
+
+    # --- Wikimedia fallback ---
+    found = wikimedia_find_image_url(q)
     if not found:
         return None
     url = found["url"]
@@ -162,9 +323,9 @@ def download_image_to_h5p(images_dir: str, query: str, stem: str) -> Optional[Di
             f.write(rr.content)
     except Exception:
         return None
-    return {"path": f"images/{fname}", "mime": mime}
+    return {"path": f"images/{fname}", "mime": mime, "credit": {"provider": "wikimedia", "source": url}}
 
-def download_image_to_h5p_multi(images_dir: str, queries: List[str], stem: str) -> Optional[Dict[str, str]]:
+def download_image_to_h5p_multi(images_dir: str, queries: List[str], stem: str) -> Optional[Dict[str, Any]]:
     """Try multiple queries until an image is found."""
     seen = set()
     for q in queries:
@@ -180,8 +341,8 @@ def download_image_to_h5p_multi(images_dir: str, queries: List[str], stem: str) 
             return dl
     return None
 
-def ensure_image(images_dir: str, queries: List[str], stem: str, fallback_query: str = "healthcare worker") -> Dict[str, str]:
-    """Guarantee an image payload. Uses Wikimedia search; if it fails, writes a tiny placeholder PNG."""
+def ensure_image(images_dir: str, queries: List[str], stem: str, fallback_query: str = "inclusive classroom") -> Dict[str, Any]:
+    """Guarantee an image payload. Uses Freepik if configured, then Wikimedia; if it fails, writes a tiny placeholder PNG."""
     dl = download_image_to_h5p_multi(images_dir, queries + [fallback_query], stem=stem)
     if dl:
         return dl
@@ -189,7 +350,7 @@ def ensure_image(images_dir: str, queries: List[str], stem: str, fallback_query:
     fname = f"{safe_filename(stem)}_placeholder.png"
     abs_path = os.path.join(images_dir, fname)
     _write_placeholder_png(abs_path)
-    return {"path": f"images/{fname}", "mime": "image/png"}
+    return {"path": f"images/{fname}", "mime": "image/png", "credit": {"provider": "placeholder"}}
 
 def extract_keywords(text: str, max_terms: int = 4) -> List[str]:
     """Lightweight keyword extraction for better image searches."""
@@ -392,6 +553,202 @@ def extract_pdf_chunks_from_bytes(filename: str, pdf_bytes: bytes, max_pages: in
             pass
 
 
+# ============================================================
+# HEADING EXTRACTION + SMART FREEPIK QUERY BUILDING
+# (Dynamic: uses course name + PDF headings + item content; no static nudges)
+# ============================================================
+
+_HEADING_MIN_LEN = 8
+_HEADING_MAX_LEN = 90
+
+def _looks_like_heading(line: str) -> bool:
+    s = (line or "").strip()
+    if len(s) < _HEADING_MIN_LEN or len(s) > _HEADING_MAX_LEN:
+        return False
+    if s.endswith((".", ":", ";")):
+        return False
+    if re.search(r"(www\.|http|@)", s.lower()):
+        return False
+
+    # Numbered headings like "1.2 The SEND Code of Practice"
+    if re.match(r"^\d+(\.\d+)*\s+.+", s):
+        return True
+
+    # ALL CAPS headings (reasonable length)
+    if s.isupper() and len(s.split()) <= 12:
+        return True
+
+    # Title Case-ish: many words start with capitals
+    words = s.split()
+    if 2 <= len(words) <= 12:
+        cap = sum(1 for w in words if re.match(r"^[A-Z][a-z]", w))
+        if cap >= max(2, int(0.6 * len(words))):
+            return True
+
+    return False
+
+
+def extract_pdf_headings_from_bytes(filename: str, pdf_bytes: bytes, max_pages: int = 300) -> List[str]:
+    """Best-effort extraction of headings/titles from PDF text.
+    Uses lightweight heuristics (numbered headings, caps, title-case lines).
+    """
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+
+    headings: List[str] = []
+    try:
+        reader = PdfReader(tmp_path)
+        total = min(len(reader.pages), max_pages)
+        for i in range(total):
+            raw = reader.pages[i].extract_text() or ""
+            raw = raw.replace("\r", "\n")
+            for ln in raw.split("\n"):
+                ln2 = re.sub(r"\s+", " ", (ln or "").strip())
+                if not ln2:
+                    continue
+                if _looks_like_heading(ln2) and ln2 not in headings:
+                    headings.append(ln2)
+        return headings
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _overlap_terms(a: str, b: str) -> int:
+    return len(set(_terms(a)) & set(_terms(b)))
+
+
+def choose_best_heading(context: str, headings: List[str]) -> Optional[str]:
+    if not headings:
+        return None
+    scored = [(h, _overlap_terms(context, h)) for h in headings]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    best, score = scored[0]
+    return best if score > 0 else None
+
+
+def _expand_course_terms(course: str) -> List[str]:
+    """Expand only what the user actually typed.
+    - Tokenises the course name
+    - Adds expansions for common abbreviations ONLY if they appear in the course string
+      (e.g., ICT -> information technology / computer science).
+    """
+    course = (course or "").strip()
+    base = _terms(course)
+
+    expansions: List[str] = []
+    c = course.lower()
+
+    if re.search(r"\bict\b", c):
+        expansions += ["information technology", "computer science", "computing"]
+    if re.search(r"\bit\b", c):
+        expansions += ["information technology", "computing"]
+    if re.search(r"\bgdpr\b", c):
+        expansions += ["data protection", "privacy"]
+    if re.search(r"\behcp\b", c):
+        expansions += ["education health care plan"]
+    if re.search(r"\bsend\b", c):
+        expansions += ["special educational needs", "inclusive education"]
+
+    out: List[str] = []
+    for t in base + expansions:
+        t = (t or "").strip()
+        if not t:
+            continue
+        if t not in out:
+            out.append(t)
+    return out
+
+
+def build_image_queries(
+    course: str,
+    pdf_headings: List[str],
+    context_text: str,
+    llm_image_query: str = "",
+    max_queries: int = 10,
+) -> List[str]:
+    """Build Freepik/Wikimedia queries using ONLY:
+      - course name
+      - headings found in the PDF
+      - the current generated item (question/answer/bullets/body)
+
+    No static domain nudges.
+    """
+    course = (course or "").strip()
+    ctx = (context_text or "").strip()
+    llm_q = (llm_image_query or "").strip()
+
+    course_terms = _expand_course_terms(course)
+    course_kw = " ".join(course_terms[:4]).strip()
+
+    ctx_terms = extract_keywords(ctx, 6)
+    ctx_kw = " ".join(ctx_terms[:4]).strip()
+
+    best_heading = choose_best_heading(ctx, pdf_headings or [])
+
+    queries: List[str] = []
+
+    # Anchor any LLM query with course keywords to reduce irrelevant imagery
+    if llm_q and course_kw:
+        queries.append(f"{llm_q} {course_kw}")
+    if llm_q:
+        queries.append(llm_q)
+
+    # Course + best PDF heading (strongest)
+    if course and best_heading:
+        queries.append(f"{course} {best_heading}")
+    if course_kw and best_heading:
+        queries.append(f"{course_kw} {best_heading}")
+
+    # Heading + content keywords
+    if best_heading and ctx_kw:
+        queries.append(f"{best_heading} {ctx_kw}")
+    if best_heading:
+        queries.append(best_heading)
+
+    # Course + content keywords
+    if course_kw and ctx_kw:
+        queries.append(f"{course_kw} {ctx_kw}")
+    if course and ctx_kw:
+        queries.append(f"{course} {ctx_kw}")
+
+    # Additional fallback headings (top 2 by overlap with course terms)
+    if pdf_headings:
+        scored = [(h, _overlap_terms(h, " ".join(course_terms))) for h in pdf_headings]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        for h, _ in scored[:2]:
+            if h and h not in queries:
+                queries.append(h)
+
+    # De-dup + normalise
+    out: List[str] = []
+    seen = set()
+    for q in queries:
+        q = re.sub(r"\s+", " ", (q or "").strip())
+        if not q:
+            continue
+        k = q.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(q)
+
+    return out[:max_queries]
+
+
+def build_fallback_query(course: str, pdf_headings: List[str]) -> str:
+    course_terms = _expand_course_terms(course)
+    if course_terms:
+        return f"{course_terms[0]} education"
+    if pdf_headings:
+        return f"{pdf_headings[0]} education"
+    return "education training"
+
+
+
 
 def _find_first_library_list(d: Any) -> Optional[List]:
     """Find a list that appears to contain H5P 'library' items."""
@@ -431,8 +788,8 @@ Return JSON:
 }}
 
 Rules:
-- FRONT must be a short description (1–2 sentences) that clearly sets context.
-- BACK must be the answer only: 1–2 words, no punctuation.
+- FRONT must be a single clear question sentence ending with '?'.
+- BACK must be a very short answer phrase (3–8 words, max 8). No full sentences, no trailing punctuation.
 - The card must be directly supported by the QUOTE.
 - image_query must be 2–6 words describing a suitable, text-free stock-style image (no brands, no logos, no text overlays, no source names).
 - quote must be copied exactly from SOURCE.
@@ -448,6 +805,7 @@ def update_dialog_cards_template(
     description: str,
     cards: List[Dict[str, Any]],
     course: str = "",
+    pdf_headings: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Populate Dialog Cards and attach an illustrative image per card.
 
@@ -455,6 +813,8 @@ def update_dialog_cards_template(
     - Locates the cards list by scoring all lists in content/content.json.
     - Preserves the template's per-card schema by cloning a sample card object.
     """
+    pdf_headings = pdf_headings or []
+
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
 
@@ -526,36 +886,58 @@ def update_dialog_cards_template(
     back_key = _pick_key(sample_card, ["answer", "back", "solution"], "answer")
     image_key = _pick_key(sample_card, ["image", "picture", "illustration", "media"], "image")
 
-    def _clean_short_answer(s: str) -> str:
+    def _clean_short_answer(s: str, max_words: int = 8) -> str:
         s = (s or "").strip()
-        s = re.sub(r"[\s\.,;:!\?\-]+$", "", s)
+        s = re.sub(r"[\s\.,;:!\?]+$", "", s)
+        s = re.sub(r"^(the|a|an)\s+", "", s, flags=re.I)
         words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'\-]*", s)
         if not words:
             return s
-        return " ".join(words[:2])
+        words = words[:max_words]
+        while words and words[-1].lower() in {"or", "and"}:
+            words = words[:-1]
+        return " ".join(words)
 
-    def _set_image_fields(obj: Any, rel_path: str, mime: str) -> Any:
+    def _set_image_fields(obj: Any, rel_path: str, mime: str, credit: Optional[Dict[str, Any]] = None) -> Any:
+        c = credit or {}
+        copyright_obj = {
+            "license": c.get("license_url", c.get("license", "")) or "",
+            "source": c.get("source", "") or "",
+            "title": c.get("title", "") or "",
+            "author": c.get("author", "") or "",
+        }
+        copyright_obj = {k: v for k, v in copyright_obj.items() if v}
+
         if obj is None:
-            return {"path": rel_path, "mime": mime, "copyright": {"license": "U"}}
+            base = {"path": rel_path, "mime": mime}
+            if copyright_obj:
+                base["copyright"] = copyright_obj
+            return base
+
         if isinstance(obj, dict):
             out = copy.deepcopy(obj)
             if "path" in out and isinstance(out["path"], str):
                 out["path"] = rel_path
-            if "mime" in out and isinstance(out["mime"], str):
+            if "mime" in out and isinstance(out.get("mime"), str):
                 out["mime"] = mime
             for k, v in list(out.items()):
                 if isinstance(v, (dict, list)):
-                    out[k] = _set_image_fields(v, rel_path, mime)
+                    out[k] = _set_image_fields(v, rel_path, mime, credit)
             if "path" not in out:
                 out["path"] = rel_path
             if "mime" not in out:
                 out["mime"] = mime
-            if "copyright" not in out:
-                out["copyright"] = {"license": "U"}
+            if copyright_obj and "copyright" not in out:
+                out["copyright"] = copyright_obj
             return out
+
         if isinstance(obj, list):
-            return [_set_image_fields(v, rel_path, mime) for v in obj]
-        return {"path": rel_path, "mime": mime, "copyright": {"license": "U"}}
+            return [_set_image_fields(v, rel_path, mime, credit) for v in obj]
+
+        base = {"path": rel_path, "mime": mime}
+        if copyright_obj:
+            base["copyright"] = copyright_obj
+        return base
 
     images_dir = os.path.join(work_dir, "content", "images")
     os.makedirs(images_dir, exist_ok=True)
@@ -575,20 +957,17 @@ def update_dialog_cards_template(
         if not front or not back:
             continue
 
-        # Always attach an image. Prefer the LLM's image_query, then fall back to extracted keywords.
-        kw_front = " ".join(extract_keywords(front, 4))
-        queries = [img_q, back, kw_front, course]
-        # Choose a sensible fallback query if course is empty
-        fallback = "adult care" if "care" in (course or "").lower() else "workplace safety"
+        context_for_img = f"{front} {back} {quote}".strip()
+        queries = build_image_queries(course=course, pdf_headings=pdf_headings, context_text=context_for_img, llm_image_query=img_q)
+        fallback = build_fallback_query(course, pdf_headings)
         dl = ensure_image(images_dir, queries=queries, stem=f"dialog_{i}", fallback_query=fallback)
-        image_payload = {"path": dl["path"], "mime": dl["mime"]}
 
         card_obj = copy.deepcopy(sample_card) if sample_card else {}
         card_obj[front_key] = front
         card_obj[back_key] = back
 
         existing_img = card_obj.get(image_key)
-        card_obj[image_key] = _set_image_fields(existing_img, image_payload["path"], image_payload["mime"])
+        card_obj[image_key] = _set_image_fields(existing_img, dl["path"], dl["mime"], dl.get("credit"))
 
         new_cards.append(card_obj)
 
@@ -615,6 +994,7 @@ def call_llm_multichoice_questions(chunks: List[ContentChunk], n: int, course: s
 Create {n} multiple choice questions based only on the SOURCE text for course: {course}
 
 Rules:
+- Keep answers/options concise (typically 1–6 words where applicable).
 - Each question must be answerable from the SOURCE.
 - Provide 3-5 options per question.
 - Exactly one option is correct.
@@ -750,8 +1130,11 @@ def update_page_template_with_images(
     title: str,
     sections: List[Dict[str, Any]],
     course: str = "",
+    pdf_headings: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Populate an H5P Page with Image + Text blocks using section.image_query (Wikimedia Commons)."""
+    """Populate an H5P Page with Image + Text blocks."""
+    pdf_headings = pdf_headings or []
+
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
 
@@ -799,10 +1182,11 @@ def update_page_template_with_images(
         if not body:
             continue
 
-        kw = " ".join(extract_keywords(f"{heading} {re.sub('<[^<]+?>','',body)}", 4))
-        queries = [img_q, heading, kw, course]
-        fallback = "adult care" if "care" in (course or "").lower() else "workplace safety"
+        context_for_img = f"{heading} {re.sub('<[^<]+?>','', body)}".strip()
+        queries = build_image_queries(course=course, pdf_headings=pdf_headings, context_text=context_for_img, llm_image_query=img_q)
+        fallback = build_fallback_query(course, pdf_headings)
         dl = ensure_image(images_dir, queries=queries, stem=f"page_{i}", fallback_query=fallback)
+
         new_blocks.append(h5p_image(dl["path"], dl["mime"], alt=heading, caption=heading))
 
         html = f"<h3>{heading}</h3>\n{body}" if heading else body
@@ -821,8 +1205,6 @@ def update_page_template_with_images(
     lib_list[:] = new_blocks
     _save_json(work_dir, "content/content.json", content)
     return qa_items
-
-
 
 def h5p_set_image_fields(obj: Any, rel_path: str, mime: str) -> Any:
     """Template-tolerant setter for H5P file objects (commonly used for images).
@@ -1019,12 +1401,11 @@ def update_course_presentation_template_with_images(
     description: str,
     slides: List[Dict[str, Any]],
     course: str = "",
+    pdf_headings: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Populate a Course Presentation template while preserving slide layout.
-    - Reuses existing slides/elements from the template whenever possible.
-    - Sets text in the first AdvancedText element per slide.
-    - Replaces the first Image element per slide (or background image if present).
-    """
+    """Populate a Course Presentation template while preserving slide layout."""
+    pdf_headings = pdf_headings or []
+
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
 
@@ -1035,9 +1416,7 @@ def update_course_presentation_template_with_images(
             "Export a blank Course Presentation with at least 1 slide and re-add it to ./templates."
         )
 
-    sample_slide = None
-    if slides_ref and isinstance(slides_ref[0], dict):
-        sample_slide = slides_ref[0]
+    sample_slide = slides_ref[0] if slides_ref and isinstance(slides_ref[0], dict) else None
 
     images_dir = os.path.join(work_dir, "content", "images")
     os.makedirs(images_dir, exist_ok=True)
@@ -1051,6 +1430,7 @@ def update_course_presentation_template_with_images(
     for i, gen in enumerate(slides, start=1):
         if i > len(slides_ref):
             break
+
         slide_obj = slides_ref[i - 1]
         heading = (gen.get("heading") or "").strip()
         bullets = gen.get("bullets") or []
@@ -1060,23 +1440,27 @@ def update_course_presentation_template_with_images(
         deep_find_set_first(slide_obj, ["slideTitle", "title", "heading"], heading)
 
         html = _html_bullets(heading, bullets)
-        adv_blocks = [b for b in _iter_library_blocks(slide_obj) if str(b.get("library","")).startswith("H5P.AdvancedText")]
+        adv_blocks = [b for b in _iter_library_blocks(slide_obj) if str(b.get("library", "")).startswith("H5P.AdvancedText")]
         if adv_blocks:
             adv_blocks[0].setdefault("params", {})
             adv_blocks[0]["params"]["text"] = html
         else:
             deep_find_set_first(slide_obj, ["text", "html", "content", "questionText"], html)
 
-        kw = " ".join(extract_keywords(f"{heading} {' '.join([str(x) for x in bullets])}", 4))
-        queries = [img_q, heading, kw, course]
-        fallback = "adult care" if "care" in (course or "").lower() else "workplace training"
+        context_for_img = f"{heading} {' '.join([str(x) for x in bullets])}".strip()
+        queries = build_image_queries(course=course, pdf_headings=pdf_headings, context_text=context_for_img, llm_image_query=img_q)
+        fallback = build_fallback_query(course, pdf_headings)
         dl = ensure_image(images_dir, queries=queries, stem=f"cp_slide_{i}", fallback_query=fallback)
 
-        img_blocks = [b for b in _iter_library_blocks(slide_obj) if str(b.get("library","")).startswith("H5P.Image")]
+        img_blocks = [b for b in _iter_library_blocks(slide_obj) if str(b.get("library", "")).startswith("H5P.Image")]
         if img_blocks:
             file_obj = (img_blocks[0].get("params") or {}).get("file")
             img_blocks[0].setdefault("params", {})
-            img_blocks[0]["params"]["file"] = {"path": dl["path"], "mime": dl["mime"], "copyright": {"license": "U"}} if not isinstance(file_obj, dict) else h5p_set_image_fields(file_obj, dl["path"], dl["mime"])
+            img_blocks[0]["params"]["file"] = (
+                {"path": dl["path"], "mime": dl["mime"], "copyright": {"license": "U"}}
+                if not isinstance(file_obj, dict)
+                else h5p_set_image_fields(file_obj, dl["path"], dl["mime"])
+            )
         else:
             found = deep_find_first_key(slide_obj, ["backgroundImage", "background"])
             if found and isinstance(found[1], dict):
@@ -1094,15 +1478,17 @@ def update_course_presentation_template_with_images(
     _save_json(work_dir, "content/content.json", content)
     return qa_items
 
-
 def update_interactive_book_template_with_images(
     work_dir: str,
     title: str,
     description: str,
     chapters: List[Dict[str, Any]],
     course: str = "",
+    pdf_headings: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Populate an Interactive Book template while preserving its structure."""
+    pdf_headings = pdf_headings or []
+
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
 
@@ -1113,9 +1499,7 @@ def update_interactive_book_template_with_images(
             "Export a blank Interactive Book with at least 1 chapter and re-add it to ./templates."
         )
 
-    sample_chapter = None
-    if chapters_ref and isinstance(chapters_ref[0], dict):
-        sample_chapter = chapters_ref[0]
+    sample_chapter = chapters_ref[0] if chapters_ref and isinstance(chapters_ref[0], dict) else None
 
     images_dir = os.path.join(work_dir, "content", "images")
     os.makedirs(images_dir, exist_ok=True)
@@ -1129,13 +1513,14 @@ def update_interactive_book_template_with_images(
     for ci, ch in enumerate(chapters, start=1):
         if ci > len(chapters_ref):
             break
+
         ch_obj = chapters_ref[ci - 1]
         ch_title = (ch.get("chapter_title") or ch.get("title") or f"Chapter {ci}").strip()
         deep_find_set_first(ch_obj, ["title", "chapterTitle", "chapter_title", "heading"], ch_title)
 
         sections = ch.get("sections") or []
-        parts = []
-        for si, sec in enumerate(sections, start=1):
+        parts: List[str] = []
+        for sec in sections:
             h = (sec.get("heading") or "").strip()
             body = (sec.get("body_html") or "").strip()
             if h:
@@ -1144,7 +1529,7 @@ def update_interactive_book_template_with_images(
                 parts.append(body)
         chapter_html = "\n".join(parts).strip() or f"<p>{ch_title}</p>"
 
-        adv_blocks = [b for b in _iter_library_blocks(ch_obj) if str(b.get("library","")).startswith("H5P.AdvancedText")]
+        adv_blocks = [b for b in _iter_library_blocks(ch_obj) if str(b.get("library", "")).startswith("H5P.AdvancedText")]
         if adv_blocks:
             adv_blocks[0].setdefault("params", {})
             adv_blocks[0]["params"]["text"] = chapter_html
@@ -1153,16 +1538,21 @@ def update_interactive_book_template_with_images(
 
         first_sec = sections[0] if sections else {}
         img_q = (first_sec.get("image_query") or "").strip()
-        kw = " ".join(extract_keywords(re.sub('<[^<]+?>', ' ', chapter_html), 5))
-        queries = [img_q, ch_title, kw, course]
-        fallback = "adult care" if "care" in (course or "").lower() else "workplace training"
+
+        context_for_img = re.sub("<[^<]+?>", " ", chapter_html)
+        queries = build_image_queries(course=course, pdf_headings=pdf_headings, context_text=context_for_img, llm_image_query=img_q)
+        fallback = build_fallback_query(course, pdf_headings)
         dl = ensure_image(images_dir, queries=queries, stem=f"ib_ch_{ci}", fallback_query=fallback)
 
-        img_blocks = [b for b in _iter_library_blocks(ch_obj) if str(b.get("library","")).startswith("H5P.Image")]
+        img_blocks = [b for b in _iter_library_blocks(ch_obj) if str(b.get("library", "")).startswith("H5P.Image")]
         if img_blocks:
             file_obj = (img_blocks[0].get("params") or {}).get("file")
             img_blocks[0].setdefault("params", {})
-            img_blocks[0]["params"]["file"] = {"path": dl["path"], "mime": dl["mime"], "copyright": {"license": "U"}} if not isinstance(file_obj, dict) else h5p_set_image_fields(file_obj, dl["path"], dl["mime"])
+            img_blocks[0]["params"]["file"] = (
+                {"path": dl["path"], "mime": dl["mime"], "copyright": {"license": "U"}}
+                if not isinstance(file_obj, dict)
+                else h5p_set_image_fields(file_obj, dl["path"], dl["mime"])
+            )
         else:
             found = deep_find_first_key(ch_obj, ["coverImage", "image", "backgroundImage"])
             if found and isinstance(found[1], dict):
@@ -1181,7 +1571,6 @@ def update_interactive_book_template_with_images(
     deep_find_set_first(content, ["description", "introduction", "taskDescription"], description)
     _save_json(work_dir, "content/content.json", content)
     return qa_items
-
 
 def choose_representative_chunks(chunks: List[ContentChunk], max_pages: int = 18) -> List[ContentChunk]:
     """Reduce prompt size by sampling pages across PDFs to reduce token/min rate limits."""
@@ -1437,6 +1826,7 @@ Return JSON:
 }}
 
 Rules:
+- Keep answers/options concise (typically 1–6 words where applicable).
 - sentence must include a blank marker like "____" where the missing word belongs (do NOT include the missing word in the sentence).
 - missing_word must be 1–2 words.
 - distractors should be plausible but incorrect 1–2 word options (2–4 per item).
@@ -1820,6 +2210,25 @@ def write_qa_report_html(path: str, title: str, activity_type: str, qa_items: Li
 # =========================
 st.set_page_config(page_title="H5P Activity Generator", layout="centered")
 
+st.markdown(
+    """
+    <style>
+    /* Primary buttons */
+    div.stButton > button, div.stDownloadButton > button, button[kind="primary"] {
+        background-color: #4b70fb !important;
+        border: 1px solid #4b70fb !important;
+        color: white !important;
+    }
+    div.stButton > button:hover, div.stDownloadButton > button:hover, button[kind="primary"]:hover {
+        filter: brightness(0.95);
+        border: 1px solid #4b70fb !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
 st.markdown("## H5P Activity Generator")
 st.caption("Upload PDF(s) → Get suggestions → Select one type → Generate H5P")
 
@@ -1861,11 +2270,13 @@ def ensure_chunks(files: List[Any]) -> List[ContentChunk]:
 
     chunks: List[ContentChunk] = []
     pdf_map: Dict[str, bytes] = {}
+    headings: List[str] = []
 
     for f in files:
         b = f.getvalue()
         pdf_map[f.name] = b
         chunks.extend(extract_pdf_chunks_from_bytes(f.name, b))
+        headings.extend(extract_pdf_headings_from_bytes(f.name, b))
 
     if not chunks:
         raise RuntimeError("No readable text found in the uploaded PDF(s). (If PDFs are scanned images, use OCR PDFs.)")
@@ -1873,8 +2284,8 @@ def ensure_chunks(files: List[Any]) -> List[ContentChunk]:
     st.session_state["pdf_fingerprints"] = fps
     st.session_state["chunks_cache"] = chunks
     st.session_state["pdf_bytes_map"] = pdf_map
+    st.session_state["pdf_headings_cache"] = headings
     return chunks
-
 
     chunks: List[ContentChunk] = []
     for f in files:
@@ -2143,6 +2554,7 @@ if st.session_state["suggestions"]:
                         description=desc,
                         chapters=gen_data.get("chapters", []),
                         course=course_name.strip(),
+                        pdf_headings=st.session_state.get("pdf_headings_cache") or [],
                     )
 
                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
