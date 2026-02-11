@@ -1,0 +1,92 @@
+{
+  "recommendations": [
+    {
+      "activity_type": "Multiple Choice",
+      "score_0_to_5": 5,
+      "why": "Multiple Choice questions align well with the ITIL Foundation exam format which uses 40 multiple-choice questions to assess understanding of key ITIL concepts.",
+      "suggested_item_count": 40,
+      "evidence": {
+        "source_file": "9.pdf",
+        "locator": "Page 2",
+        "quote": "Type Online, multiple choice, 40 questions."
+      }
+    },
+    {
+      "activity_type": "Fill in the Blanks",
+      "score_0_to_5": 4,
+      "why": "Fill in the Blanks supports learning of key ITIL terminology and concepts, matching the 'missing word' question style used in the ITIL exam.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "9.pdf",
+        "locator": "Page 4",
+        "quote": "Identify the missing word(s) in the following sentence."
+      }
+    },
+    {
+      "activity_type": "Course Presentation",
+      "score_0_to_5": 5,
+      "why": "Course Presentation is ideal for delivering structured content on ITIL guiding principles, practices, and framework in an engaging format.",
+      "suggested_item_count": 20,
+      "evidence": {
+        "source_file": "E-Book.pdf",
+        "locator": "Page 8",
+        "quote": "The ITIL framework is supported by a series of guiding principles that inform its approach to IT service management."
+      }
+    },
+    {
+      "activity_type": "Summary",
+      "score_0_to_5": 4,
+      "why": "Summary activities help learners consolidate knowledge of ITIL practices and principles, reinforcing key points after detailed modules.",
+      "suggested_item_count": 8,
+      "evidence": {
+        "source_file": "8.pdf",
+        "locator": "Page 85",
+        "quote": "Summary"
+      }
+    },
+    {
+      "activity_type": "Interactive Book",
+      "score_0_to_5": 4,
+      "why": "Interactive Book allows integration of multiple content types and detailed explanations, suitable for comprehensive ITIL practice modules.",
+      "suggested_item_count": 1,
+      "evidence": {
+        "source_file": "E-Book.pdf",
+        "locator": "Page 10",
+        "quote": "The ITIL 4 Foundation course covers the fundamental concepts of the ITIL 4 framework."
+      }
+    },
+    {
+      "activity_type": "Dialog Cards",
+      "score_0_to_5": 3,
+      "why": "Dialog Cards can be used for quick recall of ITIL key terms and definitions, supporting memorization of important concepts.",
+      "suggested_item_count": 20,
+      "evidence": {
+        "source_file": "E-Book.pdf",
+        "locator": "Page 11",
+        "quote": "Provides a systematic approach to IT service management, grounded in industry best practices."
+      }
+    },
+    {
+      "activity_type": "Drag the Words",
+      "score_0_to_5": 3,
+      "why": "Drag the Words can engage learners in matching ITIL terms with their definitions or processes, reinforcing understanding interactively.",
+      "suggested_item_count": 15,
+      "evidence": {
+        "source_file": "8.pdf",
+        "locator": "Page 15",
+        "quote": "Change Enablement is the practice that has the concern of balancing the benefit of any change against the risk that it can introduce."
+      }
+    },
+    {
+      "activity_type": "Mark the Words",
+      "score_0_to_5": 3,
+      "why": "Mark the Words can be used to highlight key ITIL concepts or principles within text passages, aiding focused reading and comprehension.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "E-Book.pdf",
+        "locator": "Page 8",
+        "quote": "The ITIL framework is supported by a series of guiding principles that inform its approach to IT service management."
+      }
+    }
+  ]
+}

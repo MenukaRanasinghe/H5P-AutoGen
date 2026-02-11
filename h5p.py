@@ -4,6 +4,7 @@ import re
 import json
 import copy
 import glob
+# Image sourcing: Wikimedia Commons (no API key required)
 
 import shutil
 import zipfile
@@ -2396,6 +2397,9 @@ with colA:
 with colB:
     clear_clicked = st.button("Clear", use_container_width=True, disabled=st.session_state["busy"])
 
+# Placeholder for suggest progress bar (appears directly under the buttons)
+suggest_progress_area = st.empty()
+
 if clear_clicked:
     st.session_state["pdf_fingerprints"] = None
     st.session_state["chunks_cache"] = None
@@ -2430,7 +2434,12 @@ if suggest_clicked:
             st.error("Missing API key. Set LLM_API_KEY.")
             st.stop()
 
+        # Show progress bar under the button
+        _suggest_bar = suggest_progress_area.progress(0, text="Validating inputs...")
+        time.sleep(0.3)
+
         # Extract qualification spec text for LLM context
+        _suggest_bar.progress(10, text="Reading qualification specification...")
         qual_spec_text = ""
         try:
             qual_spec_chunks = extract_pdf_chunks_from_bytes(qual_spec_file.name, qual_spec_file.getvalue())
@@ -2441,24 +2450,34 @@ if suggest_clicked:
 
         key = compute_inputs_key(uploads, course_name, unit_name, qual_spec_file)
         if st.session_state["suggestions_cache_key"] == key and st.session_state["suggestions"] is not None:
-            # Already computed for these inputs
-            pass
+            _suggest_bar.progress(100, text="Done ✓")
+            time.sleep(0.5)
+            suggest_progress_area.empty()
         else:
+            _suggest_bar.progress(25, text="Extracting PDF content...")
             chunks = ensure_chunks(uploads)
             disk_key = f"suggest_{key}"
             cached = cache_read_json(disk_key)
             if cached is not None:
                 st.session_state["suggestions"] = cached
                 st.session_state["suggestions_cache_key"] = key
+                _suggest_bar.progress(100, text="Done ✓")
+                time.sleep(0.5)
+                suggest_progress_area.empty()
             else:
                 chunks_small = choose_representative_chunks(chunks, max_pages=18)
-                with st.spinner("Analysing PDFs and generating suggestions..."):
-                    s = llm_suggest_activities(chunks_small, course_name.strip(), unit_name.strip(), qual_spec_text)
+                _suggest_bar.progress(40, text="Analysing content with AI...")
+                s = llm_suggest_activities(chunks_small, course_name.strip(), unit_name.strip(), qual_spec_text)
+                _suggest_bar.progress(90, text="Finalising suggestions...")
                 st.session_state["suggestions"] = s
                 st.session_state["suggestions_cache_key"] = key
                 cache_write_json(disk_key, s)
+                _suggest_bar.progress(100, text="Done ✓")
+                time.sleep(0.5)
+                suggest_progress_area.empty()
 
     except Exception as e:
+        suggest_progress_area.empty()
         msg = str(e)
         if "429" in msg or "Too Many Requests" in msg:
             st.error(msg)
@@ -2547,6 +2566,8 @@ if st.session_state["suggestions"]:
 
     gen = st.button("Generate H5P file", type="primary", use_container_width=True, disabled=st.session_state["busy"])
 
+    # Placeholder for generate progress bar (appears directly under the button)
+    gen_progress_area = st.empty()
 
     if gen:
         try:
@@ -2559,9 +2580,14 @@ if st.session_state["suggestions"]:
                     st.error(f"Missing template: templates/{chosen['type']}.h5p")
                 st.stop()
 
+            _gen_bar = gen_progress_area.progress(0, text="Preparing content...")
+            time.sleep(0.3)
+
+            _gen_bar.progress(10, text="Extracting PDF content...")
             chunks = ensure_chunks(uploads)
 
             # Build enriched course context for LLM prompts
+            _gen_bar.progress(15, text="Building course context...")
             _qs_text = st.session_state.get("qual_spec_text", "")
             _course_label = course_name.strip()
             _unit_label = (unit_name or "").strip()
@@ -2576,8 +2602,11 @@ if st.session_state["suggestions"]:
                 typ = chosen["type"]
                 run_n = int(n_items)
 
+                _gen_bar.progress(25, text=f"Generating {typ} content with AI...")
+
                 if typ == "Quiz":
                     tf = call_llm_truefalse_statements(chunks, run_n, enriched_course)
+                    _gen_bar.progress(65, text="AI content generated — building template...")
 
                     qs_dir = os.path.join(tmp, "_work_qs_tf")
                     unzip_h5p(templates["Quiz"], qs_dir)
@@ -2594,6 +2623,7 @@ if st.session_state["suggestions"]:
 
                 elif typ == "Multiple Choice":
                     mc = call_llm_multichoice_questions(chunks, run_n, enriched_course)
+                    _gen_bar.progress(65, text="AI content generated — building template...")
 
                     qs_dir = os.path.join(tmp, "_work_qs_mc")
                     unzip_h5p(templates["Quiz"], qs_dir)
@@ -2613,6 +2643,7 @@ if st.session_state["suggestions"]:
                     unzip_h5p(templates["Dialog Cards"], work_dir)
 
                     gen_data = call_llm_dialog_cards(chunks, run_n, enriched_course)
+                    _gen_bar.progress(65, text="AI content generated — building template...")
                     title = gen_data.get("title", f"Dialog Cards - {course_name.strip()}")
                     desc = gen_data.get("description", "")
 
@@ -2629,6 +2660,7 @@ if st.session_state["suggestions"]:
                     unzip_h5p(templates["Page"], work_dir)
 
                     gen_data = call_llm_page_content(chunks, n_sections=min(6, max(3, run_n // 2)), course=enriched_course)
+                    _gen_bar.progress(65, text="AI content generated — building template...")
                     title = gen_data.get("title", f"Page - {course_name.strip()}")
                     qa_items = update_page_template_with_images(work_dir, title, gen_data.get("sections", []), course=course_name.strip())
 
@@ -2643,6 +2675,7 @@ if st.session_state["suggestions"]:
                     unzip_h5p(templates["Course Presentation"], work_dir)
 
                     gen_data = call_llm_course_presentation(chunks, n_slides=run_n, course=enriched_course)
+                    _gen_bar.progress(65, text="AI content generated — building template...")
                     title = gen_data.get("title", f"Course Presentation - {course_name.strip()}")
                     desc = gen_data.get("description", "")
 
@@ -2665,6 +2698,7 @@ if st.session_state["suggestions"]:
                     unzip_h5p(templates["Interactive Book"], work_dir)
 
                     gen_data = call_llm_interactive_book(chunks, n_chapters=max(2, min(6, run_n // 2)), course=enriched_course)
+                    _gen_bar.progress(65, text="AI content generated — building template...")
                     title = gen_data.get("title", f"Interactive Book - {course_name.strip()}")
                     desc = gen_data.get("description", "")
 
@@ -2690,6 +2724,7 @@ if st.session_state["suggestions"]:
 
                     if meta_t["mode"] == "dragtext":
                         gen_data = call_llm_drag_words(chunks, run_n, enriched_course)
+                        _gen_bar.progress(65, text="AI content generated — building template...")
                         textfield = make_dragtext_textfield(gen_data["items"])
                         update_text_based_template(work_dir, gen_data["title"], gen_data["description"], textfield, gen_data.get("overall_feedback"), meta_t["textfield_keys"])
                         title = gen_data["title"]
@@ -2702,6 +2737,7 @@ if st.session_state["suggestions"]:
 
                     elif meta_t["mode"] == "blanks":
                         gen_data = call_llm_fill_blanks(chunks, run_n, enriched_course)
+                        _gen_bar.progress(65, text="AI content generated — building template...")
                         textfield = make_blanks_textfield(gen_data["items"])
                         update_text_based_template(work_dir, gen_data["title"], gen_data["description"], textfield, gen_data.get("overall_feedback"), meta_t["textfield_keys"])
                         title = gen_data["title"]
@@ -2710,6 +2746,7 @@ if st.session_state["suggestions"]:
 
                     else:  # markwords
                         gen_data = call_llm_mark_words(chunks, run_n, enriched_course)
+                        _gen_bar.progress(65, text="AI content generated — building template...")
                         textfield = make_mark_words_textfield(gen_data["items"])
                         update_text_based_template(work_dir, gen_data["title"], gen_data["description"], textfield, None, meta_t["textfield_keys"])
                         title = gen_data["title"]
@@ -2726,6 +2763,7 @@ if st.session_state["suggestions"]:
                     work_dir = os.path.join(tmp, "_work_summary")
                     unzip_h5p(templates["Summary"], work_dir)
                     gen_data = call_llm_summary(chunks, run_n, enriched_course)
+                    _gen_bar.progress(65, text="AI content generated — building template...")
                     update_summary_template(work_dir, gen_data["title"], gen_data["description"], gen_data["items"])
                     title = gen_data["title"]
 
@@ -2753,6 +2791,7 @@ if st.session_state["suggestions"]:
                         template_content_json=tpl_content,
                         item_count=run_n,
                     )
+                    _gen_bar.progress(65, text="AI content generated — building template...")
 
                     update_h5p_title(work_dir, gen_data["title"])
                     _save_json(work_dir, "content/content.json", gen_data["patched_content_json"])
@@ -2764,7 +2803,11 @@ if st.session_state["suggestions"]:
                     out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
                     write_qa_report_html(out_qa, title, typ, gen_data.get("qa_items", []))
 
+                _gen_bar.progress(90, text="Packaging H5P file...")
                 st.success("Done.")
+                _gen_bar.progress(100, text="Done ✓")
+                time.sleep(0.8)
+                gen_progress_area.empty()
 
                 # Persist outputs in session state so downloads remain available after reruns
                 with open(out_h5p, "rb") as f:
@@ -2775,6 +2818,7 @@ if st.session_state["suggestions"]:
                 st.session_state["last_qa_name"] = os.path.basename(out_qa)
 
         except Exception as e:
+            gen_progress_area.empty()
             msg = str(e)
             if "429" in msg or "Too Many Requests" in msg:
                 st.error("Rate limit reached while generating. Please wait a minute and try again.")
