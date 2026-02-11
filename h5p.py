@@ -4,7 +4,6 @@ import re
 import json
 import copy
 import glob
-# Image sourcing: Wikimedia Commons (no API key required)
 
 import shutil
 import zipfile
@@ -1790,19 +1789,24 @@ def call_openai_chat_json(system: str, user: str, model: str = "gpt-4.1-mini", t
 # ----------------------------
 # Suggestion + generators (data)
 # ----------------------------
-def llm_suggest_activities(chunks: List[ContentChunk], course_name: str) -> Dict[str, Any]:
+def llm_suggest_activities(chunks: List[ContentChunk], course_name: str, unit_name: str = "", qual_spec_text: str = "") -> Dict[str, Any]:
     system = "You are an instructional designer specialising in H5P. Return valid JSON only."
     src = join_chunks_for_prompt(chunks, max_chars=65000)
+
+    unit_block = f"\nUnit name: {unit_name}\n" if unit_name else ""
+    qual_block = f"\nQUALIFICATION SPECIFICATION:\n{qual_spec_text[:20000]}\n" if qual_spec_text.strip() else ""
+
     user = f"""
 Recommend suitable H5P activity types for this course: {course_name}
-
+{unit_block}
 Consider these H5P types (exact labels):
 {BEST_H5P_TYPES}
 
 Return ONLY the best 8 recommendations.
 
 Rules:
-- Base suggestions on the source text.
+- Base suggestions on the source text and the qualification specification.
+- Align suggestions to the unit name and learning outcomes where possible.
 - Give a short practical reason.
 - Give suggested_item_count (typical number of items/questions).
 - Include one short exact quote with page reference.
@@ -1819,7 +1823,7 @@ JSON schema:
     }}
   ]
 }}
-
+{qual_block}
 SOURCE TEXT:
 {src}
 """.strip()
@@ -2314,7 +2318,7 @@ st.markdown(
 
 
 st.markdown("## H5P Activity Generator")
-st.caption("Upload PDF(s) → Get suggestions → Select one type → Generate H5P")
+st.caption("Fill in all required fields (*) → Get suggestions → Select one type → Generate H5P")
 
 templates = discover_templates("templates")
 
@@ -2325,6 +2329,7 @@ st.session_state.setdefault("pdf_bytes_map", None)
 st.session_state.setdefault("suggestions_cache_key", None)
 st.session_state.setdefault("suggestions", None)
 st.session_state.setdefault("busy", False)
+st.session_state.setdefault("qual_spec_text", "")
 
 # Persist latest outputs across Streamlit reruns (download buttons remain visible)
 st.session_state.setdefault("last_h5p_bytes", None)
@@ -2332,16 +2337,20 @@ st.session_state.setdefault("last_h5p_name", None)
 st.session_state.setdefault("last_qa_bytes", None)
 st.session_state.setdefault("last_qa_name", None)
 
-uploads = st.file_uploader("Upload PDF file(s)", type=["pdf"], accept_multiple_files=True)
-course_name = st.text_input("Course name", placeholder="e.g., Level 5 Diploma in ...")
+uploads = st.file_uploader("Upload PDF file(s) *", type=["pdf"], accept_multiple_files=True)
+course_name = st.text_input("Course name *", placeholder="e.g., Level 5 Diploma in ...")
+unit_name = st.text_input("Unit name *", placeholder="e.g., Unit 1: Personal Development")
+qual_spec_file = st.file_uploader("Qualification specification file *", type=["pdf"], accept_multiple_files=False, key="qual_spec")
 
-def compute_inputs_key(files: List[Any], course: str) -> str:
-    # Use file hashes + course name to cache extraction + suggestions
-    parts = [course.strip()]
+def compute_inputs_key(files: List[Any], course: str, unit: str = "", qual_file: Any = None) -> str:
+    parts = [course.strip(), unit.strip()]
     for f in files:
         b = f.getvalue()
         parts.append(f.name)
         parts.append(file_sha256(b))
+    if qual_file is not None:
+        parts.append(qual_file.name)
+        parts.append(file_sha256(qual_file.getvalue()))
     return hashlib.sha256(("|".join(parts)).encode("utf-8")).hexdigest()
 def ensure_chunks(files: List[Any]) -> List[ContentChunk]:
     fps = [(f.name, file_sha256(f.getvalue())) for f in files]
@@ -2397,6 +2406,7 @@ if clear_clicked:
     st.session_state["last_h5p_name"] = None
     st.session_state["last_qa_bytes"] = None
     st.session_state["last_qa_name"] = None
+    st.session_state["qual_spec_text"] = ""
     st.session_state["busy"] = False
     st.rerun()
 
@@ -2410,11 +2420,26 @@ if suggest_clicked:
         if not (course_name or "").strip():
             st.warning("Please enter the course name.")
             st.stop()
+        if not (unit_name or "").strip():
+            st.warning("Please enter the unit name.")
+            st.stop()
+        if qual_spec_file is None:
+            st.warning("Please upload a qualification specification file.")
+            st.stop()
         if not os.environ.get("LLM_API_KEY"):
             st.error("Missing API key. Set LLM_API_KEY.")
             st.stop()
 
-        key = compute_inputs_key(uploads, course_name)
+        # Extract qualification spec text for LLM context
+        qual_spec_text = ""
+        try:
+            qual_spec_chunks = extract_pdf_chunks_from_bytes(qual_spec_file.name, qual_spec_file.getvalue())
+            qual_spec_text = join_chunks_for_prompt(qual_spec_chunks, max_chars=30000)
+        except Exception:
+            st.warning("Could not extract text from qualification specification file. Proceeding without it.")
+        st.session_state["qual_spec_text"] = qual_spec_text
+
+        key = compute_inputs_key(uploads, course_name, unit_name, qual_spec_file)
         if st.session_state["suggestions_cache_key"] == key and st.session_state["suggestions"] is not None:
             # Already computed for these inputs
             pass
@@ -2428,7 +2453,7 @@ if suggest_clicked:
             else:
                 chunks_small = choose_representative_chunks(chunks, max_pages=18)
                 with st.spinner("Analysing PDFs and generating suggestions..."):
-                    s = llm_suggest_activities(chunks_small, course_name.strip())
+                    s = llm_suggest_activities(chunks_small, course_name.strip(), unit_name.strip(), qual_spec_text)
                 st.session_state["suggestions"] = s
                 st.session_state["suggestions_cache_key"] = key
                 cache_write_json(disk_key, s)
@@ -2536,12 +2561,23 @@ if st.session_state["suggestions"]:
 
             chunks = ensure_chunks(uploads)
 
+            # Build enriched course context for LLM prompts
+            _qs_text = st.session_state.get("qual_spec_text", "")
+            _course_label = course_name.strip()
+            _unit_label = (unit_name or "").strip()
+            _context_parts = [_course_label]
+            if _unit_label:
+                _context_parts.append(f"Unit: {_unit_label}")
+            if _qs_text:
+                _context_parts.append(f"Qualification Specification excerpt:\n{_qs_text[:12000]}")
+            enriched_course = "\n".join(_context_parts)
+
             with tempfile.TemporaryDirectory() as tmp:
                 typ = chosen["type"]
                 run_n = int(n_items)
 
                 if typ == "Quiz":
-                    tf = call_llm_truefalse_statements(chunks, run_n, course_name.strip())
+                    tf = call_llm_truefalse_statements(chunks, run_n, enriched_course)
 
                     qs_dir = os.path.join(tmp, "_work_qs_tf")
                     unzip_h5p(templates["Quiz"], qs_dir)
@@ -2557,7 +2593,7 @@ if st.session_state["suggestions"]:
                     write_qa_report_html(out_qa, title, "Quiz (Question Set) — True/False", qa_items)
 
                 elif typ == "Multiple Choice":
-                    mc = call_llm_multichoice_questions(chunks, run_n, course_name.strip())
+                    mc = call_llm_multichoice_questions(chunks, run_n, enriched_course)
 
                     qs_dir = os.path.join(tmp, "_work_qs_mc")
                     unzip_h5p(templates["Quiz"], qs_dir)
@@ -2576,7 +2612,7 @@ if st.session_state["suggestions"]:
                     work_dir = os.path.join(tmp, "_work_dialog")
                     unzip_h5p(templates["Dialog Cards"], work_dir)
 
-                    gen_data = call_llm_dialog_cards(chunks, run_n, course_name.strip())
+                    gen_data = call_llm_dialog_cards(chunks, run_n, enriched_course)
                     title = gen_data.get("title", f"Dialog Cards - {course_name.strip()}")
                     desc = gen_data.get("description", "")
 
@@ -2592,7 +2628,7 @@ if st.session_state["suggestions"]:
                     work_dir = os.path.join(tmp, "_work_page")
                     unzip_h5p(templates["Page"], work_dir)
 
-                    gen_data = call_llm_page_content(chunks, n_sections=min(6, max(3, run_n // 2)), course=course_name.strip())
+                    gen_data = call_llm_page_content(chunks, n_sections=min(6, max(3, run_n // 2)), course=enriched_course)
                     title = gen_data.get("title", f"Page - {course_name.strip()}")
                     qa_items = update_page_template_with_images(work_dir, title, gen_data.get("sections", []), course=course_name.strip())
 
@@ -2606,7 +2642,7 @@ if st.session_state["suggestions"]:
                     work_dir = os.path.join(tmp, "_work_course_presentation")
                     unzip_h5p(templates["Course Presentation"], work_dir)
 
-                    gen_data = call_llm_course_presentation(chunks, n_slides=run_n, course=course_name.strip())
+                    gen_data = call_llm_course_presentation(chunks, n_slides=run_n, course=enriched_course)
                     title = gen_data.get("title", f"Course Presentation - {course_name.strip()}")
                     desc = gen_data.get("description", "")
 
@@ -2628,7 +2664,7 @@ if st.session_state["suggestions"]:
                     work_dir = os.path.join(tmp, "_work_interactive_book")
                     unzip_h5p(templates["Interactive Book"], work_dir)
 
-                    gen_data = call_llm_interactive_book(chunks, n_chapters=max(2, min(6, run_n // 2)), course=course_name.strip())
+                    gen_data = call_llm_interactive_book(chunks, n_chapters=max(2, min(6, run_n // 2)), course=enriched_course)
                     title = gen_data.get("title", f"Interactive Book - {course_name.strip()}")
                     desc = gen_data.get("description", "")
 
@@ -2653,7 +2689,7 @@ if st.session_state["suggestions"]:
                     unzip_h5p(templates[typ], work_dir)
 
                     if meta_t["mode"] == "dragtext":
-                        gen_data = call_llm_drag_words(chunks, run_n, course_name.strip())
+                        gen_data = call_llm_drag_words(chunks, run_n, enriched_course)
                         textfield = make_dragtext_textfield(gen_data["items"])
                         update_text_based_template(work_dir, gen_data["title"], gen_data["description"], textfield, gen_data.get("overall_feedback"), meta_t["textfield_keys"])
                         title = gen_data["title"]
@@ -2665,7 +2701,7 @@ if st.session_state["suggestions"]:
                                     for it in gen_data.get("items", [])]
 
                     elif meta_t["mode"] == "blanks":
-                        gen_data = call_llm_fill_blanks(chunks, run_n, course_name.strip())
+                        gen_data = call_llm_fill_blanks(chunks, run_n, enriched_course)
                         textfield = make_blanks_textfield(gen_data["items"])
                         update_text_based_template(work_dir, gen_data["title"], gen_data["description"], textfield, gen_data.get("overall_feedback"), meta_t["textfield_keys"])
                         title = gen_data["title"]
@@ -2673,7 +2709,7 @@ if st.session_state["suggestions"]:
                                     for i, it in enumerate(gen_data.get("items", []))]
 
                     else:  # markwords
-                        gen_data = call_llm_mark_words(chunks, run_n, course_name.strip())
+                        gen_data = call_llm_mark_words(chunks, run_n, enriched_course)
                         textfield = make_mark_words_textfield(gen_data["items"])
                         update_text_based_template(work_dir, gen_data["title"], gen_data["description"], textfield, None, meta_t["textfield_keys"])
                         title = gen_data["title"]
@@ -2689,7 +2725,7 @@ if st.session_state["suggestions"]:
                 elif typ == "Summary":
                     work_dir = os.path.join(tmp, "_work_summary")
                     unzip_h5p(templates["Summary"], work_dir)
-                    gen_data = call_llm_summary(chunks, run_n, course_name.strip())
+                    gen_data = call_llm_summary(chunks, run_n, enriched_course)
                     update_summary_template(work_dir, gen_data["title"], gen_data["description"], gen_data["items"])
                     title = gen_data["title"]
 
@@ -2711,7 +2747,7 @@ if st.session_state["suggestions"]:
 
                     gen_data = call_llm_generic_patch(
                         chunks=chunks,
-                        course_name=course_name.strip(),
+                        course_name=enriched_course,
                         activity_type=typ,
                         template_h5p_json=tpl_h5p,
                         template_content_json=tpl_content,
