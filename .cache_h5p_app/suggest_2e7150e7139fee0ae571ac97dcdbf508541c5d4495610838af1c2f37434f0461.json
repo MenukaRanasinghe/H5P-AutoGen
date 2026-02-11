@@ -1,0 +1,92 @@
+{
+  "recommendations": [
+    {
+      "activity_type": "Course Presentation",
+      "score_0_to_5": 5,
+      "why": "Ideal for delivering structured content on ITIL practices and the Service Value System, supporting clear explanation of concepts and processes.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "5.pdf",
+        "locator": "Page 3",
+        "quote": "The ITIL service value system (SVS) describes how all the components and activities of the organisation work together as a system to enable value creation."
+      }
+    },
+    {
+      "activity_type": "Multiple Choice",
+      "score_0_to_5": 5,
+      "why": "Effective for assessing knowledge of definitions, purposes, and key concepts such as ITIL practices and components of the SVS.",
+      "suggested_item_count": 15,
+      "evidence": {
+        "source_file": "7.pdf",
+        "locator": "Page 2",
+        "quote": "Recall the definitions of the following terms: IT asset, Event, Configuration item, Information security management, Relationship management, Supplier management."
+      }
+    },
+    {
+      "activity_type": "Fill in the Blanks",
+      "score_0_to_5": 4,
+      "why": "Useful for reinforcing terminology and key phrases related to ITIL practices and their purposes, enhancing recall.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "7.pdf",
+        "locator": "Page 12",
+        "quote": "The purpose of the Information Security Management practice is to protect the information needed by the organisation to conduct its business."
+      }
+    },
+    {
+      "activity_type": "Summary",
+      "score_0_to_5": 4,
+      "why": "Helps learners consolidate understanding of complex topics like Relationship Management and Supplier Management by summarizing key points.",
+      "suggested_item_count": 5,
+      "evidence": {
+        "source_file": "7.pdf",
+        "locator": "Page 16",
+        "quote": "The relationship management practice ensures that: stakeholders’ needs and drivers are understood, and products and services are prioritised appropriately."
+      }
+    },
+    {
+      "activity_type": "Dialog Cards",
+      "score_0_to_5": 4,
+      "why": "Supports memorization of definitions and key concepts such as IT asset types and practice purposes through question-answer flashcards.",
+      "suggested_item_count": 20,
+      "evidence": {
+        "source_file": "7.pdf",
+        "locator": "Page 22",
+        "quote": "An IT Asset is defined as any component of financial value that can contribute to the delivery of an IT product or service."
+      }
+    },
+    {
+      "activity_type": "Interactive Book",
+      "score_0_to_5": 3,
+      "why": "Suitable for organizing detailed content on multiple ITIL practices and the SVS into a navigable, learner-friendly format.",
+      "suggested_item_count": 1,
+      "evidence": {
+        "source_file": "5.pdf",
+        "locator": "Page 4",
+        "quote": "The ITIL SVS includes a flexible, value-orientated operating model with a purpose to ensure that the organisation continually co-creates value with all stakeholders."
+      }
+    },
+    {
+      "activity_type": "Mark the Words",
+      "score_0_to_5": 3,
+      "why": "Good for identifying key terms and concepts within text excerpts, reinforcing understanding of ITIL terminology.",
+      "suggested_item_count": 8,
+      "evidence": {
+        "source_file": "7.pdf",
+        "locator": "Page 24",
+        "quote": "The Monitoring & Event Management practice is a proactive approach, largely using technology to identify issues before the end user is impacted."
+      }
+    },
+    {
+      "activity_type": "Drag the Words",
+      "score_0_to_5": 3,
+      "why": "Engages learners in matching ITIL terms to their definitions or purposes, supporting active learning of complex concepts.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "7.pdf",
+        "locator": "Page 27",
+        "quote": "Release Management is about making services & features actually available for use."
+      }
+    }
+  ]
+}
