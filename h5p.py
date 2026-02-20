@@ -137,6 +137,16 @@ def wikimedia_find_image_url(query: str, limit: int = 25) -> Optional[Dict[str, 
         url = info.get("url")
         if not url or w < 450 or h < 300:
             continue
+        score = _title_score(title, q_terms)
+        candidates.append({"url": url, "mime": mime, "title": title, "score": score, "w": w, "h": h})
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    best = candidates[0]
+    return {"url": best["url"], "mime": best["mime"], "title": best["title"]}
+
+
 def _freepik_headers() -> Dict[str, str]:
     """
     Freepik expects the API key in `x-freepik-api-key` and optionally an Accept-Language header.
@@ -1318,34 +1328,144 @@ def h5p_set_image_fields(obj: Any, rel_path: str, mime: str) -> Any:
 
 
 def call_llm_course_presentation(chunks: List[ContentChunk], n_slides: int, course: str) -> Dict[str, Any]:
-    system = "Create an H5P Course Presentation grounded strictly in SOURCE. Return JSON only."
+    system = (
+        "You are a strict content extractor. You ONLY use text that exists word-for-word in the SOURCE. "
+        "You NEVER add, infer, or rephrase. Every bullet point must be a direct key fact from the SOURCE — "
+        "short, plain English, maximum 12 words each. Return valid JSON only."
+    )
     src_txt = join_chunks_for_prompt(chunks, max_chars=65000)
     user = f"""
-Create a Course Presentation for course: {course}
+Extract content from the SOURCE text below and organise it into EXACTLY {n_slides} presentation slides
+for the course: {course}
 
 Return JSON:
 {{
-  "title":"string",
+  "title":"string — use the course/unit title from SOURCE",
   "description":"string",
   "slides":[
     {{
-      "heading":"string",
-      "bullets":["string","string","string"],
-      "image_query":"string",
-      "evidence":{{"source_file":"string","locator":"PDF p.X/Y","quote":"short exact quote"}}
+      "heading":"string — a section heading or topic name found in SOURCE",
+      "bullets":["short key point (max 12 words)","short key point","short key point"],
+      "image_keywords":"string — 2-5 descriptive nouns from the slide content for photo search",
+      "evidence":{{"source_file":"string","locator":"Page X","quote":"exact sentence copied from SOURCE"}}
     }}
   ]
 }}
 
-Rules:
-- Produce 5 to {n_slides} slides (keep slides concise).
-- bullets must be 3–6 short bullet points (no numbering).
-- image_query must be 2–6 words for a clear, text-free illustrative photo (no logos/brands, no source names).
-- Evidence quote must be copied exactly from SOURCE and support the slide content.
+STRICT RULES:
+1. EXACTLY {n_slides} slides — no more, no less.
+2. Each "heading" MUST be a topic or section title that appears in the SOURCE.
+3. Each bullet MUST be a factual statement directly stated in the SOURCE.
+   - Use 3-5 SHORT bullets per slide (≤12 words each).
+   - Pick only the most important facts; do NOT overload slides with text.
+   - Copy key phrases from SOURCE. Do NOT rephrase or add new information.
+4. "bullets" must be a JSON array of plain strings — never nested objects.
+5. evidence.quote MUST be an exact sentence copied verbatim from SOURCE.
+6. image_keywords: pick 2-5 descriptive nouns from the slide's own content
+   (e.g. "workplace safety training equipment"). No file names, brand names, or generic terms.
+7. Cover different sections/topics of the SOURCE across slides — do not repeat the same content.
+8. If SOURCE does not have enough distinct topics, go deeper into subtopics.
 
 SOURCE:
 {src_txt}
-"""
+""".strip()
+    return call_openai_chat_json(system, user)
+
+
+def call_llm_cp_activity_questions(
+    chunks: List[ContentChunk],
+    activity_type: str,
+    n_questions: int,
+    course: str,
+) -> Dict[str, Any]:
+    """Generate questions for a single activity type, strictly from PDF source text."""
+    system = (
+        "You are a strict quiz creator. Every question, sentence, and answer MUST come directly "
+        "from the SOURCE text. You NEVER invent facts. Copy real sentences from SOURCE and turn "
+        "them into questions. Return valid JSON only."
+    )
+    src_txt = join_chunks_for_prompt(chunks, max_chars=65000)
+
+    at = activity_type.strip()
+
+    if "true" in at.lower() or "false" in at.lower():
+        schema = """[
+    {{
+      "statement": "a factual statement copied or closely derived from SOURCE",
+      "correct_answer": "True or False",
+      "evidence": {{"source_file":"string","locator":"Page X","quote":"the exact SOURCE sentence this is based on"}}
+    }}
+  ]"""
+        type_rules = """- Take a real sentence from SOURCE and present it as a True/False statement.
+- For \"True\" items: use the sentence as-is or minimally shortened.
+- For \"False\" items: change one key fact (e.g. swap a number or term) so it becomes false.
+- correct_answer must be exactly \"True\" or \"False\".
+- Mix of True and False answers (not all the same)."""
+    elif "fill" in at.lower() or "blank" in at.lower():
+        schema = """[
+    {{
+      "sentence": "a real sentence from SOURCE with one important word replaced by ___",
+      "answer": "the removed word",
+      "evidence": {{"source_file":"string","locator":"Page X","quote":"the original complete sentence from SOURCE"}}
+    }}
+  ]"""
+        type_rules = """- Find a real sentence in SOURCE.
+- Remove ONE important keyword and replace it with ___ (three underscores).
+- answer is the exact word you removed.
+- The sentence (with the blank) must still be recognisable from SOURCE."""
+    elif "drag" in at.lower() and "word" in at.lower():
+        schema = """[
+    {{
+      "sentence": "a real sentence from SOURCE with one key word replaced by ___",
+      "missing_word": "the correct word to drag in",
+      "distractors": ["wrong1","wrong2"],
+      "evidence": {{"source_file":"string","locator":"Page X","quote":"the original complete sentence from SOURCE"}}
+    }}
+  ]"""
+        type_rules = """- Find a real sentence in SOURCE.
+- Remove ONE important keyword and replace it with ___.
+- missing_word is the correct word.
+- distractors: 2 plausible but incorrect alternatives (also relevant to the SOURCE topic)."""
+    elif "mark" in at.lower() and "word" in at.lower():
+        schema = """[
+    {{
+      "paragraph": "1-2 sentences copied from SOURCE",
+      "marked_words": ["word1","word2","word3"],
+      "evidence": {{"source_file":"string","locator":"Page X","quote":"the exact SOURCE text copied"}}
+    }}
+  ]"""
+        type_rules = """- Copy 1-2 real sentences from SOURCE as the paragraph.
+- marked_words: 2-4 important key terms/words within that paragraph that the learner should identify."""
+    else:
+        schema = """[
+    {{
+      "statement": "a factual statement from SOURCE",
+      "correct_answer": "True or False",
+      "evidence": {{"source_file":"string","locator":"Page X","quote":"exact SOURCE sentence"}}
+    }}
+  ]"""
+        type_rules = "- Fallback to True/False format. Same rules as True/False above."
+
+    user = f"""
+Create EXACTLY {n_questions} "{at}" questions based on the SOURCE text below.
+Course: {course}
+
+Return JSON:
+{{
+  "questions": {schema}
+}}
+
+STRICT RULES:
+1. EXACTLY {n_questions} questions.
+2. Every question MUST be based on a specific sentence or fact from the SOURCE text.
+{type_rules}
+3. evidence.quote MUST be the exact original sentence from SOURCE that the question is based on.
+4. Do NOT invent any facts, numbers, or terms that are not in the SOURCE.
+5. Spread questions across different parts of the SOURCE — do not cluster them from one section.
+
+SOURCE:
+{src_txt}
+""".strip()
     return call_openai_chat_json(system, user)
 
 
@@ -1469,14 +1589,181 @@ def _score_chapters_list(path: str, lst: List) -> int:
     return score
 
 
-def _html_bullets(heading: str, bullets: List[str]) -> str:
+def _html_bullets(heading: str, bullets: List[str], max_bullets: int = 4) -> str:
     h = (heading or "").strip()
-    li = "".join([f"<li>{(b or '').strip()}</li>" for b in (bullets or []) if (b or '').strip()])
+    clean = [(b or '').strip() for b in (bullets or []) if (b or '').strip()]
+    clean = clean[:max_bullets]  # cap to avoid overloaded slides
+    li = "".join([f"<li>{b}</li>" for b in clean])
     if not li:
         li = "<li>—</li>"
     if h:
         return f"<h2>{h}</h2><ul>{li}</ul>"
     return f"<ul>{li}</ul>"
+
+
+def _build_cp_activity_slide_elements(activity_type: str, questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Build H5P element(s) for ALL activity questions on a SINGLE Course Presentation slide.
+
+    IMPORTANT: Course Presentation elements use an "action" wrapper:
+    { "x":..., "y":..., "action": { "library":"...", "params":{...}, "subContentId":"...", "metadata":{...} } }
+
+    - Fill in the Blanks: one H5P.Blanks element with multiple question lines.
+    - Drag the Words: one H5P.DragText element with multi-line textField.
+    - Mark the Words: one H5P.MarkTheWords element with combined paragraphs.
+    - True/False: one H5P.TrueFalse per question stacked vertically.
+    """
+    at = (activity_type or "").strip().lower()
+    if not at or not questions:
+        return []
+
+    elements: List[Dict[str, Any]] = []
+
+    def _make_element(x, y, w, h, library, params, content_type_label):
+        return {
+            "x": x, "y": y, "width": w, "height": h,
+            "displayAsButton": False,
+            "buttonSize": "big",
+            "backgroundOpacity": 0,
+            "action": {
+                "library": library,
+                "params": params,
+                "subContentId": str(uuid.uuid4()),
+                "metadata": {
+                    "contentType": content_type_label,
+                    "license": "U",
+                    "title": "Untitled",
+                },
+            },
+        }
+
+    if "fill" in at or "blank" in at:
+        q_lines = []
+        for q in questions:
+            sentence = (q.get("sentence") or "").strip()
+            answer = (q.get("answer") or "").strip()
+            if not sentence or not answer:
+                continue
+            text = sentence
+            if f"*{answer}*" not in text:
+                text = text.replace("___", f"*{answer}*", 1)
+            if f"*{answer}*" not in text:
+                text = text.replace(answer, f"*{answer}*", 1)
+            if f"*{answer}*" not in text:
+                text += f" *{answer}*"
+            q_lines.append(f"<p>{text}</p>")
+        if q_lines:
+            elements.append(_make_element(0, 0, 100, 100, "H5P.Blanks 1.14", {
+                "questions": q_lines,
+                "overallFeedback": [{"from": 0, "to": 100}],
+                "showSolutions": "Show solution",
+                "tryAgain": "Retry",
+                "behaviour": {"enableRetry": True, "enableSolutionsButton": True,
+                              "caseSensitive": False, "autoCheck": False, "acceptSpellingErrors": False},
+            }, "Fill in the Blanks"))
+
+    elif "drag" in at and "word" in at:
+        lines = []
+        for q in questions:
+            sentence = (q.get("sentence") or "").strip()
+            missing = (q.get("missing_word") or "").strip()
+            if not sentence or not missing:
+                continue
+            text = sentence
+            if f"*{missing}*" not in text:
+                text = text.replace("___", f"*{missing}*", 1)
+            if f"*{missing}*" not in text:
+                text = text.replace(missing, f"*{missing}*", 1)
+            if f"*{missing}*" not in text:
+                text += f" *{missing}*"
+            lines.append(text)
+        if lines:
+            elements.append(_make_element(0, 0, 100, 100, "H5P.DragText 1.10", {
+                "textField": "\n".join(lines),
+                "overallFeedback": [{"from": 0, "to": 100}],
+                "behaviour": {"enableRetry": True, "enableSolutionsButton": True, "instantFeedback": False},
+                "taskDescription": "<p>Drag the words into the correct blanks.</p>",
+            }, "Drag the Words"))
+
+    elif "mark" in at and "word" in at:
+        combined_text = ""
+        for q in questions:
+            paragraph = (q.get("paragraph") or "").strip()
+            marked = q.get("marked_words") or []
+            if not paragraph or not marked:
+                continue
+            text = paragraph
+            for w in marked:
+                w = w.strip()
+                if w and f"*{w}*" not in text:
+                    text = text.replace(w, f"*{w}*", 1)
+            combined_text += text + "\n\n"
+        if combined_text.strip():
+            elements.append(_make_element(0, 0, 100, 100, "H5P.MarkTheWords 1.11", {
+                "textField": combined_text.strip(),
+                "overallFeedback": [{"from": 0, "to": 100}],
+                "behaviour": {"enableRetry": True, "enableSolutionsButton": True},
+                "taskDescription": "<p>Select the correct words.</p>",
+                "checkAnswerButton": "Check",
+                "tryAgainButton": "Retry",
+                "showSolutionButton": "Show solution",
+            }, "Mark the Words"))
+
+    elif "true" in at or "false" in at:
+        n = max(1, len(questions))
+        per_h = max(10, 90 // n)
+        for qi, q in enumerate(questions):
+            statement = (q.get("statement") or "").strip()
+            correct = (q.get("correct_answer") or "").strip().lower()
+            if not statement:
+                continue
+            elements.append(_make_element(0, qi * per_h, 100, per_h, "H5P.TrueFalse 1.8", {
+                "question": f"<p>{statement}</p>",
+                "correct": "true" if correct in ("true", "yes", "1") else "false",
+                "behaviour": {"enableRetry": True, "enableSolutionsButton": True,
+                              "confirmCheckDialog": False, "confirmRetryDialog": False},
+                "l10n": {"trueText": "True", "falseText": "False"},
+                "media": {"type": {}},
+            }, "True/False Question"))
+
+    return elements
+
+
+# Libraries that need to be in h5p.json preloadedDependencies for each activity type
+_CP_ACTIVITY_DEPENDENCIES = {
+    "true/false": [
+        {"machineName": "H5P.TrueFalse", "majorVersion": 1, "minorVersion": 8},
+    ],
+    "fill in the blanks": [
+        {"machineName": "H5P.Blanks", "majorVersion": 1, "minorVersion": 14},
+    ],
+    "drag the words": [
+        {"machineName": "H5P.DragText", "majorVersion": 1, "minorVersion": 10},
+    ],
+    "mark the words": [
+        {"machineName": "H5P.MarkTheWords", "majorVersion": 1, "minorVersion": 11},
+    ],
+}
+
+
+def _ensure_cp_activity_dependencies(work_dir: str, activity_type: str) -> None:
+    """Add the activity library to h5p.json preloadedDependencies if missing."""
+    at_lower = activity_type.strip().lower()
+    deps_to_add = _CP_ACTIVITY_DEPENDENCIES.get(at_lower, [])
+    if not deps_to_add:
+        return
+
+    h5p_path = os.path.join(work_dir, "h5p.json")
+    meta = json.loads(open(h5p_path, "r", encoding="utf-8").read())
+    existing = meta.get("preloadedDependencies") or []
+
+    existing_names = {d.get("machineName") for d in existing}
+    for dep in deps_to_add:
+        if dep["machineName"] not in existing_names:
+            existing.append(dep)
+
+    meta["preloadedDependencies"] = existing
+    with open(h5p_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
 
 
 def update_course_presentation_template_with_images(
@@ -1486,9 +1773,19 @@ def update_course_presentation_template_with_images(
     slides: List[Dict[str, Any]],
     course: str = "",
     pdf_headings: Optional[List[str]] = None,
+    activity_groups: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> List[Dict[str, Any]]:
-    """Populate a Course Presentation template while preserving slide layout."""
+    """Populate a Course Presentation template.
+    Creates N content slides + 1 activity slide (last slide with all questions).
+
+    activity_groups: {activity_type_str: [question_dicts]} — supports multiple types on one slide.
+    """
     pdf_headings = pdf_headings or []
+    activity_groups = activity_groups or {}
+
+    # Activity library prefixes to strip from content slides
+    _ACTIVITY_LIBS = ("H5P.DragText", "H5P.Blanks", "H5P.TrueFalse", "H5P.MarkTheWords",
+                      "H5P.MultiChoice", "H5P.SingleChoiceSet")
 
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
@@ -1507,56 +1804,177 @@ def update_course_presentation_template_with_images(
 
     qa_items: List[Dict[str, Any]] = []
 
-    target_n = max(1, len(slides))
-    while len(slides_ref) < target_n:
+    has_activity = bool(activity_groups and any(activity_groups.values()))
+    total_needed = len(slides) + (1 if has_activity else 0)
+    while len(slides_ref) < total_needed:
         slides_ref.append(copy.deepcopy(sample_slide) if sample_slide else {})
+    while len(slides_ref) > total_needed:
+        slides_ref.pop()
 
+    # --- Content slides ---
     for i, gen in enumerate(slides, start=1):
         if i > len(slides_ref):
             break
 
         slide_obj = slides_ref[i - 1]
         heading = (gen.get("heading") or "").strip()
-        bullets = gen.get("bullets") or []
-        img_q = (gen.get("image_query") or "").strip()
+        raw_bullets = gen.get("bullets") or []
+        # Normalise: LLM occasionally returns dicts instead of plain strings
+        bullets = []
+        for b in raw_bullets:
+            if isinstance(b, str):
+                bullets.append(b.strip())
+            elif isinstance(b, dict):
+                # Try common keys
+                text = b.get("text") or b.get("point") or b.get("content") or b.get("bullet") or ""
+                if text:
+                    bullets.append(str(text).strip())
+        img_kw = (gen.get("image_keywords") or gen.get("image_query") or "").strip()
         ev = gen.get("evidence") or {}
 
         deep_find_set_first(slide_obj, ["slideTitle", "title", "heading"], heading)
 
         html = _html_bullets(heading, bullets)
+
+        # --- Strip interactive activity elements from this content slide ---
+        if "elements" in slide_obj and isinstance(slide_obj["elements"], list):
+            def _is_activity_element(el):
+                if not isinstance(el, dict):
+                    return False
+                lib = str(el.get("library") or "")
+                if any(lib.startswith(prefix) for prefix in _ACTIVITY_LIBS):
+                    return True
+                act = el.get("action")
+                if isinstance(act, dict):
+                    alib = str(act.get("library") or "")
+                    if any(alib.startswith(prefix) for prefix in _ACTIVITY_LIBS):
+                        return True
+                return False
+
+            slide_obj["elements"] = [el for el in slide_obj["elements"] if not _is_activity_element(el)]
+
+        # --- Update AdvancedText content (or create one if missing) ---
         adv_blocks = [b for b in _iter_library_blocks(slide_obj) if str(b.get("library", "")).startswith("H5P.AdvancedText")]
         if adv_blocks:
             adv_blocks[0].setdefault("params", {})
             adv_blocks[0]["params"]["text"] = html
+        elif not deep_find_set_first(slide_obj, ["text", "html", "content", "questionText"], html):
+            # No existing text element found — inject one so the slide is never blank
+            if "elements" not in slide_obj or not isinstance(slide_obj.get("elements"), list):
+                slide_obj["elements"] = []
+            # Text occupies right 55 % when image is on slide 1; full width otherwise
+            x_pos, width = (2, 55) if i == 1 else (2, 96)
+            slide_obj["elements"].append({
+                "x": x_pos, "y": 2, "width": width, "height": 90,
+                "displayAsButton": False,
+                "buttonSize": "big",
+                "backgroundOpacity": 0,
+                "action": {
+                    "library": "H5P.AdvancedText 1.1",
+                    "params": {"text": html},
+                    "subContentId": str(uuid.uuid4()),
+                    "metadata": {
+                        "contentType": "Advanced Text",
+                        "license": "U",
+                        "title": "Untitled",
+                    },
+                },
+            })
+
+        # --- Image: only on the FIRST slide ---
+        if i == 1:
+            context_for_img = f"{heading} {' '.join([str(x) for x in bullets])}".strip()
+            queries = build_image_queries(course=course, pdf_headings=pdf_headings, context_text=context_for_img, llm_image_query=img_kw)
+            fallback = build_fallback_query(course, pdf_headings)
+            dl = ensure_image(images_dir, queries=queries, stem=f"cp_slide_{i}", fallback_query=fallback)
+
+            img_blocks = [b for b in _iter_library_blocks(slide_obj) if str(b.get("library", "")).startswith("H5P.Image")]
+            if img_blocks:
+                file_obj = (img_blocks[0].get("params") or {}).get("file")
+                img_blocks[0].setdefault("params", {})
+                img_blocks[0]["params"]["file"] = (
+                    {"path": dl["path"], "mime": dl["mime"], "copyright": {"license": "U"}}
+                    if not isinstance(file_obj, dict)
+                    else h5p_set_image_fields(file_obj, dl["path"], dl["mime"])
+                )
+            else:
+                found = deep_find_first_key(slide_obj, ["backgroundImage", "background"])
+                if found and isinstance(found[1], dict):
+                    k, v = found
+                    slide_obj[k] = h5p_set_image_fields(v, dl["path"], dl["mime"])
+                else:
+                    # Fallback: add a new image element
+                    if "elements" not in slide_obj or not isinstance(slide_obj["elements"], list):
+                        slide_obj["elements"] = []
+                    slide_obj["elements"].append({
+                        "x": 60, "y": 5, "width": 36, "height": 90,
+                        "displayAsButton": False,
+                        "buttonSize": "big",
+                        "backgroundOpacity": 0,
+                        "action": {
+                            "library": "H5P.Image 1.1",
+                            "params": {
+                                "file": {"path": dl["path"], "mime": dl["mime"], "copyright": {"license": "U"}},
+                                "alt": heading or "slide image",
+                            },
+                            "subContentId": str(uuid.uuid4()),
+                            "metadata": {"contentType": "Image", "license": "U", "title": "Untitled"},
+                        },
+                    })
         else:
-            deep_find_set_first(slide_obj, ["text", "html", "content", "questionText"], html)
-
-        context_for_img = f"{heading} {' '.join([str(x) for x in bullets])}".strip()
-        queries = build_image_queries(course=course, pdf_headings=pdf_headings, context_text=context_for_img, llm_image_query=img_q)
-        fallback = build_fallback_query(course, pdf_headings)
-        dl = ensure_image(images_dir, queries=queries, stem=f"cp_slide_{i}", fallback_query=fallback)
-
-        img_blocks = [b for b in _iter_library_blocks(slide_obj) if str(b.get("library", "")).startswith("H5P.Image")]
-        if img_blocks:
-            file_obj = (img_blocks[0].get("params") or {}).get("file")
-            img_blocks[0].setdefault("params", {})
-            img_blocks[0]["params"]["file"] = (
-                {"path": dl["path"], "mime": dl["mime"], "copyright": {"license": "U"}}
-                if not isinstance(file_obj, dict)
-                else h5p_set_image_fields(file_obj, dl["path"], dl["mime"])
-            )
-        else:
-            found = deep_find_first_key(slide_obj, ["backgroundImage", "background"])
-            if found and isinstance(found[1], dict):
-                k, v = found
-                slide_obj[k] = h5p_set_image_fields(v, dl["path"], dl["mime"])
-
+            # Remove any image elements from non-first slides
+            if "elements" in slide_obj and isinstance(slide_obj["elements"], list):
+                def _is_image_element(el):
+                    if not isinstance(el, dict):
+                        return False
+                    lib = str(el.get("library") or "")
+                    if lib.startswith("H5P.Image"):
+                        return True
+                    act = el.get("action")
+                    if isinstance(act, dict) and str(act.get("library") or "").startswith("H5P.Image"):
+                        return True
+                    return False
+                slide_obj["elements"] = [el for el in slide_obj["elements"] if not _is_image_element(el)]
         qa_items.append({
             "label": f"Slide {i}",
             "content": f"{heading}\n" + "\n".join([f"- {b}" for b in bullets[:6]]),
             "expected": "",
             "evidence": ev,
         })
+
+    # --- ONE activity slide at the end with ALL questions from all types ---
+    if has_activity:
+        act_slide_idx = len(slides)
+        act_slide_num = act_slide_idx + 1
+        slide_obj = slides_ref[act_slide_idx]
+
+        type_names = " & ".join(activity_groups.keys())
+        act_heading = f"Activity — {type_names}"
+        deep_find_set_first(slide_obj, ["slideTitle", "title", "heading"], act_heading)
+
+        # Build elements from ALL activity types and combine on one slide
+        all_act_elements: List[Dict[str, Any]] = []
+        for atype, questions in activity_groups.items():
+            if questions:
+                all_act_elements.extend(_build_cp_activity_slide_elements(atype, questions))
+                _ensure_cp_activity_dependencies(work_dir, atype)
+
+        slide_obj["elements"] = all_act_elements if all_act_elements else []
+
+        # QA report entries
+        for atype, questions in activity_groups.items():
+            for qi, q_data in enumerate(questions):
+                ev = q_data.get("evidence") or {}
+                q_summary = q_data.get("statement") or q_data.get("sentence") or q_data.get("paragraph") or ""
+                q_answer = q_data.get("correct_answer") or q_data.get("answer") or q_data.get("missing_word") or ""
+                if isinstance(q_data.get("marked_words"), list):
+                    q_answer = ", ".join(q_data["marked_words"])
+                qa_items.append({
+                    "label": f"Slide {act_slide_num} — {atype} Q{qi + 1}",
+                    "content": f"{q_summary}\nAnswer: {q_answer}",
+                    "expected": q_answer,
+                    "evidence": ev,
+                })
 
     deep_find_set_first(content, ["introduction", "description", "taskDescription"], description)
     _save_json(work_dir, "content/content.json", content)
@@ -2561,8 +2979,55 @@ if st.session_state["suggestions"]:
     st.markdown("---")
     st.markdown("### Generate H5P")
 
-    default_n = max(5, chosen["n"]) if chosen["type"] in ("Quiz", "Multiple Choice") else max(3, chosen["n"])
-    n_items = st.number_input("Number of items/questions", min_value=3, max_value=30, value=int(default_n), step=1)
+    # --- Course Presentation specific options ---
+    if chosen["type"] == "Course Presentation":
+        # Slide-count limits: 1 PDF → max 8 total (7 content + 1 activity)
+        #                     multiple PDFs → max 20 total (19 content + 1 activity)
+        n_pdfs = len(uploads) if uploads else 1
+        if n_pdfs == 1:
+            max_content_slides = 7
+            help_note = "Max 8 slides total (7 content + 1 activity) for a single PDF."
+        else:
+            max_content_slides = 19
+            help_note = "Max 20 slides total (19 content + 1 activity) for multiple PDFs."
+
+        default_slides = min(max_content_slides, max(3, chosen["n"]))
+
+        cp_n_slides = st.number_input(
+            "Number of content slides",
+            min_value=3,
+            max_value=max_content_slides,
+            value=default_slides,
+            step=1,
+            help=help_note,
+        )
+
+        cp_activity_type = st.selectbox(
+            "Activity type for the last slide",
+            options=["Drag the Words", "Fill in the Blanks"],
+            index=0,
+            help="Select one activity type for the last slide.",
+        )
+        cp_activity_types = [cp_activity_type] if cp_activity_type else []
+
+        cp_n_questions = st.number_input(
+            "Number of questions (in the activity slide)",
+            min_value=2,
+            max_value=5,
+            value=3,
+            step=1,
+            help="Total questions for the selected activity type on the last slide.",
+        )
+
+        st.caption(f"Total slides: **{int(cp_n_slides) + 1}** ({int(cp_n_slides)} content + 1 activity)")
+
+        n_items = cp_n_slides  # n_items drives the rest of the pipeline
+    else:
+        cp_n_slides = None
+        cp_activity_types = []
+        cp_n_questions = 0
+        default_n = max(5, chosen["n"]) if chosen["type"] in ("Quiz", "Multiple Choice") else max(3, chosen["n"])
+        n_items = st.number_input("Number of items/questions", min_value=3, max_value=30, value=int(default_n), step=1)
 
     gen = st.button("Generate H5P file", type="primary", use_container_width=True, disabled=st.session_state["busy"])
 
@@ -2674,8 +3139,34 @@ if st.session_state["suggestions"]:
                     work_dir = os.path.join(tmp, "_work_course_presentation")
                     unzip_h5p(templates["Course Presentation"], work_dir)
 
+                    # Step 1: Generate content slides
+                    _gen_bar.progress(30, text="Generating content slides from PDFs...")
                     gen_data = call_llm_course_presentation(chunks, n_slides=run_n, course=enriched_course)
-                    _gen_bar.progress(65, text="AI content generated — building template...")
+
+                    # Step 2: Generate activity questions for each selected type
+                    act_groups: Dict[str, List[Dict[str, Any]]] = {}
+                    if cp_activity_types and cp_n_questions and cp_n_questions > 0:
+                        n_types = len(cp_activity_types)
+                        base_per_type = int(cp_n_questions) // n_types
+                        remainder = int(cp_n_questions) % n_types
+
+                        for ti, atype in enumerate(cp_activity_types):
+                            n_q = base_per_type + (1 if ti < remainder else 0)
+                            if n_q < 1:
+                                continue
+                            _gen_bar.progress(
+                                40 + (ti * 20 // n_types),
+                                text=f"Generating {n_q} {atype} questions..."
+                            )
+                            q_data = call_llm_cp_activity_questions(
+                                chunks,
+                                activity_type=atype,
+                                n_questions=n_q,
+                                course=enriched_course,
+                            )
+                            act_groups[atype] = q_data.get("questions") or []
+
+                    _gen_bar.progress(65, text="Building presentation template...")
                     title = gen_data.get("title", f"Course Presentation - {course_name.strip()}")
                     desc = gen_data.get("description", "")
 
@@ -2685,6 +3176,8 @@ if st.session_state["suggestions"]:
                         description=desc,
                         slides=gen_data.get("slides", []),
                         course=course_name.strip(),
+                        pdf_headings=st.session_state.get("pdf_headings_cache") or [],
+                        activity_groups=act_groups,
                     )
 
                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
