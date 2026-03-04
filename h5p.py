@@ -621,6 +621,20 @@ BEST_H5P_TYPES = [
     "Summary",
 ]
 
+# Question-count limits for selected activity types
+# - For a single PDF upload: 4–8 questions
+# - For multiple PDFs:      4–12 questions
+LIMITED_Q_TYPES = {
+    "Drag the Words",
+    "Fill in the Blanks",
+    "Mark the Words",
+    "Multiple Choice",
+    "Quiz",
+    "Single Choice",
+}
+LIMITED_Q_MIN = 4
+LIMITED_Q_MAX_SINGLE_PDF = 8
+LIMITED_Q_MAX_MULTI_PDF = 12
 # Text-driven generators we implement directly (others use the generic patcher)
 BUILTIN_TEXT_TYPES = {
     "Drag the Words": {"textfield_keys": ["textField", "text", "questionText", "content"], "mode": "dragtext"},
@@ -3186,7 +3200,7 @@ if st.session_state["suggestions"]:
     meta[other_label] = {
         "type": "__OTHER__",
         "why": "",
-        "n": 8,
+        "n": 4,
         "ev": {},
         "template_ok": True,
         "score": 0,
@@ -3264,14 +3278,30 @@ if st.session_state["suggestions"]:
         cp_n_slides = None
         cp_activity_types = []
         cp_n_questions = 0
-        default_n = max(5, chosen["n"]) if chosen["type"] in ("Quiz", "Multiple Choice") else max(3, chosen["n"])
 
-        # Dialog Cards: keep a tight range (3–5) to avoid low-quality/duplicated cards
-        if chosen["type"] == "Dialog Cards":
-            default_cards = int(min(5, max(3, default_n)))
-            n_items = st.number_input("Number of cards", min_value=3, max_value=5, value=default_cards, step=1)
+        # Enforce question limits for selected types
+        n_pdfs = len(uploads) if uploads else 1
+        if chosen["type"] in LIMITED_Q_TYPES:
+            max_q = LIMITED_Q_MAX_SINGLE_PDF if n_pdfs == 1 else LIMITED_Q_MAX_MULTI_PDF
+            default_n = LIMITED_Q_MIN  # default display should start at 4
+            n_items = st.number_input(
+                "Number of items/questions",
+                min_value=LIMITED_Q_MIN,
+                max_value=int(max_q),
+                value=int(default_n),
+                step=1,
+                key=f"n_items_limited_{chosen['type']}_{n_pdfs}",
+                help=f"Allowed range: {LIMITED_Q_MIN}–{int(max_q)} ({n_pdfs} PDF{'s' if n_pdfs != 1 else ''}).",
+            )
         else:
-            n_items = st.number_input("Number of items/questions", min_value=3, max_value=30, value=int(default_n), step=1)
+            default_n = max(5, chosen["n"]) if chosen["type"] in ("Quiz", "Multiple Choice") else max(3, chosen["n"])
+
+            # Dialog Cards: keep a tight range (3–5) to avoid low-quality/duplicated cards
+            if chosen["type"] == "Dialog Cards":
+                default_cards = int(min(5, max(3, default_n)))
+                n_items = st.number_input("Number of cards", min_value=3, max_value=5, value=default_cards, step=1)
+            else:
+                n_items = st.number_input("Number of items/questions", min_value=3, max_value=30, value=int(default_n), step=1)
 
     gen = st.button("Generate H5P file", type="primary", use_container_width=True, disabled=st.session_state["busy"])
 
@@ -3310,6 +3340,12 @@ if st.session_state["suggestions"]:
             with tempfile.TemporaryDirectory() as tmp:
                 typ = chosen["type"]
                 run_n = int(n_items)
+
+                # Enforce question limits for selected types
+                if typ in LIMITED_Q_TYPES:
+                    n_pdfs = len(uploads) if uploads else 1
+                    max_q = LIMITED_Q_MAX_SINGLE_PDF if n_pdfs == 1 else LIMITED_Q_MAX_MULTI_PDF
+                    run_n = max(LIMITED_Q_MIN, min(run_n, int(max_q)))
 
                 _gen_bar.progress(25, text=f"Generating {typ} content with AI...")
 
