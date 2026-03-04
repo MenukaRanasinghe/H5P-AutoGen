@@ -45,6 +45,12 @@ FREEPIK_API_BASE = os.getenv("FREEPIK_API_BASE", "https://api.freepik.com/v1").r
 FREEPIK_LANG = os.getenv("FREEPIK_LANG", "en-US")
 FREEPIK_DEFAULT_IMAGE_SIZE = os.getenv("FREEPIK_IMAGE_SIZE", "large")  # small|medium|large|original or px string
 
+# Optional AI image generation (OpenAI Images API)
+# Set USE_AI_IMAGES=1 to enable (may incur API costs). Falls back to Freepik/Wikimedia on failure.
+USE_AI_IMAGES = os.getenv("USE_AI_IMAGES", "1")
+OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
+OPENAI_IMAGE_SIZE = os.getenv("OPENAI_IMAGE_SIZE", "1024x1024")
+
 # Filter out files that are likely to contain text overlays, logos, icons, diagrams, banners, etc.
 _BAD_TITLE_TERMS = {
     "logo","icon","diagram","chart","word","text","banner","label","seal","flag","coat","crest",
@@ -201,7 +207,7 @@ def _tokenise(s: str) -> List[str]:
     return re.findall(r"[a-z0-9]+", (s or "").lower())
 
 
-def freepik_find_image_url(query: str, limit: int = 25) -> Optional[Dict[str, Any]]:
+def freepik_find_image_url(query: str, limit: int = 25, prefer_vectors: bool = False) -> Optional[Dict[str, Any]]:
     """
     Search Freepik resources and return a best-match candidate dict:
       {id, title, page_url, preview_url, author_name, license_url, score}
@@ -209,6 +215,8 @@ def freepik_find_image_url(query: str, limit: int = 25) -> Optional[Dict[str, An
     Uses:
       - GET /v1/resources (search) to get candidates
       - Heuristics (downloads/likes + text match) to approximate "website-like" ranking
+
+    When prefer_vectors=True, vectors are searched first for a cleaner professional look.
     """
     if not FREEPIK_API_KEY:
         return None
@@ -225,11 +233,20 @@ def freepik_find_image_url(query: str, limit: int = 25) -> Optional[Dict[str, An
     per_page = min(max(25, limit), 80)
     max_pages = 3  # keep it small to avoid rate limits
 
-    # Start by preferring photos (common for course content), then relax if needed.
-    filter_sets: List[Optional[Dict[str, Any]]] = [
-        {"content_type": ["photo"]},
-        {"content_type": ["photo", "vector", "psd"]},
-    ]
+    # When prefer_vectors is set, search vectors first for cleaner professional imagery.
+    if prefer_vectors:
+        filter_sets: List[Optional[Dict[str, Any]]] = [
+            {"content_type": ["vector"]},
+            {"content_type": ["photo"]},
+            {"content_type": ["photo", "vector", "psd"]},
+        ]
+    else:
+        # Start by preferring photos (common for course content), then relax if needed.
+        filter_sets: List[Optional[Dict[str, Any]]] = [
+            {"content_type": ["photo"]},
+            {"content_type": ["vector"]},
+            {"content_type": ["photo", "vector", "psd"]},
+        ]
 
     q_tokens = set(_tokenise(q))
 
@@ -246,6 +263,19 @@ def freepik_find_image_url(query: str, limit: int = 25) -> Optional[Dict[str, An
         exact_phrase = 2.0 if q.lower() in title.lower() else 0.0
 
         is_new = bool((item.get("meta") or {}).get("is_new"))
+        tl = title.lower()
+        # Penalise "childish"/cartoon-ish assets and text-heavy graphic styles.
+        bad_terms = ["cartoon","kids","kid","child","children","cute","kawaii","doodle","hand drawn","hand-drawn","comic","coloring","colouring",
+                     "sticker","emoji","clipart","icon","logo","typography","text",
+                     "baby","toddler","nursery","kindergarten","preschool","childcare","daycare",
+                     "toy","toys","teddy","plush","crayon","finger paint"]
+        bad = sum(1 for t in bad_terms if t in tl)
+        # Boost professional/business imagery
+        good_terms = ["professional","business","corporate","office","workplace","training","modern","flat","minimal","clean"]
+        good = sum(1 for t in good_terms if t in tl)
+        # Prefer vectors when prefer_vectors is set
+        content_type = (item.get("type") or "").lower()
+        vector_bonus = 4.0 if (prefer_vectors and content_type == "vector") else 0.0
         # final score (tune as you like)
         return (
             overlap * 5.0
@@ -253,6 +283,9 @@ def freepik_find_image_url(query: str, limit: int = 25) -> Optional[Dict[str, An
             + math.log1p(downloads) * 2.0
             + math.log1p(likes) * 1.0
             + (1.0 if is_new else 0.0)
+            + good * 3.0
+            + vector_bonus
+            - (bad * 10.0)
         )
 
     best: Optional[Dict[str, Any]] = None
@@ -345,6 +378,68 @@ def freepik_download_signed_url(resource_id: int, image_size: str = None) -> Opt
         return None
 
 
+
+def openai_generate_image_to_path(images_dir: str, query: str, stem: str) -> Optional[Dict[str, Any]]:
+    """
+    Generate an image using the OpenAI Images API and save into the H5P images folder.
+
+    Controlled by env var USE_AI_IMAGES=1. Always returns a PNG (image/png) on success.
+    On any error, returns None and the caller can fall back to Freepik/Wikimedia.
+    """
+    if str(USE_AI_IMAGES).strip() != "1":
+        return None
+
+    api_key = os.environ.get("LLM_API_KEY")
+    if not api_key:
+        return None
+
+    q = (query or "").strip()
+    if not q:
+        return None
+
+    # Prompt tuned for professional (non-childish), text-free visuals.
+    prompt = (
+        "Create a modern, professional, clean vector-style illustration suitable for workplace training. "
+        "No text, no logos, no watermarks, no brand names. "
+        f"Concept: {q}."
+    )
+
+    url = "https://api.openai.com/v1/images/generations"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    payload = {
+        "model": OPENAI_IMAGE_MODEL,
+        "prompt": prompt,
+        "size": OPENAI_IMAGE_SIZE,
+        "response_format": "b64_json",
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=120)
+        if r.status_code != 200:
+            return None
+        data = r.json() or {}
+        arr = data.get("data") or []
+        if not arr or not isinstance(arr, list):
+            return None
+        b64 = (arr[0] or {}).get("b64_json")
+        if not b64:
+            return None
+        img_bytes = base64.b64decode(b64)
+        os.makedirs(images_dir, exist_ok=True)
+        fname = f"{safe_filename(stem)}.png"
+        abs_path = os.path.join(images_dir, fname)
+        with open(abs_path, "wb") as f:
+            f.write(img_bytes)
+        return {
+            "path": f"images/{fname}",
+            "mime": "image/png",
+            "credit": {"provider": "openai", "model": OPENAI_IMAGE_MODEL},
+        }
+    except Exception:
+        return None
+
+
 _PLACEHOLDER_PNG_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO3G7qkAAAAASUVORK5CYII="
 )
@@ -355,7 +450,7 @@ def _write_placeholder_png(path: str) -> None:
     with open(path, "wb") as f:
         f.write(base64.b64decode(_PLACEHOLDER_PNG_B64))
 
-def download_image_to_h5p(images_dir: str, query: str, stem: str) -> Optional[Dict[str, Any]]:
+def download_image_to_h5p(images_dir: str, query: str, stem: str, prefer_vectors: bool = False) -> Optional[Dict[str, Any]]:
     """Download an image for query into content/images and return dict with rel path + mime + optional credit.
 
     Preference order:
@@ -367,9 +462,14 @@ def download_image_to_h5p(images_dir: str, query: str, stem: str) -> Optional[Di
     if not q:
         return None
 
+    # --- AI generation (optional) ---
+    ai = openai_generate_image_to_path(images_dir, q, stem=f"{stem}_ai")
+    if ai:
+        return ai
+
     # --- Freepik (preferred) ---
     if FREEPIK_API_KEY:
-        cand = freepik_find_image_url(q)
+        cand = freepik_find_image_url(q, prefer_vectors=prefer_vectors)
         if cand and cand.get("id"):
             dl_meta = freepik_download_signed_url(int(cand["id"]), image_size="large")
             signed = ""
@@ -419,7 +519,7 @@ def download_image_to_h5p(images_dir: str, query: str, stem: str) -> Optional[Di
         return None
     return {"path": f"images/{fname}", "mime": mime, "credit": {"provider": "wikimedia", "source": url}}
 
-def download_image_to_h5p_multi(images_dir: str, queries: List[str], stem: str) -> Optional[Dict[str, Any]]:
+def download_image_to_h5p_multi(images_dir: str, queries: List[str], stem: str, prefer_vectors: bool = False) -> Optional[Dict[str, Any]]:
     """Try multiple queries until an image is found."""
     seen = set()
     for q in queries:
@@ -430,14 +530,14 @@ def download_image_to_h5p_multi(images_dir: str, queries: List[str], stem: str) 
         if k in seen:
             continue
         seen.add(k)
-        dl = download_image_to_h5p(images_dir, q, stem=f"{stem}_{q[:40]}")
+        dl = download_image_to_h5p(images_dir, q, stem=f"{stem}_{q[:40]}", prefer_vectors=prefer_vectors)
         if dl:
             return dl
     return None
 
-def ensure_image(images_dir: str, queries: List[str], stem: str, fallback_query: str = "inclusive classroom") -> Dict[str, Any]:
+def ensure_image(images_dir: str, queries: List[str], stem: str, fallback_query: str = "inclusive classroom", prefer_vectors: bool = False) -> Dict[str, Any]:
     """Guarantee an image payload. Uses Freepik if configured, then Wikimedia; if it fails, writes a tiny placeholder PNG."""
-    dl = download_image_to_h5p_multi(images_dir, queries + [fallback_query], stem=stem)
+    dl = download_image_to_h5p_multi(images_dir, queries + [fallback_query], stem=stem, prefer_vectors=prefer_vectors)
     if dl:
         return dl
     # absolute last resort
@@ -761,6 +861,7 @@ def build_image_queries(
     course: str,
     pdf_headings: List[str],
     context_text: str,
+    pdf_keywords: Optional[List[str]] = None,
     llm_image_query: str = "",
     max_queries: int = 10,
 ) -> List[str]:
@@ -774,12 +875,14 @@ def build_image_queries(
     course = (course or "").strip()
     ctx = (context_text or "").strip()
     llm_q = (llm_image_query or "").strip()
+    pdf_keywords = pdf_keywords or []
 
     course_terms = _expand_course_terms(course)
     course_kw = " ".join(course_terms[:4]).strip()
 
     ctx_terms = extract_keywords(ctx, 6)
     ctx_kw = " ".join(ctx_terms[:4]).strip()
+    pdf_kw = " ".join([str(k) for k in (pdf_keywords or [])[:4]]).strip()
 
     best_heading = choose_best_heading(ctx, pdf_headings or [])
 
@@ -808,6 +911,14 @@ def build_image_queries(
         queries.append(f"{course_kw} {ctx_kw}")
     if course and ctx_kw:
         queries.append(f"{course} {ctx_kw}")
+
+    # Add globally-relevant PDF keywords to keep results on-topic
+    if pdf_kw and ctx_kw:
+        queries.append(f"{ctx_kw} {pdf_kw}")
+    if course_kw and pdf_kw:
+        queries.append(f"{course_kw} {pdf_kw}")
+    if pdf_kw:
+        queries.append(pdf_kw)
 
     # Additional fallback headings (top 2 by overlap with course terms)
     if pdf_headings:
@@ -862,7 +973,9 @@ def _find_first_library_list(d: Any) -> Optional[List]:
 
 
 def call_llm_dialog_cards(chunks: List[ContentChunk], n: int, course: str) -> Dict[str, Any]:
-    system = "Create Dialog Cards grounded strictly in SOURCE. Return JSON only."
+    system = ("You are a strict content extractor. You ONLY use text that appears verbatim in SOURCE. "
+              "Do not add, infer, embellish, or rephrase ANY facts. Every word in your answer must be traceable "
+              "to the SOURCE text. Return JSON only.")
     src_txt = join_chunks_for_prompt(chunks, max_chars=65000)
     user = f"""
 Create {n} Dialog Cards from SOURCE only for course: {course}
@@ -881,17 +994,125 @@ Return JSON:
   ]
 }}
 
-Rules:
+Rules (STRICT — violations cause rejection):
 - FRONT must be a single clear question sentence ending with '?'.
-- BACK must be a very short answer phrase (3–8 words, max 8). No full sentences, no trailing punctuation.
+- BACK must be a 3–8 word answer phrase copied EXACTLY from the QUOTE (verbatim substring, letter-for-letter match).
+- BACK MUST appear word-for-word inside evidence.quote — no rephrasing, no reordering, no synonyms.
+- FRONT must be answerable directly from the QUOTE and reuse key terms from it (no new facts).
 - The card must be directly supported by the QUOTE.
-- image_query must be 2–6 words describing a suitable, text-free stock-style image (no brands, no logos, no text overlays, no source names).
-- quote must be copied exactly from SOURCE.
+- evidence.quote must be copied character-for-character from SOURCE — do NOT paraphrase or summarise.
+- Double-check: after writing each card, verify that BACK is a contiguous substring of evidence.quote.
+- image_query must be 2–6 words describing the professional TOPIC/CONCEPT of the card (e.g. "workplace safety equipment", "first aid training", "health hygiene standards"). Use specific domain terminology from the PDF, NOT generic terms like "child care" or "education". No brands, no logos, no text overlays, no people's names.
 
 SOURCE:
 {src_txt}
 """.strip()
     return call_openai_chat_json(system, user)
+
+
+_DIALOG_QWORDS = {"what","which","who","whom","whose","when","where","why","how","define","definition","describe","identify","name"}
+
+def _dialog_front_terms(front: str) -> List[str]:
+    t = _terms(front)
+    return [x for x in t if x not in _DIALOG_QWORDS]
+
+def _norm_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+def _source_text_for_validation(chunks: List[ContentChunk]) -> str:
+    # Normalise whitespace to make quote checks robust to PDF extraction quirks
+    return _norm_ws("\n\n".join([c.text for c in chunks if c.text]))
+
+def validate_dialog_card(card: Dict[str, Any], source_text: str) -> Tuple[bool, str]:
+    """Hard validation to keep Dialog Cards 100% grounded in PDF text."""
+    front = (card.get("front") or card.get("text") or "").strip()
+    back = (card.get("back") or card.get("answer") or "").strip()
+    ev = card.get("evidence") or {}
+    quote = (ev.get("quote") or "").strip()
+
+    if not front or not back or not quote:
+        return False, "missing front/back/quote"
+    if not front.endswith("?"):
+        return False, "front not a question"
+    # Quote must be substantial enough to be meaningful evidence
+    if len(quote.split()) < 5:
+        return False, "quote too short to be meaningful evidence"
+    # 3–8 words
+    bw = re.findall(r"[A-Za-z0-9][A-Za-z0-9'\-]*", back)
+    if len(bw) < 3 or len(bw) > 8:
+        return False, "back word-count out of range"
+    # Quote must exist in extracted PDF text
+    qn = _norm_ws(quote)
+    if qn not in source_text:
+        # Also try case-insensitive match for robustness
+        if qn.lower() not in source_text.lower():
+            return False, "quote not found in PDF text"
+    # Back must appear inside quote (case-insensitive, word-boundary)
+    if re.search(r"\b" + re.escape(back) + r"\b", qn, re.IGNORECASE) is None:
+        # Also try without word boundaries for hyphenated/compound terms
+        if back.lower() not in qn.lower():
+            return False, "back not found in quote"
+    # Front must be about the quote (term overlap check)
+    f_terms = set(_dialog_front_terms(front))
+    q_terms = set(_terms(qn))
+    if f_terms:
+        overlap = len(f_terms & q_terms)
+        if overlap < max(2, int(0.5 * min(len(f_terms), len(q_terms) or 1))):
+            return False, "front not aligned to quote"
+    return True, "ok"
+
+def generate_dialog_cards_strict(
+    chunks: List[ContentChunk],
+    desired_n: int,
+    course_context: str,
+    max_attempts: int = 4,
+) -> Dict[str, Any]:
+    """Generate Dialog Cards with hard post-validation + re-tries until we have desired_n."""
+    desired_n = int(max(3, min(5, desired_n)))
+    source_text = _source_text_for_validation(chunks)
+
+    title = f"Dialog Cards - {course_context}"
+    description = ""
+    valid_cards: List[Dict[str, Any]] = []
+    used_quotes = set()
+
+    for attempt in range(max_attempts):
+        remaining = desired_n - len(valid_cards)
+        if remaining <= 0:
+            break
+
+        # Oversample slightly to survive validation rejections
+        request_n = min(8, remaining + 3)
+        gen = call_llm_dialog_cards(chunks, request_n, course_context) or {}
+
+        if not description:
+            description = (gen.get("description") or "").strip()
+        if gen.get("title"):
+            title = gen.get("title")
+
+        for c in (gen.get("cards") or []):
+            ev = c.get("evidence") or {}
+            quote = (ev.get("quote") or "").strip()
+            qn = _norm_ws(quote)
+            if not qn or qn in used_quotes:
+                continue
+            ok, _reason = validate_dialog_card(c, source_text)
+            if not ok:
+                continue
+            used_quotes.add(qn)
+            valid_cards.append(c)
+            if len(valid_cards) >= desired_n:
+                break
+
+    if len(valid_cards) < desired_n:
+        # Fail loudly rather than producing inaccurate cards
+        raise RuntimeError(
+            f"Could only validate {len(valid_cards)}/{desired_n} Dialog Cards against the PDF text. "
+            "Try reducing the number of cards or uploading a more text-based PDF."
+        )
+
+    return {"title": title, "description": description, "cards": valid_cards}
+
 
 def update_dialog_cards_template(
     work_dir: str,
@@ -900,6 +1121,7 @@ def update_dialog_cards_template(
     cards: List[Dict[str, Any]],
     course: str = "",
     pdf_headings: Optional[List[str]] = None,
+    pdf_keywords: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Populate Dialog Cards and attach an illustrative image per card.
 
@@ -908,6 +1130,7 @@ def update_dialog_cards_template(
     - Preserves the template's per-card schema by cloning a sample card object.
     """
     pdf_headings = pdf_headings or []
+    pdf_keywords = pdf_keywords or []
 
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
@@ -983,7 +1206,6 @@ def update_dialog_cards_template(
     def _clean_short_answer(s: str, max_words: int = 8) -> str:
         s = (s or "").strip()
         s = re.sub(r"[\s\.,;:!\?]+$", "", s)
-        s = re.sub(r"^(the|a|an)\s+", "", s, flags=re.I)
         words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'\-]*", s)
         if not words:
             return s
@@ -1052,9 +1274,9 @@ def update_dialog_cards_template(
             continue
 
         context_for_img = f"{front} {back} {quote}".strip()
-        queries = build_image_queries(course=course, pdf_headings=pdf_headings, context_text=context_for_img, llm_image_query=img_q)
+        queries = build_image_queries(course=course, pdf_headings=pdf_headings, pdf_keywords=pdf_keywords, context_text=context_for_img, llm_image_query=img_q)
         fallback = build_fallback_query(course, pdf_headings)
-        dl = ensure_image(images_dir, queries=queries, stem=f"dialog_{i}", fallback_query=fallback)
+        dl = ensure_image(images_dir, queries=queries, stem=f"dialog_{i}", fallback_query=fallback, prefer_vectors=True)
 
         card_obj = copy.deepcopy(sample_card) if sample_card else {}
         card_obj[front_key] = front
@@ -1225,9 +1447,11 @@ def update_page_template_with_images(
     sections: List[Dict[str, Any]],
     course: str = "",
     pdf_headings: Optional[List[str]] = None,
+    pdf_keywords: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Populate an H5P Page with Image + Text blocks."""
     pdf_headings = pdf_headings or []
+    pdf_keywords = pdf_keywords or []
 
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
@@ -1277,7 +1501,7 @@ def update_page_template_with_images(
             continue
 
         context_for_img = f"{heading} {re.sub('<[^<]+?>','', body)}".strip()
-        queries = build_image_queries(course=course, pdf_headings=pdf_headings, context_text=context_for_img, llm_image_query=img_q)
+        queries = build_image_queries(course=course, pdf_headings=pdf_headings, pdf_keywords=pdf_keywords, context_text=context_for_img, llm_image_query=img_q)
         fallback = build_fallback_query(course, pdf_headings)
         dl = ensure_image(images_dir, queries=queries, stem=f"page_{i}", fallback_query=fallback)
 
@@ -1773,6 +1997,7 @@ def update_course_presentation_template_with_images(
     slides: List[Dict[str, Any]],
     course: str = "",
     pdf_headings: Optional[List[str]] = None,
+    pdf_keywords: Optional[List[str]] = None,
     activity_groups: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> List[Dict[str, Any]]:
     """Populate a Course Presentation template.
@@ -1781,6 +2006,7 @@ def update_course_presentation_template_with_images(
     activity_groups: {activity_type_str: [question_dicts]} — supports multiple types on one slide.
     """
     pdf_headings = pdf_headings or []
+    pdf_keywords = pdf_keywords or []
     activity_groups = activity_groups or {}
 
     # Activity library prefixes to strip from content slides
@@ -1884,7 +2110,7 @@ def update_course_presentation_template_with_images(
         # --- Image: only on the FIRST slide ---
         if i == 1:
             context_for_img = f"{heading} {' '.join([str(x) for x in bullets])}".strip()
-            queries = build_image_queries(course=course, pdf_headings=pdf_headings, context_text=context_for_img, llm_image_query=img_kw)
+            queries = build_image_queries(course=course, pdf_headings=pdf_headings, pdf_keywords=pdf_keywords, context_text=context_for_img, llm_image_query=img_kw)
             fallback = build_fallback_query(course, pdf_headings)
             dl = ensure_image(images_dir, queries=queries, stem=f"cp_slide_{i}", fallback_query=fallback)
 
@@ -1987,9 +2213,11 @@ def update_interactive_book_template_with_images(
     chapters: List[Dict[str, Any]],
     course: str = "",
     pdf_headings: Optional[List[str]] = None,
+    pdf_keywords: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Populate an Interactive Book template while preserving its structure."""
     pdf_headings = pdf_headings or []
+    pdf_keywords = pdf_keywords or []
 
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
@@ -2042,7 +2270,7 @@ def update_interactive_book_template_with_images(
         img_q = (first_sec.get("image_query") or "").strip()
 
         context_for_img = re.sub("<[^<]+?>", " ", chapter_html)
-        queries = build_image_queries(course=course, pdf_headings=pdf_headings, context_text=context_for_img, llm_image_query=img_q)
+        queries = build_image_queries(course=course, pdf_headings=pdf_headings, pdf_keywords=pdf_keywords, context_text=context_for_img, llm_image_query=img_q)
         fallback = build_fallback_query(course, pdf_headings)
         dl = ensure_image(images_dir, queries=queries, stem=f"ib_ch_{ci}", fallback_query=fallback)
 
@@ -2745,6 +2973,8 @@ templates = discover_templates("templates")
 st.session_state.setdefault("pdf_fingerprints", None)
 st.session_state.setdefault("chunks_cache", None)
 st.session_state.setdefault("pdf_bytes_map", None)
+st.session_state.setdefault("pdf_headings_cache", None)
+st.session_state.setdefault("pdf_keywords_cache", None)
 st.session_state.setdefault("suggestions_cache_key", None)
 st.session_state.setdefault("suggestions", None)
 st.session_state.setdefault("busy", False)
@@ -2771,42 +3001,48 @@ def compute_inputs_key(files: List[Any], course: str, unit: str = "", qual_file:
         parts.append(qual_file.name)
         parts.append(file_sha256(qual_file.getvalue()))
     return hashlib.sha256(("|".join(parts)).encode("utf-8")).hexdigest()
+
 def ensure_chunks(files: List[Any]) -> List[ContentChunk]:
     fps = [(f.name, file_sha256(f.getvalue())) for f in files]
     if (
-        st.session_state["pdf_fingerprints"] == fps
-        and st.session_state["chunks_cache"] is not None
-        and st.session_state["pdf_bytes_map"] is not None
+        st.session_state.get("pdf_fingerprints") == fps
+        and st.session_state.get("chunks_cache") is not None
+        and st.session_state.get("pdf_bytes_map") is not None
     ):
         return st.session_state["chunks_cache"]
 
     chunks: List[ContentChunk] = []
     pdf_map: Dict[str, bytes] = {}
     headings: List[str] = []
+    term_freq: Dict[str, int] = {}
 
     for f in files:
         b = f.getvalue()
         pdf_map[f.name] = b
-        chunks.extend(extract_pdf_chunks_from_bytes(f.name, b))
+
+        file_chunks = extract_pdf_chunks_from_bytes(f.name, b)
+        chunks.extend(file_chunks)
+
+        # Headings help image searches feel "on topic"
         headings.extend(extract_pdf_headings_from_bytes(f.name, b))
+
+        # Keywords (frequency-based, across PDFs) for better Freepik queries
+        for ch in file_chunks:
+            for t in _terms(ch.text):
+                term_freq[t] = term_freq.get(t, 0) + 1
 
     if not chunks:
         raise RuntimeError("No readable text found in the uploaded PDF(s). (If PDFs are scanned images, use OCR PDFs.)")
+
+    # Keep a compact list of high-signal keywords (used for image searches)
+    sorted_terms = sorted(term_freq.items(), key=lambda kv: (-kv[1], -len(kv[0]), kv[0]))
+    keywords = [t for t, _ in sorted_terms[:40]]
 
     st.session_state["pdf_fingerprints"] = fps
     st.session_state["chunks_cache"] = chunks
     st.session_state["pdf_bytes_map"] = pdf_map
     st.session_state["pdf_headings_cache"] = headings
-    return chunks
-
-    chunks: List[ContentChunk] = []
-    for f in files:
-        chunks.extend(extract_pdf_chunks_from_bytes(f.name, f.getvalue()))
-    if not chunks:
-        raise RuntimeError("No readable text found in the uploaded PDF(s). (If PDFs are scanned images, use OCR PDFs.)")
-
-    st.session_state["pdf_fingerprints"] = fps
-    st.session_state["chunks_cache"] = chunks
+    st.session_state["pdf_keywords_cache"] = keywords
     return chunks
 
 colA, colB = st.columns(2)
@@ -2824,6 +3060,8 @@ if clear_clicked:
     st.session_state["suggestions_cache_key"] = None
     st.session_state["suggestions"] = None
     st.session_state["pdf_bytes_map"] = None
+    st.session_state["pdf_headings_cache"] = None
+    st.session_state["pdf_keywords_cache"] = None
     st.session_state["last_h5p_bytes"] = None
     st.session_state["last_h5p_name"] = None
     st.session_state["last_qa_bytes"] = None
@@ -3027,7 +3265,13 @@ if st.session_state["suggestions"]:
         cp_activity_types = []
         cp_n_questions = 0
         default_n = max(5, chosen["n"]) if chosen["type"] in ("Quiz", "Multiple Choice") else max(3, chosen["n"])
-        n_items = st.number_input("Number of items/questions", min_value=3, max_value=30, value=int(default_n), step=1)
+
+        # Dialog Cards: keep a tight range (3–5) to avoid low-quality/duplicated cards
+        if chosen["type"] == "Dialog Cards":
+            default_cards = int(min(5, max(3, default_n)))
+            n_items = st.number_input("Number of cards", min_value=3, max_value=5, value=default_cards, step=1)
+        else:
+            n_items = st.number_input("Number of items/questions", min_value=3, max_value=30, value=int(default_n), step=1)
 
     gen = st.button("Generate H5P file", type="primary", use_container_width=True, disabled=st.session_state["busy"])
 
@@ -3107,12 +3351,23 @@ if st.session_state["suggestions"]:
                     work_dir = os.path.join(tmp, "_work_dialog")
                     unzip_h5p(templates["Dialog Cards"], work_dir)
 
-                    gen_data = call_llm_dialog_cards(chunks, run_n, enriched_course)
-                    _gen_bar.progress(65, text="AI content generated — building template...")
+                    # Dialog Cards are validated strictly against the extracted PDF text.
+                    # Keep the context minimal to avoid pulling in anything outside the PDFs.
+                    dialog_context = f"{course_name.strip()}\nUnit: {(unit_name or '').strip()}"
+                    gen_data = generate_dialog_cards_strict(chunks, run_n, dialog_context)
+                    _gen_bar.progress(65, text="AI content generated & validated — building template...")
                     title = gen_data.get("title", f"Dialog Cards - {course_name.strip()}")
                     desc = gen_data.get("description", "")
 
-                    qa_items = update_dialog_cards_template(work_dir, title, desc, gen_data.get("cards", []), course=course_name.strip())
+                    qa_items = update_dialog_cards_template(
+                        work_dir,
+                        title,
+                        desc,
+                        gen_data.get("cards", []),
+                        course=course_name.strip(),
+                        pdf_headings=st.session_state.get("pdf_headings_cache") or [],
+                        pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
+                    )
 
                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
                     zip_dir_to_file(work_dir, out_h5p)
@@ -3127,7 +3382,14 @@ if st.session_state["suggestions"]:
                     gen_data = call_llm_page_content(chunks, n_sections=min(6, max(3, run_n // 2)), course=enriched_course)
                     _gen_bar.progress(65, text="AI content generated — building template...")
                     title = gen_data.get("title", f"Page - {course_name.strip()}")
-                    qa_items = update_page_template_with_images(work_dir, title, gen_data.get("sections", []), course=course_name.strip())
+                    qa_items = update_page_template_with_images(
+                        work_dir,
+                        title,
+                        gen_data.get("sections", []),
+                        course=course_name.strip(),
+                        pdf_headings=st.session_state.get("pdf_headings_cache") or [],
+                        pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
+                    )
 
                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
                     zip_dir_to_file(work_dir, out_h5p)
@@ -3177,6 +3439,7 @@ if st.session_state["suggestions"]:
                         slides=gen_data.get("slides", []),
                         course=course_name.strip(),
                         pdf_headings=st.session_state.get("pdf_headings_cache") or [],
+                        pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
                         activity_groups=act_groups,
                     )
 
@@ -3202,6 +3465,7 @@ if st.session_state["suggestions"]:
                         chapters=gen_data.get("chapters", []),
                         course=course_name.strip(),
                         pdf_headings=st.session_state.get("pdf_headings_cache") or [],
+                        pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
                     )
 
                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
