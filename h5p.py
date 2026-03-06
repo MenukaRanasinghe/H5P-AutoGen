@@ -554,27 +554,6 @@ def extract_keywords(text: str, max_terms: int = 4) -> List[str]:
     return toks[:max_terms]
 
 
-# Disk cache (avoids repeat API calls across refresh/restart)
-CACHE_DIR = os.environ.get("H5P_CACHE_DIR", ".cache_h5p_app")
-os.makedirs(CACHE_DIR, exist_ok=True)
-
-def _cache_path(key: str) -> str:
-    return os.path.join(CACHE_DIR, f"{key}.json")
-
-def cache_read_json(key: str):
-    p = _cache_path(key)
-    if not os.path.exists(p):
-        return None
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-def cache_write_json(key: str, data):
-    p = _cache_path(key)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 
@@ -3192,25 +3171,15 @@ if suggest_clicked:
         else:
             _suggest_bar.progress(25, text="Extracting PDF content...")
             chunks = ensure_chunks(uploads)
-            disk_key = f"suggest_{key}"
-            cached = cache_read_json(disk_key)
-            if cached is not None:
-                st.session_state["suggestions"] = cached
-                st.session_state["suggestions_cache_key"] = key
-                _suggest_bar.progress(100, text="Done ✓")
-                time.sleep(0.5)
-                suggest_progress_area.empty()
-            else:
-                chunks_small = choose_representative_chunks(chunks, max_pages=18)
-                _suggest_bar.progress(40, text="Analysing content with AI...")
-                s = llm_suggest_activities(chunks_small, course_name.strip(), unit_name.strip(), qual_spec_text)
-                _suggest_bar.progress(90, text="Finalising suggestions...")
-                st.session_state["suggestions"] = s
-                st.session_state["suggestions_cache_key"] = key
-                cache_write_json(disk_key, s)
-                _suggest_bar.progress(100, text="Done ✓")
-                time.sleep(0.5)
-                suggest_progress_area.empty()
+            chunks_small = choose_representative_chunks(chunks, max_pages=18)
+            _suggest_bar.progress(40, text="Analysing content with AI...")
+            s = llm_suggest_activities(chunks_small, course_name.strip(), unit_name.strip(), qual_spec_text)
+            _suggest_bar.progress(90, text="Finalising suggestions...")
+            st.session_state["suggestions"] = s
+            st.session_state["suggestions_cache_key"] = key
+            _suggest_bar.progress(100, text="Done ✓")
+            time.sleep(0.5)
+            suggest_progress_area.empty()
 
     except Exception as e:
         suggest_progress_area.empty()
