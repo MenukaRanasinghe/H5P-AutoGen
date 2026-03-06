@@ -554,27 +554,6 @@ def extract_keywords(text: str, max_terms: int = 4) -> List[str]:
     return toks[:max_terms]
 
 
-# Disk cache (avoids repeat API calls across refresh/restart)
-CACHE_DIR = os.environ.get("H5P_CACHE_DIR", ".cache_h5p_app")
-os.makedirs(CACHE_DIR, exist_ok=True)
-
-def _cache_path(key: str) -> str:
-    return os.path.join(CACHE_DIR, f"{key}.json")
-
-def cache_read_json(key: str):
-    p = _cache_path(key)
-    if not os.path.exists(p):
-        return None
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-def cache_write_json(key: str, data):
-    p = _cache_path(key)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 
@@ -2228,10 +2207,12 @@ def update_interactive_book_template_with_images(
     course: str = "",
     pdf_headings: Optional[List[str]] = None,
     pdf_keywords: Optional[List[str]] = None,
+    activity_groups: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> List[Dict[str, Any]]:
     """Populate an Interactive Book template while preserving its structure."""
     pdf_headings = pdf_headings or []
     pdf_keywords = pdf_keywords or []
+    activity_groups = activity_groups or {}
 
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
@@ -2250,9 +2231,12 @@ def update_interactive_book_template_with_images(
 
     qa_items: List[Dict[str, Any]] = []
 
-    target_chapters = max(1, len(chapters))
+    has_activity = bool(activity_groups and any(activity_groups.values()))
+    target_chapters = max(1, len(chapters)) + (1 if has_activity else 0)
     while len(chapters_ref) < target_chapters:
         chapters_ref.append(copy.deepcopy(sample_chapter) if sample_chapter else {})
+    while len(chapters_ref) > target_chapters:
+        chapters_ref.pop()
 
     for ci, ch in enumerate(chapters, start=1):
         if ci > len(chapters_ref):
@@ -2311,6 +2295,67 @@ def update_interactive_book_template_with_images(
                 "expected": "",
                 "evidence": ev,
             })
+
+    # --- ONE activity chapter at the end with ALL questions from all types ---
+    if has_activity:
+        act_ch_idx = len(chapters)
+        act_ch_num = act_ch_idx + 1
+        ch_obj = chapters_ref[act_ch_idx]
+
+        type_names = " & ".join(activity_groups.keys())
+        act_heading = f"Activity — {type_names}"
+        deep_find_set_first(ch_obj, ["title", "chapterTitle", "chapter_title", "heading"], act_heading)
+
+        # Build activity HTML content for the chapter
+        activity_html_parts: List[str] = []
+        activity_html_parts.append(f"<h2>{act_heading}</h2>")
+
+        all_act_elements: List[Dict[str, Any]] = []
+        for atype, questions in activity_groups.items():
+            if questions:
+                all_act_elements.extend(_build_cp_activity_slide_elements(atype, questions))
+                _ensure_cp_activity_dependencies(work_dir, atype)
+
+        # Try to inject activity elements into the chapter's content structure
+        # Interactive Book chapters may use AdvancedText or a content/params structure
+        adv_blocks = [b for b in _iter_library_blocks(ch_obj) if str(b.get("library", "")).startswith("H5P.AdvancedText")]
+        if adv_blocks:
+            adv_blocks[0].setdefault("params", {})
+            adv_blocks[0]["params"]["text"] = f"<h2>{act_heading}</h2><p>Complete the activities below.</p>"
+        else:
+            deep_find_set_first(ch_obj, ["text", "html", "content", "introduction"], f"<h2>{act_heading}</h2><p>Complete the activities below.</p>")
+
+        # Inject the activity elements into the chapter's content
+        # Interactive Book chapters can hold H5P sub-content via a 'content' list or 'params.content'
+        if "content" in ch_obj and isinstance(ch_obj["content"], list):
+            ch_obj["content"] = all_act_elements if all_act_elements else ch_obj["content"]
+        elif "params" in ch_obj and isinstance(ch_obj.get("params"), dict):
+            if "content" in ch_obj["params"] and isinstance(ch_obj["params"]["content"], list):
+                ch_obj["params"]["content"] = all_act_elements if all_act_elements else ch_obj["params"]["content"]
+            else:
+                ch_obj["params"]["content"] = all_act_elements
+        else:
+            ch_obj["content"] = all_act_elements
+
+        # Remove any image blocks from the activity chapter
+        img_blocks = [b for b in _iter_library_blocks(ch_obj) if str(b.get("library", "")).startswith("H5P.Image")]
+        for ib in img_blocks:
+            ib["params"] = {}
+
+        # QA report entries
+        for atype, questions in activity_groups.items():
+            for qi, q_data in enumerate(questions):
+                ev = q_data.get("evidence") or {}
+                q_summary = q_data.get("statement") or q_data.get("sentence") or q_data.get("paragraph") or ""
+                q_answer = q_data.get("correct_answer") or q_data.get("answer") or q_data.get("missing_word") or ""
+                if isinstance(q_data.get("marked_words"), list):
+                    q_answer = ", ".join(q_data["marked_words"])
+                qa_items.append({
+                    "label": f"Page {act_ch_num} — {atype} Q{qi + 1}",
+                    "content": f"{q_summary}\nAnswer: {q_answer}",
+                    "expected": q_answer,
+                    "evidence": ev,
+                })
 
     deep_find_set_first(content, ["description", "introduction", "taskDescription"], description)
     _save_json(work_dir, "content/content.json", content)
@@ -3126,25 +3171,15 @@ if suggest_clicked:
         else:
             _suggest_bar.progress(25, text="Extracting PDF content...")
             chunks = ensure_chunks(uploads)
-            disk_key = f"suggest_{key}"
-            cached = cache_read_json(disk_key)
-            if cached is not None:
-                st.session_state["suggestions"] = cached
-                st.session_state["suggestions_cache_key"] = key
-                _suggest_bar.progress(100, text="Done ✓")
-                time.sleep(0.5)
-                suggest_progress_area.empty()
-            else:
-                chunks_small = choose_representative_chunks(chunks, max_pages=18)
-                _suggest_bar.progress(40, text="Analysing content with AI...")
-                s = llm_suggest_activities(chunks_small, course_name.strip(), unit_name.strip(), qual_spec_text)
-                _suggest_bar.progress(90, text="Finalising suggestions...")
-                st.session_state["suggestions"] = s
-                st.session_state["suggestions_cache_key"] = key
-                cache_write_json(disk_key, s)
-                _suggest_bar.progress(100, text="Done ✓")
-                time.sleep(0.5)
-                suggest_progress_area.empty()
+            chunks_small = choose_representative_chunks(chunks, max_pages=18)
+            _suggest_bar.progress(40, text="Analysing content with AI...")
+            s = llm_suggest_activities(chunks_small, course_name.strip(), unit_name.strip(), qual_spec_text)
+            _suggest_bar.progress(90, text="Finalising suggestions...")
+            st.session_state["suggestions"] = s
+            st.session_state["suggestions_cache_key"] = key
+            _suggest_bar.progress(100, text="Done ✓")
+            time.sleep(0.5)
+            suggest_progress_area.empty()
 
     except Exception as e:
         suggest_progress_area.empty()
@@ -3234,14 +3269,14 @@ if st.session_state["suggestions"]:
     # --- Course Presentation specific options ---
     if chosen["type"] == "Course Presentation":
         # Slide-count limits: 1 PDF → max 8 total (7 content + 1 activity)
-        #                     multiple PDFs → max 20 total (19 content + 1 activity)
+        #                     multiple PDFs → max 12 total (11 content + 1 activity)
         n_pdfs = len(uploads) if uploads else 1
         if n_pdfs == 1:
             max_content_slides = 7
             help_note = "Max 8 slides total (7 content + 1 activity) for a single PDF."
         else:
-            max_content_slides = 19
-            help_note = "Max 20 slides total (19 content + 1 activity) for multiple PDFs."
+            max_content_slides = 11
+            help_note = "Max 12 slides total (11 content + 1 activity) for multiple PDFs."
 
         default_slides = min(max_content_slides, max(3, chosen["n"]))
 
@@ -3274,10 +3309,64 @@ if st.session_state["suggestions"]:
         st.caption(f"Total slides: **{int(cp_n_slides) + 1}** ({int(cp_n_slides)} content + 1 activity)")
 
         n_items = cp_n_slides  # n_items drives the rest of the pipeline
+        ib_n_pages = None
+        ib_activity_types = []
+        ib_n_questions = 0
+
+    # --- Interactive Book specific options ---
+    elif chosen["type"] == "Interactive Book":
+        # Page-count limits: 1 PDF → max 8 total (7 content + 1 activity)
+        #                    multiple PDFs → max 12 total (11 content + 1 activity)
+        n_pdfs = len(uploads) if uploads else 1
+        if n_pdfs == 1:
+            max_content_pages = 7
+            help_note = "Max 8 pages total (7 content + 1 activity) for a single PDF."
+        else:
+            max_content_pages = 11
+            help_note = "Max 12 pages total (11 content + 1 activity) for multiple PDFs."
+
+        default_pages = min(max_content_pages, max(3, chosen["n"]))
+
+        ib_n_pages = st.number_input(
+            "Number of content pages",
+            min_value=3,
+            max_value=max_content_pages,
+            value=default_pages,
+            step=1,
+            help=help_note,
+        )
+
+        ib_activity_type = st.selectbox(
+            "Activity type for the last page",
+            options=["Drag the Words", "Fill in the Blanks"],
+            index=0,
+            help="Select one activity type for the last page.",
+        )
+        ib_activity_types = [ib_activity_type] if ib_activity_type else []
+
+        ib_n_questions = st.number_input(
+            "Number of questions (in the activity page)",
+            min_value=2,
+            max_value=5,
+            value=3,
+            step=1,
+            help="Total questions for the selected activity type on the last page.",
+        )
+
+        st.caption(f"Total pages: **{int(ib_n_pages) + 1}** ({int(ib_n_pages)} content + 1 activity)")
+
+        n_items = ib_n_pages  # n_items drives the rest of the pipeline
+        cp_n_slides = None
+        cp_activity_types = []
+        cp_n_questions = 0
+
     else:
         cp_n_slides = None
         cp_activity_types = []
         cp_n_questions = 0
+        ib_n_pages = None
+        ib_activity_types = []
+        ib_n_questions = 0
 
         # Enforce question limits for selected types
         n_pdfs = len(uploads) if uploads else 1
@@ -3489,7 +3578,33 @@ if st.session_state["suggestions"]:
                     work_dir = os.path.join(tmp, "_work_interactive_book")
                     unzip_h5p(templates["Interactive Book"], work_dir)
 
-                    gen_data = call_llm_interactive_book(chunks, n_chapters=max(2, min(6, run_n // 2)), course=enriched_course)
+                    # Step 1: Generate content chapters/pages
+                    _gen_bar.progress(30, text="Generating content pages from PDFs...")
+                    gen_data = call_llm_interactive_book(chunks, n_chapters=max(2, min(run_n, run_n)), course=enriched_course)
+
+                    # Step 2: Generate activity questions for each selected type
+                    ib_act_groups: Dict[str, List[Dict[str, Any]]] = {}
+                    if ib_activity_types and ib_n_questions and ib_n_questions > 0:
+                        n_types = len(ib_activity_types)
+                        base_per_type = int(ib_n_questions) // n_types
+                        remainder = int(ib_n_questions) % n_types
+
+                        for ti, atype in enumerate(ib_activity_types):
+                            n_q = base_per_type + (1 if ti < remainder else 0)
+                            if n_q < 1:
+                                continue
+                            _gen_bar.progress(
+                                40 + (ti * 20 // n_types),
+                                text=f"Generating {n_q} {atype} questions..."
+                            )
+                            q_data = call_llm_cp_activity_questions(
+                                chunks,
+                                activity_type=atype,
+                                n_questions=n_q,
+                                course=enriched_course,
+                            )
+                            ib_act_groups[atype] = q_data.get("questions") or []
+
                     _gen_bar.progress(65, text="AI content generated — building template...")
                     title = gen_data.get("title", f"Interactive Book - {course_name.strip()}")
                     desc = gen_data.get("description", "")
@@ -3502,6 +3617,7 @@ if st.session_state["suggestions"]:
                         course=course_name.strip(),
                         pdf_headings=st.session_state.get("pdf_headings_cache") or [],
                         pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
+                        activity_groups=ib_act_groups,
                     )
 
                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
