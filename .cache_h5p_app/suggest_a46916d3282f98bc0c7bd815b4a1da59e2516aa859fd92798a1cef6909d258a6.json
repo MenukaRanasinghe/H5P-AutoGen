@@ -1,0 +1,92 @@
+{
+  "recommendations": [
+    {
+      "activity_type": "Course Presentation",
+      "score_0_to_5": 5,
+      "why": "Ideal for delivering structured content on legislation, policies, and procedures with multimedia support to engage learners.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "Unit 05 Chapter 01.pdf",
+        "locator": "Page 2",
+        "quote": "Table of Contents ... Introduction ... Key Legislation and Guidance Relating to the Health, Safety, and Welfare of Young Children"
+      }
+    },
+    {
+      "activity_type": "Multiple Choice",
+      "score_0_to_5": 5,
+      "why": "Effective for assessing knowledge of key legislation and health and safety requirements in early years settings.",
+      "suggested_item_count": 15,
+      "evidence": {
+        "source_file": "Unit 05 Chapter 01.pdf",
+        "locator": "Page 5",
+        "quote": "In the UK, there are various pieces of legislation and guidance that govern the health, safety, and welfare of young children in early years settings."
+      }
+    },
+    {
+      "activity_type": "Fill in the Blanks",
+      "score_0_to_5": 4,
+      "why": "Useful for reinforcing understanding of specific terms and legal acts related to health and safety.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "Unit 05 Chapter 01.pdf",
+        "locator": "Page 6",
+        "quote": "The Children Act 1989 is one of the most significant pieces of legislation for the protection and welfare of children in the UK."
+      }
+    },
+    {
+      "activity_type": "Drag the Words",
+      "score_0_to_5": 4,
+      "why": "Engages learners in matching legislation or policy terms with their correct descriptions or functions.",
+      "suggested_item_count": 8,
+      "evidence": {
+        "source_file": "Unit 05 Chapter 01.pdf",
+        "locator": "Page 9",
+        "quote": "Legislation Provides the Legal Framework ... laws such as the Children Act 1989 and the Health and Safety at Work Act 1974 require early years settings to implement policies."
+      }
+    },
+    {
+      "activity_type": "Summary",
+      "score_0_to_5": 4,
+      "why": "Allows learners to consolidate and reflect on the key points about policy implementation and monitoring.",
+      "suggested_item_count": 5,
+      "evidence": {
+        "source_file": "Unit 05 Chapter 01.pdf",
+        "locator": "Page 11",
+        "quote": "In conclusion, legislation and guidance form the backbone of the policies and procedures in early years settings."
+      }
+    },
+    {
+      "activity_type": "Dialog Cards",
+      "score_0_to_5": 3,
+      "why": "Good for memorising definitions and key facts about legislation and health and safety responsibilities.",
+      "suggested_item_count": 12,
+      "evidence": {
+        "source_file": "Unit 05 Chapter 01.pdf",
+        "locator": "Page 17",
+        "quote": "Health, Safety, and Security Responsibilities of 'Self' (Employee/Staff Member)"
+      }
+    },
+    {
+      "activity_type": "Mark the Words",
+      "score_0_to_5": 3,
+      "why": "Useful for identifying key terms or legislation within longer text passages to improve legal literacy.",
+      "suggested_item_count": 5,
+      "evidence": {
+        "source_file": "Unit 05 Chapter 01.pdf",
+        "locator": "Page 7",
+        "quote": "The Equality Act 2010 consolidates and strengthens previous anti-discrimination legislation."
+      }
+    },
+    {
+      "activity_type": "Quiz",
+      "score_0_to_5": 5,
+      "why": "Comprehensive tool to test overall understanding of health, safety, and legal requirements in early years settings.",
+      "suggested_item_count": 20,
+      "evidence": {
+        "source_file": "Unit 05 Chapter 01.pdf",
+        "locator": "Page 13",
+        "quote": "Health and Safety Policies and Procedures ... Regular Risk Assessments ... Safety Audits and Inspections"
+      }
+    }
+  ]
+}

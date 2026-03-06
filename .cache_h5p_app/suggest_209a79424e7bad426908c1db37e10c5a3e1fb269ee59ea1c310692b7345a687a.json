@@ -14,7 +14,7 @@
     {
       "activity_type": "Multiple Choice",
       "score_0_to_5": 5,
-      "why": "Effective for assessing knowledge of key legislation, SEND categories, and statutory requirements.",
+      "why": "Effective for assessing knowledge of key legislation and statutory requirements related to SEND.",
       "suggested_item_count": 8,
       "evidence": {
         "source_file": "Chapter-01-Unit-01-7.pdf",
@@ -25,19 +25,19 @@
     {
       "activity_type": "Fill in the Blanks",
       "score_0_to_5": 4,
-      "why": "Useful for reinforcing terminology such as 'Graduated Approach', 'EHC plans', and 'reasonable adjustments'.",
+      "why": "Useful for reinforcing terminology such as 'Graduated Approach', 'EHC plans', and key SEND categories.",
       "suggested_item_count": 6,
       "evidence": {
         "source_file": "Chapter-01-Unit-01-7.pdf",
-        "locator": "Page 8",
-        "quote": "Early years settings must follow the Assess, Plan, Do, Review cycle."
+        "locator": "Page 6",
+        "quote": "SEND support should follow the Assess, Plan, Do, Review cycle to ensure children receive tailored and effective support."
       }
     },
     {
       "activity_type": "Summary",
       "score_0_to_5": 4,
-      "why": "Helps learners consolidate understanding of statutory guidance and key SEND concepts.",
-      "suggested_item_count": 3,
+      "why": "Helps learners consolidate understanding of statutory guidance and the SENCO role by summarizing key points.",
+      "suggested_item_count": 5,
       "evidence": {
         "source_file": "Chapter-01-Unit-01-7.pdf",
         "locator": "Page 11",
@@ -47,7 +47,7 @@
     {
       "activity_type": "Dialog Cards",
       "score_0_to_5": 4,
-      "why": "Supports memorization of definitions and key terms such as SEND categories and legislation.",
+      "why": "Supports memorization of definitions and key concepts such as SEND categories and legislation.",
       "suggested_item_count": 10,
       "evidence": {
         "source_file": "Chapter-01-Unit-01-7.pdf",
@@ -56,36 +56,36 @@
       }
     },
     {
+      "activity_type": "Interactive Book",
+      "score_0_to_5": 3,
+      "why": "Allows comprehensive exploration of the unit content with embedded quizzes and multimedia for deeper engagement.",
+      "suggested_item_count": 1,
+      "evidence": {
+        "source_file": "Chapter-01-Unit-01-7.pdf",
+        "locator": "Page 8",
+        "quote": "Early years providers must follow the statutory requirements set out in the Early Years Foundation Stage (EYFS) framework and the SEND Code of Practice."
+      }
+    },
+    {
       "activity_type": "Mark the Words",
       "score_0_to_5": 3,
-      "why": "Good for identifying key terms in statutory guidance texts and legislation excerpts.",
+      "why": "Useful for identifying key terms and concepts within statutory guidance text to enhance comprehension.",
       "suggested_item_count": 5,
       "evidence": {
         "source_file": "Chapter-01-Unit-01-7.pdf",
         "locator": "Page 6",
-        "quote": "Understanding and implementing statutory guidance is essential for educators, practitioners, and SEND professionals."
+        "quote": "Applying the Graduated Approach enables education providers to assess needs, plan interventions, implement strategies, and review progress systematically."
       }
     },
     {
-      "activity_type": "Drag the Words",
-      "score_0_to_5": 3,
-      "why": "Engages learners in matching SEND categories or stages of the Graduated Approach cycle.",
-      "suggested_item_count": 5,
+      "activity_type": "Quiz",
+      "score_0_to_5": 4,
+      "why": "Comprehensive assessment tool to evaluate understanding of SEND statutory guidance, SENCO responsibilities, and legislation.",
+      "suggested_item_count": 10,
       "evidence": {
         "source_file": "Chapter-01-Unit-01-7.pdf",
-        "locator": "Page 8",
-        "quote": "Early years settings must follow the Assess, Plan, Do, Review cycle."
-      }
-    },
-    {
-      "activity_type": "Interactive Book",
-      "score_0_to_5": 3,
-      "why": "Allows integration of multiple content types and activities for comprehensive learning on SEND statutory requirements.",
-      "suggested_item_count": 1,
-      "evidence": {
-        "source_file": "Chapter-01-Unit-01-7.pdf",
-        "locator": "Page 3",
-        "quote": "The SENCO is responsible for coordinating SEND provision within the setting."
+        "locator": "Page 9",
+        "quote": "Every early years setting must have a named SENCO who is responsible for overseeing SEND provision."
       }
     }
   ]

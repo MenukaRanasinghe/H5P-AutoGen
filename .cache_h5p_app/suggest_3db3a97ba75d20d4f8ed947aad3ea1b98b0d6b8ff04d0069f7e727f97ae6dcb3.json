@@ -1,0 +1,92 @@
+{
+  "recommendations": [
+    {
+      "activity_type": "Course Presentation",
+      "score_0_to_5": 5,
+      "why": "Ideal for delivering structured content on respectful physical care, cultural sensitivity, and regulatory procedures with multimedia support.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "Unit 18 Chapter 1.pdf",
+        "locator": "Page 3",
+        "quote": "This unit is designed to equip learners with the essential knowledge and skills required to provide high-quality physical care, support, and nutrition for babies and young children."
+      }
+    },
+    {
+      "activity_type": "Multiple Choice",
+      "score_0_to_5": 5,
+      "why": "Effective for assessing knowledge of key concepts such as cultural care practices, hygiene, and safeguarding procedures.",
+      "suggested_item_count": 15,
+      "evidence": {
+        "source_file": "Unit 18 Chapter 1.pdf",
+        "locator": "Page 16",
+        "quote": "Health and safety regulations are foundational to the protection of both children and practitioners."
+      }
+    },
+    {
+      "activity_type": "Fill in the Blanks",
+      "score_0_to_5": 4,
+      "why": "Good for reinforcing terminology and key facts related to physical care routines and regulatory requirements.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "Unit 18 Chapter 1.pdf",
+        "locator": "Page 14",
+        "quote": "Respecting cultural beliefs and practices is another essential component of providing personalised physical care."
+      }
+    },
+    {
+      "activity_type": "Dialog Cards",
+      "score_0_to_5": 4,
+      "why": "Useful for memorizing culturally sensitive care practices and preferences of carers through question-answer format.",
+      "suggested_item_count": 12,
+      "evidence": {
+        "source_file": "Unit 18 Chapter 1.pdf",
+        "locator": "Page 9",
+        "quote": "Carers, particularly parents, hold specific values, beliefs, and practices regarding how their children should be cared for."
+      }
+    },
+    {
+      "activity_type": "Summary",
+      "score_0_to_5": 4,
+      "why": "Helps learners consolidate understanding of key points such as respectful engagement and organisational procedures.",
+      "suggested_item_count": 8,
+      "evidence": {
+        "source_file": "Unit 18 Chapter 1.pdf",
+        "locator": "Page 18",
+        "quote": "Ensuring Safety and Well-being: The primary reason for these protective procedures is to ensure the safety and well-being of both children and practitioners."
+      }
+    },
+    {
+      "activity_type": "Mark the Words",
+      "score_0_to_5": 3,
+      "why": "Supports vocabulary development related to care terminology and cultural sensitivity by identifying key words in context.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "Unit 18 Chapter 1.pdf",
+        "locator": "Page 5",
+        "quote": "Providing culturally and ethnically appropriate care for babies and young children is essential in ensuring that their physical needs are met."
+      }
+    },
+    {
+      "activity_type": "Drag the Words",
+      "score_0_to_5": 3,
+      "why": "Engages learners in matching care practices with cultural or regulatory concepts, enhancing understanding of personalised care.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "Unit 18 Chapter 1.pdf",
+        "locator": "Page 11",
+        "quote": "Respecting the Child’s Comfort and Preferences: Personalised physical care involves respecting the child’s preferences and comfort levels during physical care tasks."
+      }
+    },
+    {
+      "activity_type": "Quiz",
+      "score_0_to_5": 5,
+      "why": "Comprehensive tool to evaluate learners’ overall understanding of respectful physical care, cultural competence, and safety procedures.",
+      "suggested_item_count": 20,
+      "evidence": {
+        "source_file": "Unit 18 Chapter 1.pdf",
+        "locator": "Page 13",
+        "quote": "Engaging with babies and young children in a respectful manner while providing personalised physical care is essential in ensuring their emotional and physical well-being."
+      }
+    }
+  ]
+}

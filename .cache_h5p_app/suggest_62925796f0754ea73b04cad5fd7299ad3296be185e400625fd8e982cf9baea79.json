@@ -1,0 +1,92 @@
+{
+  "recommendations": [
+    {
+      "activity_type": "Course Presentation",
+      "score_0_to_5": 5,
+      "why": "Ideal for delivering structured content on legislation, policies, and procedures with multimedia support to engage learners.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "Unit 05 Chapter 01.pdf",
+        "locator": "Page 2",
+        "quote": "The Early Years Foundation Stage (EYFS) Framework is a statutory document in England that sets the standards for learning, development, and care for children from birth to age five."
+      }
+    },
+    {
+      "activity_type": "Multiple Choice",
+      "score_0_to_5": 5,
+      "why": "Effective for assessing knowledge of key legislation and health and safety responsibilities.",
+      "suggested_item_count": 15,
+      "evidence": {
+        "source_file": "Unit 05 Chapter 01.pdf",
+        "locator": "Page 6",
+        "quote": "In the UK, there are various pieces of legislation and guidance that govern the health, safety, and welfare of young children in early years settings."
+      }
+    },
+    {
+      "activity_type": "Fill in the Blanks",
+      "score_0_to_5": 4,
+      "why": "Good for reinforcing terminology and key concepts related to legislation and policies.",
+      "suggested_item_count": 10,
+      "evidence": {
+        "source_file": "Unit 05 Chapter 01.pdf",
+        "locator": "Page 9",
+        "quote": "The primary way in which legislation informs company policies and procedures is by providing a legal framework that must be adhered to."
+      }
+    },
+    {
+      "activity_type": "Summary",
+      "score_0_to_5": 4,
+      "why": "Useful for learners to consolidate understanding of health, safety, and security responsibilities.",
+      "suggested_item_count": 5,
+      "evidence": {
+        "source_file": "Unit 05 Chapter 01.pdf",
+        "locator": "Page 19",
+        "quote": "Health, safety, and security responsibilities are shared by all members of an early years setting."
+      }
+    },
+    {
+      "activity_type": "Dialog Cards",
+      "score_0_to_5": 4,
+      "why": "Supports memorization of legislation names, dates, and key points through flashcard style learning.",
+      "suggested_item_count": 12,
+      "evidence": {
+        "source_file": "Unit 05 Chapter 01.pdf",
+        "locator": "Page 5",
+        "quote": "The Children Act 1989 is one of the most significant pieces of legislation for the protection and welfare of children in the UK."
+      }
+    },
+    {
+      "activity_type": "Drag the Words",
+      "score_0_to_5": 3,
+      "why": "Engages learners in matching legislation or policy terms with their definitions or descriptions.",
+      "suggested_item_count": 8,
+      "evidence": {
+        "source_file": "Unit 05 Chapter 01.pdf",
+        "locator": "Page 7",
+        "quote": "The Equality Act 2010 consolidates and strengthens previous anti-discrimination legislation."
+      }
+    },
+    {
+      "activity_type": "Mark the Words",
+      "score_0_to_5": 3,
+      "why": "Helps learners identify key terms or phrases within policy texts or legislation excerpts.",
+      "suggested_item_count": 6,
+      "evidence": {
+        "source_file": "Unit 05 Chapter 01.pdf",
+        "locator": "Page 10",
+        "quote": "Policies must specify how staff should document and report any incidents or concerns regarding a child's safety."
+      }
+    },
+    {
+      "activity_type": "Interactive Book",
+      "score_0_to_5": 4,
+      "why": "Allows comprehensive presentation of detailed policies, procedures, and legislation with embedded quizzes and multimedia.",
+      "suggested_item_count": 5,
+      "evidence": {
+        "source_file": "Unit 05 Chapter 01.pdf",
+        "locator": "Page 4",
+        "quote": "Supporting the health, wellbeing, and physical care needs of children in early years settings is fundamental to ensuring their growth and development."
+      }
+    }
+  ]
+}
