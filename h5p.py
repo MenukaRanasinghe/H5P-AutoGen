@@ -587,6 +587,7 @@ def extract_keywords(text: str, max_terms: int = 4) -> List[str]:
 # "Best" H5P types to suggest (keeps recommendations high-signal).
 # The generator can still build ANY type that exists as a .h5p template in ./templates.
 BEST_H5P_TYPES = [
+    "Cornell Notes",
     "Course Presentation",
     "Dialog Cards",
     "Drag the Words",
@@ -2863,6 +2864,175 @@ def maybe_set_distractors(work_dir: str, distractors: List[str]) -> None:
 
 
 
+def call_llm_cornell_notes(chunks: List[ContentChunk], course: str) -> Dict[str, Any]:
+    """Generate Cornell Notes instructional text from PDF content."""
+    system = "Create H5P Cornell Notes content strictly grounded in source text. Return JSON only."
+    src = join_chunks_for_prompt(chunks, max_chars=30000)
+    user = f"""
+Create Cornell Notes content for course: {course}
+
+Return JSON:
+{{
+  "title": "Cornell Notes - <topic from source>",
+  "body": "2-3 sentence instruction telling learners what to watch and what to note down",
+  "cue_placeholder": "short helpful prompt for the Cue column",
+  "notes_placeholder": "short helpful prompt for the Notes column",
+  "summary_placeholder": "short prompt for the Summary box"
+}}
+
+Course: {course}
+Source:
+{src}
+""".strip()
+    return call_openai_chat_json(system, user)
+
+
+def _cornell_mime(url: str) -> str:
+    u = (url or "").lower()
+    if "youtube.com" in u or "youtu.be" in u:
+        return "video/YouTube"
+    if "vimeo.com" in u:
+        return "video/Vimeo"
+    return "video/YouTube"
+
+
+def _normalise_video_url(url: str) -> str:
+    """Strip /video/ from Vimeo URLs so H5P recognises them.
+    https://vimeo.com/video/123 → https://vimeo.com/123
+    """
+    import re as _re
+    m = _re.search(r"vimeo\.com(?:/video)?/(\d+)", url or "")
+    if m:
+        return f"https://vimeo.com/{m.group(1)}"
+    return url
+
+
+def _deep_set_video_sources(node: Any, sources: list) -> bool:
+    """Recursively walk node and replace EVERY 'sources' list that looks like
+    H5P video sources (contains dicts with a 'path' key).
+    Returns True if at least one replacement was made.
+    """
+    replaced = False
+    if isinstance(node, dict):
+        if "sources" in node and isinstance(node["sources"], list):
+            # Check it looks like a video sources list
+            current = node["sources"]
+            if not current or (isinstance(current[0], dict) and "path" in current[0]):
+                node["sources"] = sources
+                replaced = True
+        for v in node.values():
+            if _deep_set_video_sources(v, sources):
+                replaced = True
+    elif isinstance(node, list):
+        for item in node:
+            if _deep_set_video_sources(item, sources):
+                replaced = True
+    return replaced
+
+
+def update_cornell_notes_template(
+    work_dir: str,
+    title: str,
+    video_url: str,
+    gen_data: Optional[Dict[str, Any]] = None,
+    poster_image_bytes: Optional[bytes] = None,
+    poster_image_ext: str = "jpg",
+) -> dict:
+    """Completely rewrite the video source in a Cornell Notes H5P template.
+
+    Strategy: rather than guessing the JSON shape, we:
+      1. Read the real content.json
+      2. Replace the video sub-content sources at EVERY location in the tree
+      3. If nothing was replaced, force-write the top-level 'video' key
+         using the full H5P.Video sub-content structure
+    Returns the patched content dict (useful for debug display).
+    """
+    update_h5p_title(work_dir, title)
+    content = _load_json(work_dir, "content/content.json")
+
+    if video_url:
+        url = _normalise_video_url(video_url.strip())
+        mime = _cornell_mime(url)
+
+        new_sources = [{
+            "path": url,
+            "mime": mime,
+            "copyright": {"license": "U"},
+            "aspectRatio": "16:9",
+        }]
+
+        # ── Strategy A: deep-replace every 'sources' list in the tree ───────
+        replaced = _deep_set_video_sources(content, new_sources)
+
+        # ── Strategy B: handle plain-string "video" key ───────────────────
+        if isinstance(content.get("video"), str):
+            content["video"] = url
+            replaced = True
+
+        # ── Strategy C: handle "video" as flat list of source objects ────
+        if isinstance(content.get("video"), list):
+            lst = content["video"]
+            if lst and isinstance(lst[0], dict) and "path" in lst[0]:
+                lst[0]["path"] = url
+                lst[0]["mime"] = mime
+                replaced = True
+            elif not lst:
+                content["video"] = new_sources
+                replaced = True
+
+        # ── Strategy D: force-write full H5P.Video sub-content ──────────
+        if not replaced:
+            content["video"] = {
+                "params": {
+                    "visuals": {"fit": True, "controls": True},
+                    "playback": {"autoplay": False, "loop": False},
+                    "sources": new_sources,
+                },
+                "library": "H5P.Video 1.6",
+                "metadata": {"contentType": "Video", "license": "U", "title": title},
+                "subContentId": str(uuid.uuid4()),
+            }
+
+        # ── Poster image ─────────────────────────────────────────────────
+        if poster_image_bytes:
+            img_dir = os.path.join(work_dir, "content", "images")
+            os.makedirs(img_dir, exist_ok=True)
+            ext = (poster_image_ext or "jpg").lower()
+            img_filename = f"poster.{ext}"
+            with open(os.path.join(img_dir, img_filename), "wb") as f:
+                f.write(poster_image_bytes)
+            mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                        "png": "image/png", "gif": "image/gif", "webp": "image/webp"}
+            poster_obj = {
+                "path": f"images/{img_filename}",
+                "mime": mime_map.get(ext, "image/jpeg"),
+                "copyright": {"license": "U"},
+                "width": 1280, "height": 720,
+            }
+            vid = content.get("video")
+            if isinstance(vid, dict):
+                vid.setdefault("params", {}).setdefault("visuals", {})["posterImage"] = poster_obj
+
+    # ── Body / cue / notes / summary text ─────────────────────────────────
+    if gen_data:
+        _txt_map = [
+            ("body",             ["body", "taskDescription", "introduction", "description"]),
+            ("cue_placeholder",  ["cue", "cuePlaceholder", "cueText"]),
+            ("notes_placeholder",["notes", "notesPlaceholder", "notesText"]),
+            ("summary_placeholder", ["summary", "summaryPlaceholder", "summaryText"]),
+        ]
+        for gen_key, content_keys in _txt_map:
+            val = gen_data.get(gen_key)
+            if val:
+                for ck in content_keys:
+                    if ck in content:
+                        content[ck] = val
+                        break
+
+    _save_json(work_dir, "content/content.json", content)
+    return content
+
+
 def update_summary_template(work_dir: str, title: str, description: str, groups: List[Dict[str, Any]]) -> None:
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
@@ -3296,8 +3466,52 @@ if st.session_state["suggestions"]:
     st.markdown("---")
     st.markdown("### Generate H5P")
 
+    cornell_video_url = ""
+    cornell_poster_bytes: Optional[bytes] = None
+    cornell_poster_ext: str = "jpg"
+
+    if chosen["type"] == "Cornell Notes":
+        st.markdown("#### Cornell Notes — Video URL")
+        cornell_video_url = st.text_input(
+            "Vimeo / YouTube video URL",
+            placeholder="https://vimeo.com/123456789",
+            help="Plain video page URL. Do NOT paste embed/iframe URLs.",
+        )
+        if cornell_video_url:
+            import re as _re2
+            _m = _re2.search(r"vimeo\.com(?:/video)?/(\d+)", cornell_video_url)
+            if _m:
+                _preview = f"https://vimeo.com/{_m.group(1)}"
+            else:
+                _preview = cornell_video_url
+            if "player.vimeo.com" in cornell_video_url or "/embed/" in cornell_video_url:
+                st.warning("\u26a0\ufe0f Embed URL detected — please use the plain page URL.")
+            else:
+                st.success(f"\u2705 Will use: `{_preview}`")
+        else:
+            st.info("\u2139\ufe0f No URL entered — template default video will be kept.")
+
+        st.markdown("#### Poster Image (optional)")
+        poster_upload = st.file_uploader(
+            "Upload cover / poster image (JPG or PNG)",
+            type=["jpg", "jpeg", "png"],
+            help="Shown as the video thumbnail. Tip: export your PDF cover page as an image.",
+        )
+        if poster_upload is not None:
+            cornell_poster_bytes = poster_upload.read()
+            cornell_poster_ext = poster_upload.name.rsplit(".", 1)[-1].lower()
+            st.image(cornell_poster_bytes, caption="Poster preview", use_container_width=True)
+
+        n_items = 1
+        cp_n_slides = None
+        cp_activity_types = []
+        cp_n_questions = 0
+        ib_n_pages = None
+        ib_activity_types = []
+        ib_n_questions = 0
+
     # --- Course Presentation specific options ---
-    if chosen["type"] == "Course Presentation":
+    elif chosen["type"] == "Course Presentation":
         # Slide-count limits: 1 PDF → max 8 total (7 content + 1 activity)
         #                     multiple PDFs → max 12 total (11 content + 1 activity)
         n_pdfs = len(uploads) if uploads else 1
@@ -3696,6 +3910,47 @@ if st.session_state["suggestions"]:
                     zip_dir_to_file(work_dir, out_h5p)
 
                     out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                    write_qa_report_html(out_qa, title, typ, qa_items)
+
+                elif typ == "Cornell Notes":
+                    work_dir = os.path.join(tmp, "_work_cornell_notes")
+                    unzip_h5p(templates["Cornell Notes"], work_dir)
+
+                    # ── Read raw template content.json BEFORE patching ────────
+                    raw_before = _load_json(work_dir, "content/content.json")
+
+                    _gen_bar.progress(30, text="Generating Cornell Notes content with AI...")
+                    cn_gen = call_llm_cornell_notes(chunks, enriched_course)
+
+                    _gen_bar.progress(65, text="Injecting video URL into template...")
+                    title = cn_gen.get("title") or f"Cornell Notes - {course_name.strip()}"
+                    patched = update_cornell_notes_template(
+                        work_dir,
+                        title=title,
+                        video_url=cornell_video_url,
+                        gen_data=cn_gen,
+                        poster_image_bytes=cornell_poster_bytes,
+                        poster_image_ext=cornell_poster_ext,
+                    )
+
+                    # ── Debug expander: show template JSON so dev can verify ──
+                    with st.expander("\U0001f50d Debug: Cornell Notes content.json (click to inspect)", expanded=False):
+                        st.caption("**Before patching** (template original):")
+                        st.json(raw_before)
+                        st.caption("**After patching** (what goes into the .h5p):")
+                        st.json(patched)
+
+                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                    zip_dir_to_file(work_dir, out_h5p)
+
+                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                    qa_items = [
+                        {"label": "Video URL used", "content": _normalise_video_url(cornell_video_url) if cornell_video_url else "(template default)", "evidence": {}},
+                        {"label": "Body", "content": cn_gen.get("body", ""), "evidence": {}},
+                        {"label": "Cue placeholder", "content": cn_gen.get("cue_placeholder", ""), "evidence": {}},
+                        {"label": "Notes placeholder", "content": cn_gen.get("notes_placeholder", ""), "evidence": {}},
+                        {"label": "Summary placeholder", "content": cn_gen.get("summary_placeholder", ""), "evidence": {}},
+                    ]
                     write_qa_report_html(out_qa, title, typ, qa_items)
 
                 elif typ == "Summary":
