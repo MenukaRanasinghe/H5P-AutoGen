@@ -663,6 +663,7 @@ BEST_H5P_TYPES = [
     "Dialog Cards",
     "Dictation",
     "Drag the Words",
+    "Essay",
     "Fill in the Blanks",
     "Interactive Book",
     "Mark the Words",
@@ -2790,6 +2791,238 @@ SOURCE:
     return call_openai_chat_json(system, user)
 
 
+# ----------------------------
+# Essay: LLM generator + template builder
+# ----------------------------
+def call_llm_essay(chunks: List[ContentChunk], course: str) -> Dict[str, Any]:
+    """Generate exactly 1 Essay question with keyword-based marking, strictly grounded in PDF source text.
+
+    H5P Essay checks the learner's written response for specific keywords.
+    Each keyword can have alternative acceptable forms (synonyms, abbreviations).
+    The answer should be concise — not overly long — following the H5P Essay template format.
+    All content must be 100% accurate and taken directly from the attached PDF(s).
+    """
+    system = (
+        "You are a strict content extractor for essay-type questions. "
+        "You ONLY use facts that appear VERBATIM in the SOURCE text. "
+        "Every question, sample solution, keyword, and piece of information must be "
+        "directly and exactly supported by the SOURCE — do NOT add, infer, rephrase, "
+        "or embellish any facts. 100% accuracy is required. "
+        "Return JSON only."
+    )
+    src = join_chunks_for_prompt(chunks, max_chars=65000)
+    user = f"""
+Create exactly 1 Essay question for course: {course}
+
+The essay question should:
+- Ask the learner to explain, describe, or discuss a specific concept from the SOURCE
+- Be a clear, focused question or instruction that the learner can respond to
+- Have a concise model/sample answer (30–80 words MAX) drawn ONLY from the SOURCE text
+- The sample answer must be SHORT and to-the-point — do NOT write a long paragraph
+- Have 4–6 keywords that the system will check for in the learner's response
+- Each keyword should have 1–2 alternative forms (synonyms, abbreviations)
+
+CRITICAL ACCURACY RULES:
+- Every single fact, term, number, and statement in the question AND sample answer
+  MUST appear word-for-word in the SOURCE text.
+- Do NOT add any information not found in the SOURCE.
+- Do NOT rephrase or paraphrase SOURCE content — use the exact words from the PDF.
+- The sample answer should be a concise summary using ONLY exact phrases from the SOURCE.
+- If you cannot create a 100% accurate question from the SOURCE, return fewer keywords
+  rather than inventing content.
+
+Return JSON:
+{{
+  "title": "string (descriptive activity title from SOURCE content)",
+  "description": "string (brief overall instruction, e.g. 'Read the question and write your answer below.')",
+  "essays": [
+    {{
+      "taskDescription": "<p>The essay question/instruction. Be specific about what to include.</p>",
+      "sampleSolution": "A concise model answer (30–80 words) using ONLY exact facts from SOURCE.",
+      "keywords": [
+        {{
+          "keyword": "the primary keyword or key phrase from SOURCE",
+          "alternatives": ["alt form 1"],
+          "points": 1,
+          "occurrences": 1
+        }}
+      ],
+      "minimumLength": 30,
+      "maximumLength": 300,
+      "evidence": {{
+        "source_file": "string",
+        "locator": "Page X",
+        "quote": "exact quote from SOURCE supporting this question and answer"
+      }}
+    }}
+  ]
+}}
+
+Rules:
+1. EXACTLY 1 essay question — no more.
+2. taskDescription must clearly state what the learner should write about.
+3. sampleSolution must be SHORT (30–80 words) and contain ONLY verbatim facts from SOURCE.
+4. Keywords must be important terms that appear EXACTLY in both the SOURCE and sampleSolution.
+5. Each keyword's alternatives should be reasonable variations (e.g., "GDPR" / "General Data Protection Regulation").
+6. Points per keyword: 1 for common terms, 2 for critical/specific terms.
+7. Keep taskDescription in simple HTML (<p> tags only).
+8. Do NOT exceed 300 words for the maximum answer length.
+9. The evidence quote must be copied character-for-character from SOURCE.
+
+SOURCE:
+{src}
+""".strip()
+    return call_openai_chat_json(system, user)
+
+
+def _strip_html(s: str) -> str:
+    """Remove HTML tags for plain-text display."""
+    return re.sub(r"<[^>]+>", "", (s or "")).strip()
+
+
+def _build_essay_params(essay: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the params dict for a single H5P.Essay content block."""
+    task_desc = (essay.get("taskDescription") or "").strip()
+    if not task_desc.startswith("<"):
+        task_desc = f"<p>{task_desc}</p>"
+
+    sample_solution = (essay.get("sampleSolution") or "").strip()
+    min_len = int(essay.get("minimumLength", 30) or 30)
+    max_len = int(essay.get("maximumLength", 300) or 300)
+
+    # Build keywords array
+    keywords = []
+    for kw in (essay.get("keywords") or []):
+        keyword_text = (kw.get("keyword") or "").strip()
+        if not keyword_text:
+            continue
+
+        alternatives = []
+        for alt in (kw.get("alternatives") or []):
+            alt = (alt or "").strip()
+            if alt and alt.lower() != keyword_text.lower():
+                alternatives.append(alt)
+
+        keywords.append({
+            "keyword": keyword_text,
+            "alternatives": alternatives,
+            "options": {
+                "points": int(kw.get("points", 1) or 1),
+                "occurrences": int(kw.get("occurrences", 1) or 1),
+                "caseSensitive": False,
+                "forgiveMistakes": True,
+            },
+        })
+
+    # Build overall feedback bands
+    overall_feedback = [
+        {"from": 0, "to": 25, "feedback": "You've made a start. Try to include more key concepts from the material."},
+        {"from": 26, "to": 50, "feedback": "Good effort. Review the material and try to cover more of the key points."},
+        {"from": 51, "to": 75, "feedback": "Well done! You've covered many important points. Check if you missed anything."},
+        {"from": 76, "to": 100, "feedback": "Excellent! You've demonstrated a thorough understanding of the topic."},
+    ]
+
+    return {
+        "taskDescription": task_desc,
+        "solution": {
+            "introduction": "Sample solution:",
+            "sample": sample_solution,
+        },
+        "keywords": keywords,
+        "overallFeedback": overall_feedback,
+        "behaviour": {
+            "minimumLength": min_len,
+            "maximumLength": max_len,
+            "inputFieldSize": "10",
+            "enableRetry": True,
+            "ignoreScoring": False,
+            "pointsHost": 1,
+        },
+        "placeholderText": "Enter your answer here...",
+        "checkAnswer": "Check",
+        "tryAgain": "Retry",
+        "showSolution": "Show solution",
+    }
+
+
+def _populate_essay_content(content: Dict[str, Any], essay: Dict[str, Any], description: str) -> None:
+    """Populate a single-essay H5P content.json with the essay data."""
+    params = _build_essay_params(essay)
+
+    # Set task description
+    deep_find_set_first(content, ["taskDescription"], params["taskDescription"])
+
+    # Set solution
+    if "solution" in content and isinstance(content.get("solution"), dict):
+        content["solution"]["sample"] = params["solution"]["sample"]
+        content["solution"]["introduction"] = params["solution"]["introduction"]
+    else:
+        if not deep_find_set_first(content, ["solution"], params["solution"]):
+            content["solution"] = params["solution"]
+
+    # Set keywords
+    if not deep_find_set_first(content, ["keywords"], params["keywords"]):
+        content["keywords"] = params["keywords"]
+
+    # Set overall feedback
+    deep_find_set_first(content, ["overallFeedback"], params["overallFeedback"])
+
+    # Set behaviour
+    if "behaviour" in content and isinstance(content["behaviour"], dict):
+        content["behaviour"].update(params["behaviour"])
+    else:
+        if not deep_find_set_first(content, ["behaviour"], params["behaviour"]):
+            content["behaviour"] = params["behaviour"]
+
+    # Set placeholder text
+    deep_find_set_first(content, ["placeholderText"], params.get("placeholderText", ""))
+
+
+def update_essay_template(
+    work_dir: str,
+    title: str,
+    description: str,
+    essays: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Populate an H5P Essay template with generated question and keyword-based grading.
+
+    Always populates a single essay (the first one) directly into the template.
+
+    Args:
+        work_dir:    Extracted H5P template directory.
+        title:       Activity title.
+        description: Overall task description.
+        essays:      List of essay dicts from call_llm_essay() (always 1 essay).
+
+    Returns:
+        qa_items list for the QA evidence report.
+    """
+    update_h5p_title(work_dir, title)
+    content = _load_json(work_dir, "content/content.json")
+
+    qa_items: List[Dict[str, Any]] = []
+
+    if essays:
+        _populate_essay_content(content, essays[0], description)
+
+    # Set description (do NOT overwrite taskDescription — that holds the actual question)
+    deep_find_set_first(content, ["introduction", "description"], description)
+
+    _save_json(work_dir, "content/content.json", content)
+
+    for i, e in enumerate(essays, start=1):
+        ev = e.get("evidence") or {}
+        kw_list = ", ".join(k.get("keyword", "") for k in (e.get("keywords") or []))
+        qa_items.append({
+            "label": f"Essay Q{i}",
+            "content": f"Q: {_strip_html(e.get('taskDescription', ''))}\nSample: {e.get('sampleSolution', '')[:300]}",
+            "expected": kw_list,
+            "evidence": ev,
+        })
+
+    return qa_items
+
+
 def call_llm_truefalse_statements(chunks: List[ContentChunk], n: int, course: str) -> Dict[str, Any]:
     system = "Create True/False statements strictly grounded in source text. Return JSON only."
     src = join_chunks_for_prompt(chunks)
@@ -3845,9 +4078,14 @@ if st.session_state["suggestions"]:
         ib_activity_types = []
         ib_n_questions = 0
 
+        # ── ESSAY: always 1 question, no number input needed ──
+        if chosen["type"] == "Essay":
+            n_items = 1
+            st.info("Essay generates a single question/instruction for the learner to respond to. All content is taken directly from the uploaded PDF(s).")
+
         # Enforce question limits for selected types
-        n_pdfs = len(uploads) if uploads else 1
-        if chosen["type"] in LIMITED_Q_TYPES:
+        elif chosen["type"] in LIMITED_Q_TYPES:
+            n_pdfs = len(uploads) if uploads else 1
             max_q = LIMITED_Q_MAX_SINGLE_PDF if n_pdfs == 1 else LIMITED_Q_MAX_MULTI_PDF
             default_n = LIMITED_Q_MIN  # default display should start at 4
             n_items = st.number_input(
@@ -4206,6 +4444,30 @@ if st.session_state["suggestions"]:
                         {"label": "Notes placeholder", "content": cn_gen.get("notes_placeholder", ""), "evidence": {}},
                         {"label": "Summary placeholder", "content": cn_gen.get("summary_placeholder", ""), "evidence": {}},
                     ]
+                    write_qa_report_html(out_qa, title, typ, qa_items)
+
+                elif typ == "Essay":
+                    work_dir = os.path.join(tmp, "_work_essay")
+                    unzip_h5p(templates["Essay"], work_dir)
+
+                    # Always generate exactly 1 essay question
+                    gen_data = call_llm_essay(chunks, enriched_course)
+                    _gen_bar.progress(65, text="AI content generated — building template...")
+
+                    title = gen_data.get("title", f"Essay - {course_name.strip()}")
+                    desc = gen_data.get("description", "Read the question and write your answer below.")
+
+                    qa_items = update_essay_template(
+                        work_dir,
+                        title=title,
+                        description=desc,
+                        essays=gen_data.get("essays", []),
+                    )
+
+                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                    zip_dir_to_file(work_dir, out_h5p)
+
+                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
                     write_qa_report_html(out_qa, title, typ, qa_items)
 
                 elif typ == "Summary":
