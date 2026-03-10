@@ -51,6 +51,12 @@ USE_AI_IMAGES = os.getenv("USE_AI_IMAGES", "1")
 OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
 OPENAI_IMAGE_SIZE = os.getenv("OPENAI_IMAGE_SIZE", "1024x1024")
 
+# OpenAI TTS configuration (used for Dictation activities)
+OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "tts-1")
+OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "alloy")
+OPENAI_TTS_NORMAL_SPEED = float(os.getenv("OPENAI_TTS_NORMAL_SPEED", "1.0"))
+OPENAI_TTS_SLOW_SPEED = float(os.getenv("OPENAI_TTS_SLOW_SPEED", "0.75"))
+
 # Filter out files that are likely to contain text overlays, logos, icons, diagrams, banners, etc.
 _BAD_TITLE_TERMS = {
     "logo","icon","diagram","chart","word","text","banner","label","seal","flag","coat","crest",
@@ -440,6 +446,71 @@ def openai_generate_image_to_path(images_dir: str, query: str, stem: str) -> Opt
         return None
 
 
+def openai_tts_to_file(
+    text: str,
+    out_path: str,
+    speed: float = 1.0,
+    voice: str = None,
+    model: str = None,
+) -> bool:
+    """Generate speech audio via OpenAI TTS API and save to out_path as MP3.
+
+    Args:
+        text:     The text to speak.
+        out_path: Absolute path where the .mp3 will be written.
+        speed:    Playback speed (0.25–4.0). Use <1.0 for slow.
+        voice:    TTS voice name (default from env OPENAI_TTS_VOICE).
+        model:    TTS model (default from env OPENAI_TTS_MODEL).
+
+    Returns True on success, False on any failure.
+    """
+    api_key = os.environ.get("LLM_API_KEY")
+    if not api_key:
+        return False
+
+    text = (text or "").strip()
+    if not text:
+        return False
+
+    url = "https://api.openai.com/v1/audio/speech"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": model or OPENAI_TTS_MODEL,
+        "input": text,
+        "voice": voice or OPENAI_TTS_VOICE,
+        "response_format": "mp3",
+        "speed": max(0.25, min(4.0, speed)),
+    }
+
+    max_attempts = 4
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=120)
+            if resp.status_code == 429:
+                sleep_s = min(30.0, (2 ** (attempt - 1))) + random.uniform(0, 0.5)
+                if attempt == max_attempts:
+                    return False
+                time.sleep(sleep_s)
+                continue
+            if resp.status_code in (500, 502, 503, 504):
+                sleep_s = min(20.0, (2 ** (attempt - 1))) + random.uniform(0, 0.5)
+                if attempt == max_attempts:
+                    return False
+                time.sleep(sleep_s)
+                continue
+            resp.raise_for_status()
+
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with open(out_path, "wb") as f:
+                f.write(resp.content)
+            return True
+        except Exception:
+            if attempt == max_attempts:
+                return False
+            time.sleep(min(10.0, (2 ** (attempt - 1))))
+    return False
+
+
 _PLACEHOLDER_PNG_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO3G7qkAAAAASUVORK5CYII="
 )
@@ -590,6 +661,7 @@ BEST_H5P_TYPES = [
     "Cornell Notes",
     "Course Presentation",
     "Dialog Cards",
+    "Dictation",
     "Drag the Words",
     "Fill in the Blanks",
     "Interactive Book",
@@ -605,6 +677,7 @@ BEST_H5P_TYPES = [
 # - For a single PDF upload: 4–8 questions
 # - For multiple PDFs:      4–12 questions
 LIMITED_Q_TYPES = {
+    "Dictation",
     "Drag the Words",
     "Fill in the Blanks",
     "Mark the Words",
@@ -2739,6 +2812,166 @@ Source:
 
 
 # ----------------------------
+# Dictation: dedicated LLM + template builder with TTS audio
+# ----------------------------
+def call_llm_dictation(chunks: List[ContentChunk], n: int, course: str) -> Dict[str, Any]:
+    """Generate short dictation sentences strictly grounded in the PDF source text."""
+    system = (
+        "You are a strict content extractor for dictation exercises. "
+        "You ONLY use facts that appear in the SOURCE. "
+        "Every sentence must be directly supported by the source text. "
+        "Return JSON only."
+    )
+    src = join_chunks_for_prompt(chunks, max_chars=65000)
+    user = f"""
+Create {n} short dictation sentences for course: {course}
+
+Each sentence should be a short phrase or sentence (5–15 words) that a learner will
+listen to and then type. The sentences must test key vocabulary and concepts from
+the source material.
+
+Return JSON:
+{{
+  "title": "string (a descriptive activity title)",
+  "description": "string (brief task instruction, e.g. 'Listen carefully and type what you hear.')",
+  "sentences": [
+    {{
+      "text": "The short sentence the learner must type.",
+      "evidence": {{
+        "source_file": "string",
+        "locator": "Page X",
+        "quote": "exact quote from SOURCE that supports this sentence"
+      }}
+    }}
+  ]
+}}
+
+Rules:
+1. EXACTLY {n} sentences.
+2. Each sentence must be 5–15 words — short enough to remember after hearing once.
+3. Use proper punctuation and capitalisation.
+4. Spread sentences across different topics/sections of the SOURCE.
+5. Every sentence MUST be grounded in a specific fact from the SOURCE.
+6. Avoid overly complex vocabulary unless it is a key term from the source.
+7. Do not repeat the same concept across multiple sentences.
+
+SOURCE:
+{src}
+""".strip()
+    return call_openai_chat_json(system, user)
+
+
+def update_dictation_template(
+    work_dir: str,
+    title: str,
+    description: str,
+    sentences: List[Dict[str, Any]],
+    progress_callback=None,
+) -> List[Dict[str, Any]]:
+    """Build a Dictation H5P by generating TTS audio for each sentence.
+
+    For each sentence:
+      - Generates normal-speed audio via OpenAI TTS → content/audios/<name>.mp3
+      - Generates slow-speed audio via OpenAI TTS   → content/audios/<name>_slow.mp3
+      - Wires both into the content.json sentence entry
+
+    Args:
+        work_dir:          Extracted template directory.
+        title:             Activity title.
+        description:       Task description shown to learner.
+        sentences:         List of dicts with at least "text" key.
+        progress_callback: Optional callable(fraction, text) for UI updates.
+
+    Returns:
+        qa_items list for the QA evidence report.
+    """
+    update_h5p_title(work_dir, title)
+    content = _load_json(work_dir, "content/content.json")
+
+    audios_dir = os.path.join(work_dir, "content", "audios")
+    os.makedirs(audios_dir, exist_ok=True)
+
+    # ── Build new sentence entries ──────────────────────────────────────
+    new_sentences = []
+    qa_items = []
+    total = len(sentences)
+
+    for i, sent in enumerate(sentences):
+        text = (sent.get("text") or "").strip()
+        if not text:
+            continue
+
+        stem = safe_filename(f"sentence_{i+1}", max_len=60)
+        normal_fname = f"{stem}.mp3"
+        slow_fname = f"{stem}_slow.mp3"
+        normal_path = os.path.join(audios_dir, normal_fname)
+        slow_path = os.path.join(audios_dir, slow_fname)
+
+        if progress_callback:
+            pct = int(65 + (i / max(total, 1)) * 20)
+            progress_callback(min(pct, 85), f"Generating audio {i+1}/{total}: {text[:50]}...")
+
+        # Normal-speed audio
+        normal_ok = openai_tts_to_file(text, normal_path, speed=OPENAI_TTS_NORMAL_SPEED)
+        # Slow-speed audio
+        slow_ok = openai_tts_to_file(text, slow_path, speed=OPENAI_TTS_SLOW_SPEED)
+
+        entry: Dict[str, Any] = {"text": text}
+
+        if normal_ok:
+            entry["sample"] = [{
+                "path": f"audios/{normal_fname}",
+                "mime": "audio/mpeg",
+                "copyright": {"license": "U"},
+            }]
+        else:
+            entry["sample"] = []
+
+        if slow_ok:
+            entry["sampleSlow"] = [{
+                "path": f"audios/{slow_fname}",
+                "mime": "audio/mpeg",
+                "copyright": {"license": "U"},
+            }]
+        else:
+            entry["sampleSlow"] = []
+
+        new_sentences.append(entry)
+
+        ev = sent.get("evidence") or {}
+        qa_items.append({
+            "label": f"Sentence {i+1}",
+            "content": text,
+            "evidence": ev,
+        })
+
+    # ── Inject into content.json ────────────────────────────────────────
+    content["sentences"] = new_sentences
+
+    # Set description / taskDescription
+    deep_find_set_first(content, ["taskDescription", "description", "introduction"], description)
+
+    # ── Remove any stale template audio files not referenced by new content ──
+    referenced_files = set()
+    for s in new_sentences:
+        for key in ("sample", "sampleSlow"):
+            for aud in (s.get(key) or []):
+                p = aud.get("path", "")
+                if p:
+                    referenced_files.add(os.path.basename(p))
+
+    for fname in os.listdir(audios_dir):
+        if fname not in referenced_files:
+            try:
+                os.remove(os.path.join(audios_dir, fname))
+            except Exception:
+                pass
+
+    _save_json(work_dir, "content/content.json", content)
+    return qa_items
+
+
+# ----------------------------
 # Generic patcher (for any type with a template)
 # ----------------------------
 def _load_json(work_dir: str, rel_path: str) -> Dict[str, Any]:
@@ -3736,6 +3969,28 @@ if st.session_state["suggestions"]:
                         course=course_name.strip(),
                         pdf_headings=st.session_state.get("pdf_headings_cache") or [],
                         pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
+                    )
+
+                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                    zip_dir_to_file(work_dir, out_h5p)
+
+                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                    write_qa_report_html(out_qa, title, typ, qa_items)
+
+                elif typ == "Dictation":
+                    work_dir = os.path.join(tmp, "_work_dictation")
+                    unzip_h5p(templates["Dictation"], work_dir)
+
+                    gen_data = call_llm_dictation(chunks, run_n, enriched_course)
+                    title = gen_data.get("title", f"Dictation - {course_name.strip()}")
+                    desc = gen_data.get("description", "Listen carefully and type what you hear.")
+
+                    qa_items = update_dictation_template(
+                        work_dir,
+                        title=title,
+                        description=desc,
+                        sentences=gen_data.get("sentences", []),
+                        progress_callback=lambda pct, txt: _gen_bar.progress(pct, text=txt),
                     )
 
                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
