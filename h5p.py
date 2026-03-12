@@ -2740,18 +2740,32 @@ def make_blanks_textfield(items: List[Dict[str, Any]]) -> str:
     return "\n\n".join(lines)
 
 def make_mark_words_textfield(items: List[Dict[str, Any]]) -> str:
-    paragraphs = []
-    for it in items:
-        p = (it.get("paragraph") or "").strip()
-        words = it.get("marked_words") or []
-        for w in words:
-            w = (w or "").strip()
-            if not w:
-                continue
-            p2, n = _wrap_first_word_occurrence(p, w)
-            p = p2 if n else f"{p} (*{w}*)"
-        paragraphs.append(p)
-    return "\n\n".join(paragraphs)
+    lines = []
+
+    for i, it in enumerate(items, start=1):
+        sentence = (it.get("sentence") or it.get("paragraph") or "").strip()
+        marked_word = (it.get("marked_word") or "").strip()
+        hint = (it.get("hint") or "").strip()
+
+        if not sentence or not marked_word:
+            continue
+
+        # Force single-word markable word
+        marked_word = marked_word.split()[0].strip()
+
+        # Mark only the first exact occurrence
+        sentence_marked, n = _wrap_first_word_occurrence(sentence, marked_word)
+        if n == 0:
+            sentence_marked = f"{sentence} (*{marked_word}*)"
+
+        block = f"{i}. {sentence_marked}"
+
+        if hint:
+            block += f"\n({hint})"
+
+        lines.append(block)
+
+    return "\n\n".join(lines)
 
 
 def call_llm_drag_words(chunks: List[ContentChunk], n: int, course: str) -> Dict[str, Any]:
@@ -2839,58 +2853,39 @@ Source:
 def call_llm_mark_words(chunks: List[ContentChunk], n: int, course: str) -> Dict[str, Any]:
     system = "Create H5P Mark the Words strictly grounded in source text. Return JSON only."
     src = join_chunks_for_prompt(chunks)
+
     user = f"""
-Create Mark the Words with {n} paragraphs. Each paragraph must include 3-6 marked_words that appear in the paragraph exactly.
-
-JSON:
-{{
- "title":"string","description":"string",
- "items":[
-   {{"paragraph":"string","marked_words":["string"],"evidence":{{"source_file":"string","locator":"Page X","quote":"string"}}}}
- ]
-}}
-
-Course: {course}
-Source:
-{src}
-""".strip()
-    return call_openai_chat_json(system, user)
-
-
-def call_llm_summary(chunks: List[ContentChunk], n: int, course: str) -> Dict[str, Any]:
-    system = "Create H5P Summary strictly grounded in source text. Return JSON only."
-    src = join_chunks_for_prompt(chunks)
-    user = f"""
-Create an H5P Summary activity with EXACTLY {n} statement groups for course: {course}
-
-Each group has ONE correct statement and 2 incorrect (but plausible) statements.
-The correct statement must be a true fact from the SOURCE text.
-The incorrect statements must sound plausible but be factually wrong based on the SOURCE.
+Create EXACTLY {n} Mark the Words items for the source.
 
 Return JSON:
 {{
   "title":"string",
   "description":"string",
-  "groups":[
+  "items":[
     {{
-      "correct_statement":"a true statement taken directly from SOURCE",
-      "incorrect_statements":["plausible but wrong statement 1","plausible but wrong statement 2"],
-      "tip":"optional short hint",
-      "evidence":{{"source_file":"string","locator":"Page X","quote":"exact quote from SOURCE supporting the correct statement"}}
+      "sentence":"string",
+      "marked_word":"string",
+      "hint":"string",
+      "evidence":{{"source_file":"string","locator":"Page X","quote":"string"}}
     }}
   ]
 }}
 
 Rules:
-1. EXACTLY {n} groups.
-2. Every correct_statement MUST be grounded in a specific fact from SOURCE.
-3. Incorrect statements should be related to the same topic but contain a wrong detail (e.g. swapped term, wrong number, reversed cause/effect).
-4. Spread groups across different parts of the SOURCE — do not cluster from one section.
-5. Each statement should be a complete, clear sentence.
+- Create EXACTLY {n} items.
+- Each item must contain exactly ONE sentence/question.
+- Each item must have exactly ONE markable word.
+- marked_word must be a SINGLE WORD only, not a phrase.
+- The marked_word must appear exactly in the sentence.
+- hint must help the learner identify the markable word.
+- Keep the hint short and display-friendly.
+- Everything must be directly supported by SOURCE.
 
-SOURCE:
+Course: {course}
+Source:
 {src}
 """.strip()
+
     return call_openai_chat_json(system, user)
 
 
@@ -4541,13 +4536,13 @@ if st.session_state["suggestions"]:
                         )
                         title = gen_data["title"]
                         qa_items = [
-                            {
-                                "label": f"Item {i + 1}",
-                                "content": f"{it.get('paragraph', '')[:160]}... (marked: {', '.join(it.get('marked_words', []))})",
-                                "evidence": it.get("evidence", {}),
-                            }
-                            for i, it in enumerate(gen_data.get("items", []))
-                        ]
+        {
+            "label": f"Item {i + 1}",
+            "content": f"{it.get('sentence', '')} (marked: {it.get('marked_word', '')}, hint: {it.get('hint', '')})",
+            "evidence": it.get("evidence", {}),
+        }
+        for i, it in enumerate(gen_data.get("items", []))
+    ]
 
                     else:
                         raise ValueError(f"Unsupported BUILTIN_TEXT_TYPES mode: {meta_t['mode']}")
