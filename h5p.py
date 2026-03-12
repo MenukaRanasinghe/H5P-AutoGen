@@ -692,7 +692,10 @@ LIMITED_Q_MAX_MULTI_PDF = 12
 # Text-driven generators we implement directly (others use the generic patcher)
 BUILTIN_TEXT_TYPES = {
     "Drag the Words": {"textfield_keys": ["textField", "text", "questionText", "content"], "mode": "dragtext"},
-    "Fill in the Blanks": {"textfield_keys": ["textField", "text", "questionText", "content"], "mode": "blanks"},
+     "Fill in the Blanks": {
+        "textfield_keys": ["questions", "textField", "text", "questionText", "content"],
+        "mode": "blanks"
+    },
     "Mark the Words": {"textfield_keys": ["textField", "text", "questionText", "content"], "mode": "markwords"},
 }
 @dataclass
@@ -1521,6 +1524,8 @@ def update_page_template_with_images(
     pdf_headings = pdf_headings or []
     pdf_keywords = pdf_keywords or []
 
+    
+
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
 
@@ -1591,6 +1596,36 @@ def update_page_template_with_images(
     lib_list[:] = new_blocks
     _save_json(work_dir, "content/content.json", content)
     return qa_items
+
+def update_fill_in_the_blanks_template(work_dir: str, title: str, description: str, textfield: str, overall_feedback=None) -> None:
+    update_h5p_title(work_dir, title)
+    content = _load_json(work_dir, "content/content.json")
+
+    simple_instruction = (description or "").strip() or "Read the sentences and type the missing word in each blank."
+
+    updated = update_activity_description_fields(content, simple_instruction)
+    if updated == 0:
+        content["taskDescription"] = f"<p>{simple_instruction}</p>"
+
+    question_blocks = [f"<p>{block.strip()}</p>" for block in textfield.split("\n\n") if block.strip()]
+
+    found_questions = deep_find_first_key(content, ["questions"])
+
+    if found_questions:
+        key, current_value = found_questions
+        if isinstance(current_value, list):
+            deep_find_set_first(content, ["questions"], question_blocks)
+        else:
+            deep_find_set_first(content, ["questions"], textfield)
+    else:
+        if not deep_find_set_first(content, ["textField", "text", "questionText", "content"], textfield):
+            found = deep_find_first_key(content, ["questions", "textField", "text", "questionText", "content"])
+            raise KeyError(f"Fill in the Blanks template missing a usable question field. Nearest match: {found}")
+
+    if overall_feedback is not None:
+        deep_find_set_first(content, ["overallFeedback"], overall_feedback)
+
+    _save_json(work_dir, "content/content.json", content)
 
 def h5p_set_image_fields(obj: Any, rel_path: str, mime: str) -> Any:
     """Template-tolerant setter for H5P file objects (commonly used for images).
@@ -2475,6 +2510,45 @@ def deep_find_set_first(d: Any, key_candidates: List[str], new_value: Any) -> bo
                 return True
     return False
 
+def deep_find_set_all(d: Any, key_candidates: List[str], new_value: Any) -> int:
+    count = 0
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if k in key_candidates:
+                d[k] = new_value
+                count += 1
+            else:
+                count += deep_find_set_all(v, key_candidates, new_value)
+    elif isinstance(d, list):
+        for v in d:
+            count += deep_find_set_all(v, key_candidates, new_value)
+    return count
+
+def update_activity_description_fields(content: Dict[str, Any], description: str) -> int:
+    """
+    Force-update all common instruction/description fields used by H5P templates.
+    Returns number of fields updated.
+    """
+    if not description:
+        return 0
+
+    desc_html = description.strip()
+    if not desc_html.startswith("<"):
+        desc_html = f"<p>{desc_html}</p>"
+
+    keys = [
+        "taskDescription",
+        "description",
+        "instructions",
+        "instruction",
+        "introduction",
+        "questionText",
+        "text",
+        "body",
+    ]
+
+    return deep_find_set_all(content, keys, desc_html)
+
 
 def deep_find_first_key(d: Any, key_candidates: List[str]) -> Optional[Tuple[str, Any]]:
     if isinstance(d, dict):
@@ -2649,24 +2723,49 @@ def make_dragtext_textfield(items: List[Dict[str, Any]]) -> str:
     ])
 
 def make_blanks_textfield(items: List[Dict[str, Any]]) -> str:
-    return make_multiline_blocks([
-        make_single_blank_markup(it.get("sentence", ""), it.get("answer", ""))
-        for it in items
-    ])
+    lines = []
+    for i, it in enumerate(items, start=1):
+        sentence = (it.get("sentence") or "").strip()
+        answer = (it.get("answer") or "").strip()
+        hint = (it.get("hint") or "").strip()
+
+        text = make_single_blank_markup(sentence, answer)
+        block = f"{i}. {text}"
+
+        if hint:
+            block += f"\n({hint})"
+
+        lines.append(block)
+
+    return "\n\n".join(lines)
 
 def make_mark_words_textfield(items: List[Dict[str, Any]]) -> str:
-    paragraphs = []
-    for it in items:
-        p = (it.get("paragraph") or "").strip()
-        words = it.get("marked_words") or []
-        for w in words:
-            w = (w or "").strip()
-            if not w:
-                continue
-            p2, n = _wrap_first_word_occurrence(p, w)
-            p = p2 if n else f"{p} (*{w}*)"
-        paragraphs.append(p)
-    return "\n\n".join(paragraphs)
+    lines = []
+
+    for i, it in enumerate(items, start=1):
+        sentence = (it.get("sentence") or it.get("paragraph") or "").strip()
+        marked_word = (it.get("marked_word") or "").strip()
+        hint = (it.get("hint") or "").strip()
+
+        if not sentence or not marked_word:
+            continue
+
+        # Force single-word markable word
+        marked_word = marked_word.split()[0].strip()
+
+        # Mark only the first exact occurrence
+        sentence_marked, n = _wrap_first_word_occurrence(sentence, marked_word)
+        if n == 0:
+            sentence_marked = f"{sentence} (*{marked_word}*)"
+
+        block = f"{i}. {sentence_marked}"
+
+        if hint:
+            block += f"\n({hint})"
+
+        lines.append(block)
+
+    return "\n\n".join(lines)
 
 
 def call_llm_drag_words(chunks: List[ContentChunk], n: int, course: str) -> Dict[str, Any]:
@@ -2710,84 +2809,83 @@ SOURCE:
 def call_llm_fill_blanks(chunks: List[ContentChunk], n: int, course: str) -> Dict[str, Any]:
     system = "Create H5P Fill in the Blanks strictly grounded in source text. Return JSON only."
     src = join_chunks_for_prompt(chunks)
+
     user = f"""
 Create Fill in the Blanks with {n} items.
 
-JSON:
+Return JSON:
 {{
- "title":"string","description":"string",
- "overall_feedback":[
-   {{"from":0,"to":40,"feedback":"string"}},
-   {{"from":41,"to":80,"feedback":"string"}},
-   {{"from":81,"to":100,"feedback":"string"}}
- ],
- "items":[
-   {{"sentence":"string","answer":"string","evidence":{{"source_file":"string","locator":"Page X","quote":"string"}}}}
- ]
+  "title":"string",
+  "description":"string",
+  "overall_feedback":[
+    {{"from":0,"to":40,"feedback":"Keep practising and review the topic again."}},
+    {{"from":41,"to":80,"feedback":"Good attempt. Check the wording carefully."}},
+    {{"from":81,"to":100,"feedback":"Well done. You identified the correct answers."}}
+  ],
+  "items":[
+    {{
+      "sentence":"A sentence from the source with one blank shown as ____",
+      "answer":"exact missing word or short phrase",
+      "hint":"A simple sentence helping the learner identify the answer.",
+      "evidence":{{"source_file":"string","locator":"Page X","quote":"string"}}
+    }}
+  ]
 }}
+
+Rules:
+- description must be a short learner instruction written specifically for this PDF topic.
+- description must mention the actual topic or concept from the SOURCE.
+- do not reuse wording from any template.
+- sentence must contain one blank marker such as ____ where the answer belongs.
+- answer must be the exact missing word or phrase from the source.
+- hint must be a simple sentence that helps identify the missing answer.
+- Keep the hint short, clear, and learner-friendly.
+- Keep everything grounded in the source text.
 
 Course: {course}
 Source:
 {src}
 """.strip()
+
     return call_openai_chat_json(system, user)
 
 
 def call_llm_mark_words(chunks: List[ContentChunk], n: int, course: str) -> Dict[str, Any]:
     system = "Create H5P Mark the Words strictly grounded in source text. Return JSON only."
     src = join_chunks_for_prompt(chunks)
+
     user = f"""
-Create Mark the Words with {n} paragraphs. Each paragraph must include 3-6 marked_words that appear in the paragraph exactly.
-
-JSON:
-{{
- "title":"string","description":"string",
- "items":[
-   {{"paragraph":"string","marked_words":["string"],"evidence":{{"source_file":"string","locator":"Page X","quote":"string"}}}}
- ]
-}}
-
-Course: {course}
-Source:
-{src}
-""".strip()
-    return call_openai_chat_json(system, user)
-
-
-def call_llm_summary(chunks: List[ContentChunk], n: int, course: str) -> Dict[str, Any]:
-    system = "Create H5P Summary strictly grounded in source text. Return JSON only."
-    src = join_chunks_for_prompt(chunks)
-    user = f"""
-Create an H5P Summary activity with EXACTLY {n} statement groups for course: {course}
-
-Each group has ONE correct statement and 2 incorrect (but plausible) statements.
-The correct statement must be a true fact from the SOURCE text.
-The incorrect statements must sound plausible but be factually wrong based on the SOURCE.
+Create EXACTLY {n} Mark the Words items for the source.
 
 Return JSON:
 {{
   "title":"string",
   "description":"string",
-  "groups":[
+  "items":[
     {{
-      "correct_statement":"a true statement taken directly from SOURCE",
-      "incorrect_statements":["plausible but wrong statement 1","plausible but wrong statement 2"],
-      "tip":"optional short hint",
-      "evidence":{{"source_file":"string","locator":"Page X","quote":"exact quote from SOURCE supporting the correct statement"}}
+      "sentence":"string",
+      "marked_word":"string",
+      "hint":"string",
+      "evidence":{{"source_file":"string","locator":"Page X","quote":"string"}}
     }}
   ]
 }}
 
 Rules:
-1. EXACTLY {n} groups.
-2. Every correct_statement MUST be grounded in a specific fact from SOURCE.
-3. Incorrect statements should be related to the same topic but contain a wrong detail (e.g. swapped term, wrong number, reversed cause/effect).
-4. Spread groups across different parts of the SOURCE — do not cluster from one section.
-5. Each statement should be a complete, clear sentence.
+- Create EXACTLY {n} items.
+- Each item must contain exactly ONE sentence/question.
+- Each item must have exactly ONE markable word.
+- marked_word must be a SINGLE WORD only, not a phrase.
+- The marked_word must appear exactly in the sentence.
+- hint must help the learner identify the markable word.
+- Keep the hint short and display-friendly.
+- Everything must be directly supported by SOURCE.
 
-SOURCE:
+Course: {course}
+Source:
 {src}
 """.strip()
+
     return call_openai_chat_json(system, user)
 
 
@@ -3182,7 +3280,9 @@ def update_dictation_template(
     content["sentences"] = new_sentences
 
     # Set description / taskDescription
-    deep_find_set_first(content, ["taskDescription", "description", "introduction"], description)
+    updated = update_activity_description_fields(content, description)
+    if updated == 0:
+     content["taskDescription"] = f"<p>{description.strip()}</p>"
 
     # ── Remove any stale template audio files not referenced by new content ──
     referenced_files = set()
@@ -3295,7 +3395,10 @@ SOURCE TEXT:
 def update_text_based_template(work_dir: str, title: str, description: str, textfield: str, overall_feedback=None, textfield_keys=None) -> None:
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
-    deep_find_set_first(content, ["taskDescription", "introduction", "description", "instructions"], description)
+
+    updated = update_activity_description_fields(content, description)
+    if updated == 0:
+        content["taskDescription"] = f"<p>{description.strip()}</p>"
 
     keys = textfield_keys or ["textField", "text", "questionText", "content"]
     if not deep_find_set_first(content, keys, textfield):
@@ -4372,32 +4475,77 @@ if st.session_state["suggestions"]:
                         gen_data = call_llm_drag_words(chunks, run_n, enriched_course)
                         _gen_bar.progress(65, text="AI content generated — building template...")
                         textfield = make_dragtext_textfield(gen_data["items"])
-                        update_text_based_template(work_dir, gen_data["title"], gen_data["description"], textfield, gen_data.get("overall_feedback"), meta_t["textfield_keys"])
+                        update_text_based_template(
+                            work_dir,
+                            gen_data["title"],
+                            gen_data["description"],
+                            textfield,
+                            gen_data.get("overall_feedback"),
+                            meta_t["textfield_keys"],
+                        )
                         title = gen_data["title"]
                         all_dis = []
                         for it in gen_data.get("items", []):
                             all_dis.extend(it.get("distractors") or [])
                         maybe_set_distractors(work_dir, all_dis)
-                        qa_items = [{"label": "Drag the Words", "content": it.get("sentence", ""), "expected": it.get("missing_word", ""), "evidence": it.get("evidence", {})}
-                                    for it in gen_data.get("items", [])]
+                        qa_items = [
+                            {
+                                "label": "Drag the Words",
+                                "content": it.get("sentence", ""),
+                                "expected": it.get("missing_word", ""),
+                                "evidence": it.get("evidence", {}),
+                            }
+                            for it in gen_data.get("items", [])
+                        ]
 
                     elif meta_t["mode"] == "blanks":
                         gen_data = call_llm_fill_blanks(chunks, run_n, enriched_course)
                         _gen_bar.progress(65, text="AI content generated — building template...")
                         textfield = make_blanks_textfield(gen_data["items"])
-                        update_text_based_template(work_dir, gen_data["title"], gen_data["description"], textfield, gen_data.get("overall_feedback"), meta_t["textfield_keys"])
-                        title = gen_data["title"]
-                        qa_items = [{"label": f"Item {i+1}", "content": f"{it['sentence']} (answer: {it['answer']})", "evidence": it.get("evidence", {})}
-                                    for i, it in enumerate(gen_data.get("items", []))]
+                        desc = (gen_data.get("description") or "").strip() or "Read each sentence and type the missing word."
 
-                    else:  # markwords
+                        update_fill_in_the_blanks_template(
+                            work_dir,
+                            gen_data["title"],
+                            desc,
+                            textfield,
+                            gen_data.get("overall_feedback"),
+                        )
+
+                        title = gen_data["title"]
+                        qa_items = [
+                            {
+                                "label": f"Item {i + 1}",
+                                "content": f"{it.get('sentence', '')} (answer: {it.get('answer', '')})",
+                                "evidence": it.get("evidence", {}),
+                            }
+                            for i, it in enumerate(gen_data.get("items", []))
+                        ]
+
+                    elif meta_t["mode"] == "markwords":
                         gen_data = call_llm_mark_words(chunks, run_n, enriched_course)
                         _gen_bar.progress(65, text="AI content generated — building template...")
                         textfield = make_mark_words_textfield(gen_data["items"])
-                        update_text_based_template(work_dir, gen_data["title"], gen_data["description"], textfield, None, meta_t["textfield_keys"])
+                        update_text_based_template(
+                            work_dir,
+                            gen_data["title"],
+                            gen_data["description"],
+                            textfield,
+                            None,
+                            meta_t["textfield_keys"],
+                        )
                         title = gen_data["title"]
-                        qa_items = [{"label": f"Item {i+1}", "content": f"{it['paragraph'][:160]}... (marked: {', '.join(it['marked_words'])})", "evidence": it.get("evidence", {})}
-                                    for i, it in enumerate(gen_data.get("items", []))]
+                        qa_items = [
+        {
+            "label": f"Item {i + 1}",
+            "content": f"{it.get('sentence', '')} (marked: {it.get('marked_word', '')}, hint: {it.get('hint', '')})",
+            "evidence": it.get("evidence", {}),
+        }
+        for i, it in enumerate(gen_data.get("items", []))
+    ]
+
+                    else:
+                        raise ValueError(f"Unsupported BUILTIN_TEXT_TYPES mode: {meta_t['mode']}")
 
                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
                     zip_dir_to_file(work_dir, out_h5p)
