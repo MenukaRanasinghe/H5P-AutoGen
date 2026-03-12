@@ -2649,10 +2649,21 @@ def make_dragtext_textfield(items: List[Dict[str, Any]]) -> str:
     ])
 
 def make_blanks_textfield(items: List[Dict[str, Any]]) -> str:
-    return make_multiline_blocks([
-        make_single_blank_markup(it.get("sentence", ""), it.get("answer", ""))
-        for it in items
-    ])
+    lines = []
+    for i, it in enumerate(items, start=1):
+        sentence = (it.get("sentence") or "").strip()
+        answer = (it.get("answer") or "").strip()
+        hint = (it.get("hint") or "").strip()
+
+        text = make_single_blank_markup(sentence, answer)
+        block = f"{i}. {text}"
+
+        if hint:
+            block += f"\n({hint})"
+
+        lines.append(block)
+
+    return "\n\n".join(lines)
 
 def make_mark_words_textfield(items: List[Dict[str, Any]]) -> str:
     paragraphs = []
@@ -2715,16 +2726,29 @@ Create Fill in the Blanks with {n} items.
 
 JSON:
 {{
- "title":"string","description":"string",
+ "title":"string",
+ "description":"string",
  "overall_feedback":[
    {{"from":0,"to":40,"feedback":"string"}},
    {{"from":41,"to":80,"feedback":"string"}},
    {{"from":81,"to":100,"feedback":"string"}}
  ],
  "items":[
-   {{"sentence":"string","answer":"string","evidence":{{"source_file":"string","locator":"Page X","quote":"string"}}}}
+   {{
+     "sentence":"string",
+     "answer":"string",
+     "hint":"string",
+     "evidence":{{"source_file":"string","locator":"Page X","quote":"string"}}
+   }}
  ]
 }}
+
+Rules:
+- description must be a short learner instruction only.
+- sentence must contain one blank marker such as ____ where the answer belongs.
+- answer must be the exact missing word or phrase from the source.
+- hint must be short and helpful, 2-6 words only.
+- Keep everything grounded in the source text.
 
 Course: {course}
 Source:
@@ -4372,32 +4396,79 @@ if st.session_state["suggestions"]:
                         gen_data = call_llm_drag_words(chunks, run_n, enriched_course)
                         _gen_bar.progress(65, text="AI content generated — building template...")
                         textfield = make_dragtext_textfield(gen_data["items"])
-                        update_text_based_template(work_dir, gen_data["title"], gen_data["description"], textfield, gen_data.get("overall_feedback"), meta_t["textfield_keys"])
+                        update_text_based_template(
+                            work_dir,
+                            gen_data["title"],
+                            gen_data["description"],
+                            textfield,
+                            gen_data.get("overall_feedback"),
+                            meta_t["textfield_keys"],
+                        )
                         title = gen_data["title"]
                         all_dis = []
                         for it in gen_data.get("items", []):
                             all_dis.extend(it.get("distractors") or [])
                         maybe_set_distractors(work_dir, all_dis)
-                        qa_items = [{"label": "Drag the Words", "content": it.get("sentence", ""), "expected": it.get("missing_word", ""), "evidence": it.get("evidence", {})}
-                                    for it in gen_data.get("items", [])]
+                        qa_items = [
+                            {
+                                "label": "Drag the Words",
+                                "content": it.get("sentence", ""),
+                                "expected": it.get("missing_word", ""),
+                                "evidence": it.get("evidence", {}),
+                            }
+                            for it in gen_data.get("items", [])
+                        ]
 
                     elif meta_t["mode"] == "blanks":
                         gen_data = call_llm_fill_blanks(chunks, run_n, enriched_course)
                         _gen_bar.progress(65, text="AI content generated — building template...")
                         textfield = make_blanks_textfield(gen_data["items"])
-                        update_text_based_template(work_dir, gen_data["title"], gen_data["description"], textfield, gen_data.get("overall_feedback"), meta_t["textfield_keys"])
+                        desc = (
+                            gen_data.get("description", "").strip()
+                            or "Read each sentence and type the missing word in the blank."
+                        )
+                        update_text_based_template(
+                            work_dir,
+                            gen_data["title"],
+                            desc,
+                            textfield,
+                            gen_data.get("overall_feedback"),
+                            meta_t["textfield_keys"],
+                        )
                         title = gen_data["title"]
-                        qa_items = [{"label": f"Item {i+1}", "content": f"{it['sentence']} (answer: {it['answer']})", "evidence": it.get("evidence", {})}
-                                    for i, it in enumerate(gen_data.get("items", []))]
+                        qa_items = [
+                            {
+                                "label": f"Item {i + 1}",
+                                "content": f"{it.get('sentence', '')} (answer: {it.get('answer', '')})",
+                                "evidence": it.get("evidence", {}),
+                            }
+                            for i, it in enumerate(gen_data.get("items", []))
+                        ]
 
-                    else:  # markwords
+                    elif meta_t["mode"] == "markwords":
                         gen_data = call_llm_mark_words(chunks, run_n, enriched_course)
                         _gen_bar.progress(65, text="AI content generated — building template...")
                         textfield = make_mark_words_textfield(gen_data["items"])
-                        update_text_based_template(work_dir, gen_data["title"], gen_data["description"], textfield, None, meta_t["textfield_keys"])
+                        update_text_based_template(
+                            work_dir,
+                            gen_data["title"],
+                            gen_data["description"],
+                            textfield,
+                            None,
+                            meta_t["textfield_keys"],
+                        )
                         title = gen_data["title"]
-                        qa_items = [{"label": f"Item {i+1}", "content": f"{it['paragraph'][:160]}... (marked: {', '.join(it['marked_words'])})", "evidence": it.get("evidence", {})}
-                                    for i, it in enumerate(gen_data.get("items", []))]
+                        qa_items = [
+                            {
+                                "label": f"Item {i + 1}",
+                                "content": f"{it.get('paragraph', '')[:160]}... (marked: {', '.join(it.get('marked_words', []))})",
+                                "evidence": it.get("evidence", {}),
+                            }
+                            for i, it in enumerate(gen_data.get("items", []))
+                        ]
+
+                    else:
+                        raise ValueError(f"Unsupported BUILTIN_TEXT_TYPES mode: {meta_t['mode']}")
 
                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
                     zip_dir_to_file(work_dir, out_h5p)
