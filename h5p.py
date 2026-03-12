@@ -692,7 +692,10 @@ LIMITED_Q_MAX_MULTI_PDF = 12
 # Text-driven generators we implement directly (others use the generic patcher)
 BUILTIN_TEXT_TYPES = {
     "Drag the Words": {"textfield_keys": ["textField", "text", "questionText", "content"], "mode": "dragtext"},
-    "Fill in the Blanks": {"textfield_keys": ["textField", "text", "questionText", "content"], "mode": "blanks"},
+     "Fill in the Blanks": {
+        "textfield_keys": ["questions", "textField", "text", "questionText", "content"],
+        "mode": "blanks"
+    },
     "Mark the Words": {"textfield_keys": ["textField", "text", "questionText", "content"], "mode": "markwords"},
 }
 @dataclass
@@ -1521,6 +1524,8 @@ def update_page_template_with_images(
     pdf_headings = pdf_headings or []
     pdf_keywords = pdf_keywords or []
 
+    
+
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
 
@@ -1591,6 +1596,38 @@ def update_page_template_with_images(
     lib_list[:] = new_blocks
     _save_json(work_dir, "content/content.json", content)
     return qa_items
+
+def update_fill_in_the_blanks_template(work_dir: str, title: str, description: str, textfield: str, overall_feedback=None) -> None:
+    update_h5p_title(work_dir, title)
+    content = _load_json(work_dir, "content/content.json")
+
+    # Simple learner instruction only
+    simple_instruction = description.strip() or "Read each sentence and type the missing word in the blank."
+
+    # Set instruction / description
+    deep_find_set_first(content, ["taskDescription", "introduction", "description", "instructions"], simple_instruction)
+
+    # H5P Blanks usually expects a LIST in "questions"
+    question_blocks = [f"<p>{block.strip()}</p>" for block in textfield.split("\n\n") if block.strip()]
+
+    found_questions = deep_find_first_key(content, ["questions"])
+
+    if found_questions:
+        key, current_value = found_questions
+        if isinstance(current_value, list):
+            deep_find_set_first(content, ["questions"], question_blocks)
+        else:
+            deep_find_set_first(content, ["questions"], textfield)
+    else:
+        # fallback only if template does not use "questions"
+        if not deep_find_set_first(content, ["textField", "text", "questionText", "content"], textfield):
+            found = deep_find_first_key(content, ["questions", "textField", "text", "questionText", "content"])
+            raise KeyError(f"Fill in the Blanks template missing a usable question field. Nearest match: {found}")
+
+    if overall_feedback is not None:
+        deep_find_set_first(content, ["overallFeedback"], overall_feedback)
+
+    _save_json(work_dir, "content/content.json", content)
 
 def h5p_set_image_fields(obj: Any, rel_path: str, mime: str) -> Any:
     """Template-tolerant setter for H5P file objects (commonly used for images).
@@ -2721,39 +2758,43 @@ SOURCE:
 def call_llm_fill_blanks(chunks: List[ContentChunk], n: int, course: str) -> Dict[str, Any]:
     system = "Create H5P Fill in the Blanks strictly grounded in source text. Return JSON only."
     src = join_chunks_for_prompt(chunks)
+
     user = f"""
 Create Fill in the Blanks with {n} items.
 
-JSON:
+Return JSON:
 {{
- "title":"string",
- "description":"string",
- "overall_feedback":[
-   {{"from":0,"to":40,"feedback":"string"}},
-   {{"from":41,"to":80,"feedback":"string"}},
-   {{"from":81,"to":100,"feedback":"string"}}
- ],
- "items":[
-   {{
-     "sentence":"string",
-     "answer":"string",
-     "hint":"string",
-     "evidence":{{"source_file":"string","locator":"Page X","quote":"string"}}
-   }}
- ]
+  "title":"string",
+  "description":"Read each sentence and type the missing word.",
+  "overall_feedback":[
+    {{"from":0,"to":40,"feedback":"Keep practising and review the topic again."}},
+    {{"from":41,"to":80,"feedback":"Good attempt. Check the wording carefully."}},
+    {{"from":81,"to":100,"feedback":"Well done. You identified the correct answers."}}
+  ],
+  "items":[
+    {{
+      "sentence":"A sentence from the source with one blank shown as ____",
+      "answer":"exact missing word or short phrase",
+      "hint":"A simple sentence helping the learner identify the answer.",
+      "evidence":{{"source_file":"string","locator":"Page X","quote":"string"}}
+    }}
+  ]
 }}
 
 Rules:
-- description must be a short learner instruction only.
-- sentence must contain one blank marker such as ____ where the answer belongs.
-- answer must be the exact missing word or phrase from the source.
-- hint must be short and helpful, 2-6 words only.
-- Keep everything grounded in the source text.
+- description must be exactly: "Read each sentence and type the missing word."
+- sentence must contain one blank marker: ____
+- answer must be the exact missing word or phrase from the source
+- hint must be a simple sentence, 5-12 words, helping the learner identify the answer
+- keep everything grounded in the source text
+- do not copy the full answer into the hint
+- use clear learner-friendly wording
 
 Course: {course}
 Source:
 {src}
 """.strip()
+
     return call_openai_chat_json(system, user)
 
 
@@ -4423,18 +4464,16 @@ if st.session_state["suggestions"]:
                         gen_data = call_llm_fill_blanks(chunks, run_n, enriched_course)
                         _gen_bar.progress(65, text="AI content generated — building template...")
                         textfield = make_blanks_textfield(gen_data["items"])
-                        desc = (
-                            gen_data.get("description", "").strip()
-                            or "Read each sentence and type the missing word in the blank."
-                        )
-                        update_text_based_template(
+                        desc = "Read each sentence and type the missing word in the blank."
+
+                        update_fill_in_the_blanks_template(
                             work_dir,
                             gen_data["title"],
                             desc,
                             textfield,
                             gen_data.get("overall_feedback"),
-                            meta_t["textfield_keys"],
                         )
+
                         title = gen_data["title"]
                         qa_items = [
                             {
