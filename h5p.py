@@ -1601,13 +1601,12 @@ def update_fill_in_the_blanks_template(work_dir: str, title: str, description: s
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
 
-    # Simple learner instruction only
-    simple_instruction = description.strip() or "Read each sentence and type the missing word in the blank."
+    simple_instruction = (description or "").strip() or "Read the sentences and type the missing word in each blank."
 
-    # Set instruction / description
-    deep_find_set_first(content, ["taskDescription", "introduction", "description", "instructions"], simple_instruction)
+    updated = update_activity_description_fields(content, simple_instruction)
+    if updated == 0:
+        content["taskDescription"] = f"<p>{simple_instruction}</p>"
 
-    # H5P Blanks usually expects a LIST in "questions"
     question_blocks = [f"<p>{block.strip()}</p>" for block in textfield.split("\n\n") if block.strip()]
 
     found_questions = deep_find_first_key(content, ["questions"])
@@ -1619,7 +1618,6 @@ def update_fill_in_the_blanks_template(work_dir: str, title: str, description: s
         else:
             deep_find_set_first(content, ["questions"], textfield)
     else:
-        # fallback only if template does not use "questions"
         if not deep_find_set_first(content, ["textField", "text", "questionText", "content"], textfield):
             found = deep_find_first_key(content, ["questions", "textField", "text", "questionText", "content"])
             raise KeyError(f"Fill in the Blanks template missing a usable question field. Nearest match: {found}")
@@ -2512,6 +2510,45 @@ def deep_find_set_first(d: Any, key_candidates: List[str], new_value: Any) -> bo
                 return True
     return False
 
+def deep_find_set_all(d: Any, key_candidates: List[str], new_value: Any) -> int:
+    count = 0
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if k in key_candidates:
+                d[k] = new_value
+                count += 1
+            else:
+                count += deep_find_set_all(v, key_candidates, new_value)
+    elif isinstance(d, list):
+        for v in d:
+            count += deep_find_set_all(v, key_candidates, new_value)
+    return count
+
+def update_activity_description_fields(content: Dict[str, Any], description: str) -> int:
+    """
+    Force-update all common instruction/description fields used by H5P templates.
+    Returns number of fields updated.
+    """
+    if not description:
+        return 0
+
+    desc_html = description.strip()
+    if not desc_html.startswith("<"):
+        desc_html = f"<p>{desc_html}</p>"
+
+    keys = [
+        "taskDescription",
+        "description",
+        "instructions",
+        "instruction",
+        "introduction",
+        "questionText",
+        "text",
+        "body",
+    ]
+
+    return deep_find_set_all(content, keys, desc_html)
+
 
 def deep_find_first_key(d: Any, key_candidates: List[str]) -> Optional[Tuple[str, Any]]:
     if isinstance(d, dict):
@@ -2765,7 +2802,7 @@ Create Fill in the Blanks with {n} items.
 Return JSON:
 {{
   "title":"string",
-  "description":"Read each sentence and type the missing word.",
+  "description":"string",
   "overall_feedback":[
     {{"from":0,"to":40,"feedback":"Keep practising and review the topic again."}},
     {{"from":41,"to":80,"feedback":"Good attempt. Check the wording carefully."}},
@@ -2782,13 +2819,14 @@ Return JSON:
 }}
 
 Rules:
-- description must be exactly: "Read each sentence and type the missing word."
-- sentence must contain one blank marker: ____
-- answer must be the exact missing word or phrase from the source
-- hint must be a simple sentence, 5-12 words, helping the learner identify the answer
-- keep everything grounded in the source text
-- do not copy the full answer into the hint
-- use clear learner-friendly wording
+- description must be a short learner instruction written specifically for this PDF topic.
+- description must mention the actual topic or concept from the SOURCE.
+- do not reuse wording from any template.
+- sentence must contain one blank marker such as ____ where the answer belongs.
+- answer must be the exact missing word or phrase from the source.
+- hint must be a simple sentence that helps identify the missing answer.
+- Keep the hint short, clear, and learner-friendly.
+- Keep everything grounded in the source text.
 
 Course: {course}
 Source:
@@ -3247,7 +3285,9 @@ def update_dictation_template(
     content["sentences"] = new_sentences
 
     # Set description / taskDescription
-    deep_find_set_first(content, ["taskDescription", "description", "introduction"], description)
+    updated = update_activity_description_fields(content, description)
+    if updated == 0:
+     content["taskDescription"] = f"<p>{description.strip()}</p>"
 
     # ── Remove any stale template audio files not referenced by new content ──
     referenced_files = set()
@@ -3360,7 +3400,10 @@ SOURCE TEXT:
 def update_text_based_template(work_dir: str, title: str, description: str, textfield: str, overall_feedback=None, textfield_keys=None) -> None:
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
-    deep_find_set_first(content, ["taskDescription", "introduction", "description", "instructions"], description)
+
+    updated = update_activity_description_fields(content, description)
+    if updated == 0:
+        content["taskDescription"] = f"<p>{description.strip()}</p>"
 
     keys = textfield_keys or ["textField", "text", "questionText", "content"]
     if not deep_find_set_first(content, keys, textfield):
@@ -4464,7 +4507,7 @@ if st.session_state["suggestions"]:
                         gen_data = call_llm_fill_blanks(chunks, run_n, enriched_course)
                         _gen_bar.progress(65, text="AI content generated — building template...")
                         textfield = make_blanks_textfield(gen_data["items"])
-                        desc = "Read each sentence and type the missing word in the blank."
+                        desc = (gen_data.get("description") or "").strip() or "Read each sentence and type the missing word."
 
                         update_fill_in_the_blanks_template(
                             work_dir,
