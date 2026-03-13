@@ -3699,7 +3699,7 @@ def build_question_set_truefalse(work_dir: str, title: str, description: str, tf
             "subContentId": random_subcontent_id(),
             "params": {
                 "question": it.get("statement", ""),
-                "correctAnswer": bool(it.get("correctAnswer", True)),
+                "correct": "true" if it.get("correctAnswer", True) else "false",
                 "feedbackCorrect": {"text": "Correct."},
                 "feedbackIncorrect": {"text": "Incorrect."},
                 "behaviour": {"enableRetry": True, "enableSolutionsButton": True, "autoCheck": False},
