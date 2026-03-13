@@ -3275,14 +3275,15 @@ def update_dictation_template(
             "content": text,
             "evidence": ev,
         })
-
-    # ── Inject into content.json ────────────────────────────────────────
-    content["sentences"] = new_sentences
+    
 
     # Set description / taskDescription
     updated = update_activity_description_fields(content, description)
     if updated == 0:
      content["taskDescription"] = f"<p>{description.strip()}</p>"
+
+     # ── Inject into content.json ────────────────────────────────────────
+    content["sentences"] = new_sentences
 
     # ── Remove any stale template audio files not referenced by new content ──
     referenced_files = set()
