@@ -1602,10 +1602,11 @@ def update_fill_in_the_blanks_template(work_dir: str, title: str, description: s
     content = _load_json(work_dir, "content/content.json")
 
     simple_instruction = (description or "").strip() or "Read the sentences and type the missing word in each blank."
+    desc_html = simple_instruction if simple_instruction.strip().startswith("<") else f"<p>{simple_instruction}</p>"
 
-    updated = update_activity_description_fields(content, simple_instruction)
-    if updated == 0:
-        content["taskDescription"] = f"<p>{simple_instruction}</p>"
+    # H5P.Blanks stores task description in the TOP-LEVEL "text" key
+    # (NOT "taskDescription"). Set it directly.
+    content["text"] = desc_html
 
     question_blocks = [f"<p>{block.strip()}</p>" for block in textfield.split("\n\n") if block.strip()]
 
@@ -2524,7 +2525,7 @@ def deep_find_set_all(d: Any, key_candidates: List[str], new_value: Any) -> int:
             count += deep_find_set_all(v, key_candidates, new_value)
     return count
 
-def update_activity_description_fields(content: Dict[str, Any], description: str) -> int:
+def update_activity_description_fields(content, description):
     """
     Force-update all common instruction/description fields used by H5P templates.
     Returns number of fields updated.
@@ -2542,12 +2543,17 @@ def update_activity_description_fields(content: Dict[str, Any], description: str
         "instructions",
         "instruction",
         "introduction",
-        "questionText",
-        "text",
-        "body",
     ]
 
-    return deep_find_set_all(content, keys, desc_html)
+    count = deep_find_set_all(content, keys, desc_html)
+ 
+    # Always force-set the top-level taskDescription — this is the field
+    # H5P actually renders for most activity types.
+    content["taskDescription"] = desc_html
+    if count == 0:
+        count = 1
+ 
+    return count
 
 
 def deep_find_first_key(d: Any, key_candidates: List[str]) -> Optional[Tuple[str, Any]]:
@@ -3275,14 +3281,15 @@ def update_dictation_template(
             "content": text,
             "evidence": ev,
         })
-
-    # ── Inject into content.json ────────────────────────────────────────
-    content["sentences"] = new_sentences
+    
 
     # Set description / taskDescription
     updated = update_activity_description_fields(content, description)
     if updated == 0:
      content["taskDescription"] = f"<p>{description.strip()}</p>"
+
+     # ── Inject into content.json ────────────────────────────────────────
+    content["sentences"] = new_sentences
 
     # ── Remove any stale template audio files not referenced by new content ──
     referenced_files = set()
@@ -3392,13 +3399,14 @@ SOURCE TEXT:
 # ----------------------------
 # Template updaters
 # ----------------------------
-def update_text_based_template(work_dir: str, title: str, description: str, textfield: str, overall_feedback=None, textfield_keys=None) -> None:
+def update_text_based_template(work_dir, title, description, textfield, overall_feedback=None, textfield_keys=None):
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
 
-    updated = update_activity_description_fields(content, description)
-    if updated == 0:
-        content["taskDescription"] = f"<p>{description.strip()}</p>"
+    desc_text = (description or "").strip()
+    if desc_text:
+        desc_html = desc_text if desc_text.startswith("<") else f"<p>{desc_text}</p>"
+        content["taskDescription"] = desc_html
 
     keys = textfield_keys or ["textField", "text", "questionText", "content"]
     if not deep_find_set_first(content, keys, textfield):
@@ -3410,6 +3418,26 @@ def update_text_based_template(work_dir: str, title: str, description: str, text
 
     _save_json(work_dir, "content/content.json", content)
 
+def _force_set_task_description(content, desc_html):
+    """Overwrite taskDescription at EVERY level of the JSON tree."""
+    count = 0
+    def _recurse(obj):
+        nonlocal count
+        if isinstance(obj, dict):
+            if "taskDescription" in obj:
+                obj["taskDescription"] = desc_html
+                count += 1
+            for v in obj.values():
+                _recurse(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                _recurse(v)
+    _recurse(content)
+    if isinstance(content, dict):
+        if "taskDescription" not in content or count == 0:
+            content["taskDescription"] = desc_html
+            count += 1
+    return count
 
 def maybe_set_distractors(work_dir: str, distractors: List[str]) -> None:
     """If the template supports distractors, set them (H5P Drag the Words)."""
@@ -3671,7 +3699,7 @@ def build_question_set_truefalse(work_dir: str, title: str, description: str, tf
             "subContentId": random_subcontent_id(),
             "params": {
                 "question": it.get("statement", ""),
-                "correctAnswer": bool(it.get("correctAnswer", True)),
+                "correct": "true" if it.get("correctAnswer", True) else "false",
                 "feedbackCorrect": {"text": "Correct."},
                 "feedbackIncorrect": {"text": "Incorrect."},
                 "behaviour": {"enableRetry": True, "enableSolutionsButton": True, "autoCheck": False},
