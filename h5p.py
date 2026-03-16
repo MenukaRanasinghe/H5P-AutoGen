@@ -3483,6 +3483,47 @@ Source:
 """.strip()
     return call_openai_chat_json(system, user)
 
+# ============================================================
+# MISSING FUNCTION — paste this into app.py
+# right AFTER the call_llm_cornell_notes() function
+# (around line 1820, before the _cornell_mime function)
+# ============================================================
+
+def call_llm_summary(chunks: List[ContentChunk], n: int, course: str) -> Dict[str, Any]:
+    system = "Create H5P Summary strictly grounded in source text. Return JSON only."
+    src = join_chunks_for_prompt(chunks)
+    user = f"""
+Create an H5P Summary activity with EXACTLY {n} statement groups for course: {course}
+
+Each group has ONE correct statement and 2 incorrect (but plausible) statements.
+The correct statement must be a true fact from the SOURCE text.
+The incorrect statements must sound plausible but be factually wrong based on the SOURCE.
+
+Return JSON:
+{{
+  "title":"string",
+  "description":"string",
+  "groups":[
+    {{
+      "correct_statement":"a true statement taken directly from SOURCE",
+      "incorrect_statements":["plausible but wrong statement 1","plausible but wrong statement 2"],
+      "tip":"optional short hint",
+      "evidence":{{"source_file":"string","locator":"Page X","quote":"exact quote from SOURCE supporting the correct statement"}}
+    }}
+  ]
+}}
+
+Rules:
+1. EXACTLY {n} groups.
+2. Every correct_statement MUST be grounded in a specific fact from SOURCE.
+3. Incorrect statements should be related to the same topic but contain a wrong detail (e.g. swapped term, wrong number, reversed cause/effect).
+4. Spread groups across different parts of the SOURCE — do not cluster from one section.
+5. Each statement should be a complete, clear sentence.
+
+SOURCE:
+{src}
+""".strip()
+    return call_openai_chat_json(system, user)
 
 def _cornell_mime(url: str) -> str:
     u = (url or "").lower()
@@ -3716,6 +3757,34 @@ def build_question_set_truefalse(work_dir: str, title: str, description: str, tf
         qa.append({"label": f"Q{i}", "content": f"{it.get('statement','')} (answer: {it.get('correctAnswer')})", "evidence": it.get("evidence", {})})
     return qa
 
+def update_virtual_tour_template(work_dir: str, title: str, image_bytes: bytes, image_name: str) -> List[Dict[str, Any]]:
+    update_h5p_title(work_dir, title)
+    content = _load_json(work_dir, "content/content.json")
+
+    ext = image_name.rsplit(".", 1)[-1].lower() if "." in image_name else "jpg"
+    mime = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
+
+    images_dir = os.path.join(work_dir, "content", "images")
+    os.makedirs(images_dir, exist_ok=True)
+
+    fname = f"tour360.{ext}"
+    rel_path = f"images/{fname}"
+    abs_path = os.path.join(images_dir, fname)
+
+    with open(abs_path, "wb") as f:
+        f.write(image_bytes)
+
+    # simplest possible patch: replace first image-like object found
+    deep_find_set_first(content, ["path"], rel_path)
+    deep_find_set_first(content, ["mime"], mime)
+
+    _save_json(work_dir, "content/content.json", content)
+
+    return [{
+        "label": "360 image",
+        "content": rel_path,
+        "evidence": {}
+    }]
 
 def write_qa_report_html(path: str, title: str, activity_type: str, qa_items: List[Dict[str, Any]]) -> None:
     def esc(s: str) -> str:
@@ -4154,6 +4223,20 @@ if st.session_state["suggestions"]:
         ib_activity_types = []
         ib_n_questions = 0
 
+    elif chosen["type"] == "Virtual Tour (360)":
+     vt_360_file = st.file_uploader(
+        "Upload 360 image *",
+        type=["jpg", "jpeg", "png", "webp"],
+        help="Upload the panorama image for the virtual tour."
+    )
+     n_items = 1
+     cp_n_slides = None
+     cp_activity_types = []
+     cp_n_questions = 0
+     ib_n_pages = None
+     ib_activity_types = []
+     ib_n_questions = 0    
+
     # --- Interactive Book specific options ---
     elif chosen["type"] == "Interactive Book":
         # Page-count limits: 1 PDF → max 8 total (7 content + 1 activity)
@@ -4441,6 +4524,28 @@ if st.session_state["suggestions"]:
 
                     out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
                     write_qa_report_html(out_qa, title, typ, qa_items)
+
+                elif typ == "Virtual Tour (360)":
+                    if vt_360_file is None:
+                        raise ValueError("Please upload a 360 image for Virtual Tour (360).")
+
+                    work_dir = os.path.join(tmp, "_work_virtual_tour")
+                    unzip_h5p(templates["Virtual Tour (360)"], work_dir)
+
+                    title = f"Virtual Tour - {course_name.strip()}"
+
+                    qa_items = update_virtual_tour_template(
+                        work_dir,
+                        title,
+                        vt_360_file.getvalue(),
+                        vt_360_file.name,
+                   )
+
+                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                    zip_dir_to_file(work_dir, out_h5p)
+
+                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                    write_qa_report_html(out_qa, title, typ, qa_items)    
 
                 elif typ == "Interactive Book":
                     work_dir = os.path.join(tmp, "_work_interactive_book")
