@@ -3949,6 +3949,91 @@ SOURCE:
 {src}
 """.strip()
     return call_openai_chat_json(system, user)
+
+def call_llm_information_wall(chunks, n_panels, course):
+    """Generate Information Wall content with proper panel structure."""
+    system = (
+        "You are a strict content extractor for H5P Information Wall activities. "
+        "You ONLY use facts from the SOURCE text. Return JSON only."
+    )
+    src_txt = join_chunks_for_prompt(chunks, max_chars=65000)
+    user = f"""
+Create an Information Wall activity for course: {course}
+ 
+An Information Wall displays panels (like cards/tiles). Each panel has:
+- An image
+- A title
+- Multiple text entries that correspond to property labels
+ 
+You must define 3 property labels that are relevant to this topic.
+For example, for a security topic the properties might be:
+  ["Topic", "Description", "Key Points"]
+For a health topic:
+  ["Condition", "Overview", "Prevention"]
+ 
+Then create {n_panels} panels. Each panel MUST have EXACTLY 3 entries
+(one per property).
+ 
+Return JSON:
+{{
+  "title": "string — descriptive title for the Information Wall",
+  "header": "string — short header shown above the wall",
+  "properties": [
+    {{
+      "label": "string — first property label (used as the card title/name)",
+      "showLabel": false,
+      "searchInProperty": false,
+      "bold": true
+    }},
+    {{
+      "label": "string — second property label (main content)",
+      "showLabel": false,
+      "searchInProperty": true,
+      "bold": false
+    }},
+    {{
+      "label": "string — third property label (additional detail)",
+      "showLabel": true,
+      "searchInProperty": true,
+      "bold": false
+    }}
+  ],
+  "panels": [
+    {{
+      "panelTitle": "string — title shown on the panel card",
+      "entries": [
+        "HTML string for property 1 (short title, use <p><span style=\\"font-size:1.25em;\\">Title</span></p>)",
+        "HTML string for property 2 (main descriptive paragraph, use <p> tags)",
+        "HTML string for property 3 (additional key points, use <p> or <ol>/<ul> tags)"
+      ],
+      "keywords": "comma-separated search keywords for this panel",
+      "image_query": "2-5 words for finding a relevant professional image",
+      "image_alt": "short alt text describing what the image should show",
+      "evidence": {{
+        "source_file": "string",
+        "locator": "PDF p.X/Y",
+        "quote": "exact quote from SOURCE supporting this panel"
+      }}
+    }}
+  ]
+}}
+ 
+STRICT RULES:
+1. EXACTLY {n_panels} panels.
+2. EXACTLY 3 properties.
+3. Each panel MUST have EXACTLY 3 entries (matching the 3 properties).
+4. Entry 1: short styled title — <p><span style="font-size:1.25em;">Title Here</span></p>
+5. Entry 2: main descriptive content (1-3 sentences in <p> tags, can use <strong>).
+6. Entry 3: additional key points (use <p> or <ol>/<ul> with <li>).
+7. All content MUST be grounded in the SOURCE text.
+8. image_query: visual concept words only (no jargon, no brand names).
+9. Each panel covers a DIFFERENT topic from the SOURCE.
+10. HTML tags allowed: <p>, <strong>, <em>, <span>, <ul>, <ol>, <li> only.
+ 
+SOURCE:
+{src_txt}
+""".strip()
+    return call_openai_chat_json(system, user)
  
 def call_llm_virtual_tour_interactions(chunks, n_hotspots, course):
     """Generate text-based hotspot interactions for a 360° Virtual Tour from PDF content."""
@@ -4038,6 +4123,179 @@ def _cornell_mime(url: str) -> str:
         return "video/Vimeo"
     return "video/YouTube"
 
+def update_information_wall_template(
+    work_dir,
+    title,
+    header,
+    properties,
+    panels,
+    course="",
+    pdf_headings=None,
+    pdf_keywords=None,
+):
+    """Populate an H5P Information Wall template with content and images.
+ 
+    Critical H5P.InfoWall requirements:
+    - propertiesGroup.properties defines the column labels
+    - Each panel MUST have an H5P.Image sub-content object (NOT null!)
+    - Each panel's entries array MUST have exactly len(properties) items
+    - Each entry is an HTML string ending with newline
+    """
+    pdf_headings = pdf_headings or []
+    pdf_keywords = pdf_keywords or []
+ 
+    update_h5p_title(work_dir, title)
+    content = _load_json(work_dir, "content/content.json")
+ 
+    images_dir = os.path.join(work_dir, "content", "images")
+    os.makedirs(images_dir, exist_ok=True)
+ 
+    # ── Build propertiesGroup ──────────────────────────────────────────
+    n_props = len(properties)
+    if n_props < 1:
+        raise ValueError("Information Wall requires at least 1 property.")
+ 
+    new_properties = []
+    for prop in properties:
+        new_properties.append({
+            "label": prop.get("label", "Info"),
+            "showLabel": prop.get("showLabel", False),
+            "searchInProperty": prop.get("searchInProperty", True),
+            "styling": {
+                "bold": prop.get("bold", False),
+                "italic": False,
+            },
+        })
+ 
+    # Navigate to the infoWall object
+    info_wall = content.get("infoWall")
+    if not isinstance(info_wall, dict):
+        content["infoWall"] = {
+            "propertiesGroup": {"properties": []},
+            "panels": [],
+            "behaviour": {
+                "useFallbackImage": False,
+                "imageWidth": 150,
+                "imageHeight": 150,
+                "alternateBackground": True,
+                "offerFilterField": True,
+                "modeFilterField": "and",
+            },
+            "l10n": {
+                "noEntriesError": "The author did not enter anything.",
+                "noMatchesForFilter": "There are no matches for @query.",
+                "enterToFilter": "Enter a query to filter the content for relevant entries.",
+                "listChanged": "List changed. Showing @visible of @total items.",
+            },
+        }
+        info_wall = content["infoWall"]
+ 
+    # Update properties
+    info_wall.setdefault("propertiesGroup", {})["properties"] = new_properties
+    # Update header
+    info_wall["header"] = header or title
+ 
+    # ── Remove old template images ─────────────────────────────────────
+    for old_img in os.listdir(images_dir):
+        old_path = os.path.join(images_dir, old_img)
+        if os.path.isfile(old_path):
+            os.remove(old_path)
+ 
+    # ── Build panels with images ───────────────────────────────────────
+    new_panels = []
+    qa_items = []
+ 
+    for i, panel in enumerate(panels, start=1):
+        panel_title = (panel.get("panelTitle") or f"Panel {i}").strip()
+        entries = panel.get("entries") or []
+        keywords = (panel.get("keywords") or "").strip()
+        img_query = (panel.get("image_query") or "").strip()
+        img_alt = (panel.get("image_alt") or panel_title).strip()
+        ev = panel.get("evidence") or {}
+ 
+        # ── Pad/trim entries to match properties count exactly ──────
+        while len(entries) < n_props:
+            entries.append("<p>&nbsp;</p>")
+        entries = entries[:n_props]
+ 
+        # ── Clean each entry as proper HTML ─────────────────────────
+        clean_entries = []
+        for entry in entries:
+            entry = (entry or "").strip()
+            if not entry:
+                entry = "<p>&nbsp;</p>"
+            if not entry.startswith("<"):
+                entry = f"<p>{entry}</p>"
+            if not entry.endswith("\n"):
+                entry = entry + "\n"
+            clean_entries.append(entry)
+ 
+        # ── Download image for this panel ───────────────────────────
+        context_for_img = f"{panel_title} {' '.join(entries)}"
+        context_for_img = re.sub(r"<[^>]+>", " ", context_for_img).strip()
+ 
+        queries = build_image_queries(
+            course=course,
+            pdf_headings=pdf_headings,
+            pdf_keywords=pdf_keywords,
+            context_text=context_for_img,
+            llm_image_query=img_query,
+        )
+        fallback = build_fallback_query(course, pdf_headings)
+        dl = ensure_image(
+            images_dir,
+            queries=queries,
+            stem=f"infowall_panel_{i}",
+            fallback_query=fallback,
+            prefer_vectors=True,
+        )
+ 
+        # ── Build H5P.Image sub-content (REQUIRED — NOT null) ──────
+        image_obj = {
+            "params": {
+                "decorative": False,
+                "contentName": "Image",
+                "file": {
+                    "path": dl["path"],
+                    "mime": dl["mime"],
+                    "copyright": {"license": "U"},
+                },
+                "alt": img_alt,
+            },
+            "library": "H5P.Image 1.1",
+            "subContentId": str(uuid.uuid4()),
+            "metadata": {
+                "contentType": "Image",
+                "license": "U",
+                "title": panel_title,
+            },
+        }
+ 
+        # ── Assemble panel object ───────────────────────────────────
+        panel_obj = {
+            "image": image_obj,
+            "panelTitle": panel_title,
+            "entries": clean_entries,
+        }
+        if keywords:
+            panel_obj["keywords"] = keywords
+ 
+        new_panels.append(panel_obj)
+ 
+        # QA tracking
+        qa_items.append({
+            "label": panel_title,
+            "content": re.sub(r"<[^>]+>", "", " ".join(clean_entries))[:500],
+            "expected": "",
+            "evidence": ev,
+        })
+ 
+    if not new_panels:
+        raise ValueError("No Information Wall panels were generated.")
+ 
+    info_wall["panels"] = new_panels
+    _save_json(work_dir, "content/content.json", content)
+    return qa_items
 
 def _normalise_video_url(url: str) -> str:
     """Strip /video/ from Vimeo URLs so H5P recognises them.
@@ -5177,6 +5435,35 @@ if st.session_state["suggestions"]:
  
                     out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
                     write_qa_report_html(out_qa, title, typ, qa_items)  
+
+
+                elif typ == "Information Wall":
+                    work_dir = os.path.join(tmp, "_work_information_wall")
+                    unzip_h5p(templates["Information Wall"], work_dir)
+ 
+                    _gen_bar.progress(30, text="Generating Information Wall content from PDFs...")
+                    gen_data = call_llm_information_wall(chunks, run_n, enriched_course)
+ 
+                    _gen_bar.progress(65, text="AI content generated — building template with images...")
+                    title = gen_data.get("title", f"Information Wall - {course_name.strip()}")
+                    header = gen_data.get("header", title)
+ 
+                    qa_items = update_information_wall_template(
+                        work_dir,
+                        title=title,
+                        header=header,
+                        properties=gen_data.get("properties", []),
+                        panels=gen_data.get("panels", []),
+                        course=course_name.strip(),
+                        pdf_headings=st.session_state.get("pdf_headings_cache") or [],
+                        pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
+                    )
+ 
+                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                    zip_dir_to_file(work_dir, out_h5p)
+ 
+                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                    write_qa_report_html(out_qa, title, typ, qa_items)    
 
                 elif typ == "Interactive Book":
                     work_dir = os.path.join(tmp, "_work_interactive_book")
