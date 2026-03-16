@@ -2385,43 +2385,147 @@ def update_interactive_book_template_with_images(
     pdf_keywords: Optional[List[str]] = None,
     activity_groups: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> List[Dict[str, Any]]:
-    """Populate an Interactive Book template while preserving its structure."""
+    """Populate an Interactive Book template while preserving its structure.
+ 
+    FIXED: cover description, cover image, and template activity stripping.
+    """
     pdf_headings = pdf_headings or []
     pdf_keywords = pdf_keywords or []
     activity_groups = activity_groups or {}
-
+ 
+    # Activity library prefixes to strip from content chapters
+    _ACTIVITY_LIBS = (
+        "H5P.DragText", "H5P.Blanks", "H5P.TrueFalse", "H5P.MarkTheWords",
+        "H5P.MultiChoice", "H5P.SingleChoiceSet",
+    )
+ 
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
-
+ 
     chapters_ref = _best_list_by_score(content, _score_chapters_list)
     if chapters_ref is None:
         raise KeyError(
             "Could not locate a 'chapters' list in the Interactive Book template. "
             "Export a blank Interactive Book with at least 1 chapter and re-add it to ./templates."
         )
-
+ 
     sample_chapter = chapters_ref[0] if chapters_ref and isinstance(chapters_ref[0], dict) else None
-
+ 
     images_dir = os.path.join(work_dir, "content", "images")
     os.makedirs(images_dir, exist_ok=True)
-
+ 
     qa_items: List[Dict[str, Any]] = []
-
+ 
     has_activity = bool(activity_groups and any(activity_groups.values()))
     target_chapters = max(1, len(chapters)) + (1 if has_activity else 0)
     while len(chapters_ref) < target_chapters:
         chapters_ref.append(copy.deepcopy(sample_chapter) if sample_chapter else {})
     while len(chapters_ref) > target_chapters:
         chapters_ref.pop()
-
+ 
+    # ══════════════════════════════════════════════════════════════════════
+    # FIX 1: Update bookCover.coverDescription with generated description
+    # ══════════════════════════════════════════════════════════════════════
+    book_cover = content.get("bookCover")
+    if isinstance(book_cover, dict):
+        # Build a meaningful cover description from the generated content
+        cover_desc = ""
+        if description and description.strip():
+            cover_desc = description.strip()
+        elif title:
+            # Fallback: build from title + first chapter heading
+            first_ch_title = ""
+            for ch in chapters:
+                t = (ch.get("chapter_title") or ch.get("title") or "").strip()
+                if t:
+                    first_ch_title = t
+                    break
+            if first_ch_title:
+                cover_desc = f"{title} — {first_ch_title}"
+            else:
+                cover_desc = title
+ 
+        if cover_desc:
+            if not cover_desc.strip().startswith("<"):
+                cover_desc = f"<p>{cover_desc}</p>"
+            book_cover["coverDescription"] = cover_desc
+ 
+    # ══════════════════════════════════════════════════════════════════════
+    # FIX 2: Replace bookCover.coverMedium image with a relevant one
+    #         (previously searched for "coverImage"/"image"/"backgroundImage"
+    #          but template uses "coverMedium")
+    # ══════════════════════════════════════════════════════════════════════
+    if isinstance(book_cover, dict):
+        # Build an image query from the title and first chapter content
+        cover_img_context = title or ""
+        for ch in chapters[:2]:
+            ch_title = (ch.get("chapter_title") or ch.get("title") or "").strip()
+            if ch_title:
+                cover_img_context += " " + ch_title
+            for sec in (ch.get("sections") or [])[:1]:
+                h = (sec.get("heading") or "").strip()
+                if h:
+                    cover_img_context += " " + h
+ 
+        cover_queries = build_image_queries(
+            course=course, pdf_headings=pdf_headings, pdf_keywords=pdf_keywords,
+            context_text=cover_img_context.strip(), llm_image_query="",
+        )
+        cover_fallback = build_fallback_query(course, pdf_headings)
+        cover_dl = ensure_image(
+            images_dir, queries=cover_queries, stem="ib_cover",
+            fallback_query=cover_fallback,
+        )
+ 
+        cover_medium = book_cover.get("coverMedium")
+        if isinstance(cover_medium, dict):
+            # Update the existing coverMedium image
+            cm_params = cover_medium.get("params")
+            if isinstance(cm_params, dict):
+                file_obj = cm_params.get("file")
+                cm_params["file"] = (
+                    {"path": cover_dl["path"], "mime": cover_dl["mime"],
+                     "copyright": {"license": "U"}}
+                    if not isinstance(file_obj, dict)
+                    else h5p_set_image_fields(file_obj, cover_dl["path"], cover_dl["mime"])
+                )
+        else:
+            # Create a new coverMedium entry
+            book_cover["coverMedium"] = {
+                "params": {
+                    "decorative": False,
+                    "contentName": "Image",
+                    "file": {
+                        "path": cover_dl["path"],
+                        "mime": cover_dl["mime"],
+                        "copyright": {"license": "U"},
+                    },
+                },
+                "library": "H5P.Image 1.1",
+                "metadata": {
+                    "contentType": "Image",
+                    "license": "U",
+                    "title": "Cover Image",
+                },
+                "subContentId": str(uuid.uuid4()),
+            }
+ 
+    # ══════════════════════════════════════════════════════════════════════
+    # Content chapters
+    # ══════════════════════════════════════════════════════════════════════
     for ci, ch in enumerate(chapters, start=1):
         if ci > len(chapters_ref):
             break
-
+ 
         ch_obj = chapters_ref[ci - 1]
         ch_title = (ch.get("chapter_title") or ch.get("title") or f"Chapter {ci}").strip()
+ 
+        # Set the chapter title in metadata (the template stores it here)
+        meta = ch_obj.get("metadata")
+        if isinstance(meta, dict):
+            meta["title"] = ch_title
         deep_find_set_first(ch_obj, ["title", "chapterTitle", "chapter_title", "heading"], ch_title)
-
+ 
         sections = ch.get("sections") or []
         parts: List[str] = []
         for sec in sections:
@@ -2432,98 +2536,344 @@ def update_interactive_book_template_with_images(
             if body:
                 parts.append(body)
         chapter_html = "\n".join(parts).strip() or f"<p>{ch_title}</p>"
-
-        adv_blocks = [b for b in _iter_library_blocks(ch_obj) if str(b.get("library", "")).startswith("H5P.AdvancedText")]
+ 
+        # ══════════════════════════════════════════════════════════════════
+        # FIX 3a: Strip template activity elements from content chapters
+        #          Only keep AdvancedText blocks; remove TrueFalse, Blanks,
+        #          MultiChoice, DragText, MarkTheWords, etc.
+        # ══════════════════════════════════════════════════════════════════
+        ch_params = ch_obj.get("params")
+        if isinstance(ch_params, dict):
+            content_items = ch_params.get("content")
+            if isinstance(content_items, list):
+                cleaned_items = []
+                for item in content_items:
+                    if not isinstance(item, dict):
+                        cleaned_items.append(item)
+                        continue
+                    inner = item.get("content", {})
+                    if not isinstance(inner, dict):
+                        cleaned_items.append(item)
+                        continue
+                    lib = str(inner.get("library") or "")
+                    # Strip any activity library elements (template leftovers)
+                    if any(lib.startswith(prefix) for prefix in _ACTIVITY_LIBS):
+                        continue  # skip this stale template activity
+                    cleaned_items.append(item)
+                ch_params["content"] = cleaned_items
+ 
+        # Update the AdvancedText block with generated HTML
+        adv_blocks = [b for b in _iter_library_blocks(ch_obj)
+                      if str(b.get("library", "")).startswith("H5P.AdvancedText")]
         if adv_blocks:
             adv_blocks[0].setdefault("params", {})
             adv_blocks[0]["params"]["text"] = chapter_html
         else:
-            deep_find_set_first(ch_obj, ["text", "html", "content", "introduction"], chapter_html)
-
+            # No AdvancedText found — inject one into the chapter's content list
+            if isinstance(ch_params, dict):
+                if not isinstance(ch_params.get("content"), list):
+                    ch_params["content"] = []
+                ch_params["content"].insert(0, {
+                    "content": {
+                        "params": {"text": chapter_html},
+                        "library": "H5P.AdvancedText 1.1",
+                        "metadata": {
+                            "contentType": "Text",
+                            "license": "U",
+                            "title": "Untitled Text",
+                        },
+                        "subContentId": str(uuid.uuid4()),
+                    },
+                    "useSeparator": "auto",
+                })
+            else:
+                deep_find_set_first(ch_obj, ["text", "html", "content", "introduction"],
+                                    chapter_html)
+ 
+        # Chapter image
         first_sec = sections[0] if sections else {}
         img_q = (first_sec.get("image_query") or "").strip()
-
+ 
         context_for_img = re.sub("<[^<]+?>", " ", chapter_html)
-        queries = build_image_queries(course=course, pdf_headings=pdf_headings, pdf_keywords=pdf_keywords, context_text=context_for_img, llm_image_query=img_q)
+        queries = build_image_queries(
+            course=course, pdf_headings=pdf_headings, pdf_keywords=pdf_keywords,
+            context_text=context_for_img, llm_image_query=img_q,
+        )
         fallback = build_fallback_query(course, pdf_headings)
-        dl = ensure_image(images_dir, queries=queries, stem=f"ib_ch_{ci}", fallback_query=fallback)
-
-        img_blocks = [b for b in _iter_library_blocks(ch_obj) if str(b.get("library", "")).startswith("H5P.Image")]
+        dl = ensure_image(images_dir, queries=queries, stem=f"ib_ch_{ci}",
+                          fallback_query=fallback)
+ 
+        img_blocks = [b for b in _iter_library_blocks(ch_obj)
+                      if str(b.get("library", "")).startswith("H5P.Image")]
         if img_blocks:
             file_obj = (img_blocks[0].get("params") or {}).get("file")
             img_blocks[0].setdefault("params", {})
             img_blocks[0]["params"]["file"] = (
-                {"path": dl["path"], "mime": dl["mime"], "copyright": {"license": "U"}}
+                {"path": dl["path"], "mime": dl["mime"],
+                 "copyright": {"license": "U"}}
                 if not isinstance(file_obj, dict)
                 else h5p_set_image_fields(file_obj, dl["path"], dl["mime"])
             )
         else:
-            found = deep_find_first_key(ch_obj, ["coverImage", "image", "backgroundImage"])
+            found = deep_find_first_key(ch_obj,
+                                        ["coverImage", "coverMedium", "image",
+                                         "backgroundImage"])
             if found and isinstance(found[1], dict):
                 k, v = found
                 ch_obj[k] = h5p_set_image_fields(v, dl["path"], dl["mime"])
-
+ 
         for si, sec in enumerate(sections, start=1):
             ev = sec.get("evidence") or {}
             qa_items.append({
                 "label": f"Chapter {ci} — Section {si}",
-                "content": f"{sec.get('heading','')}\n{re.sub('<[^<]+?>','', sec.get('body_html',''))[:450]}",
+                "content": (
+                    f"{sec.get('heading', '')}\n"
+                    f"{re.sub('<[^<]+?>', '', sec.get('body_html', ''))[:450]}"
+                ),
                 "expected": "",
                 "evidence": ev,
             })
-
-    # --- ONE activity chapter at the end with ALL questions from all types ---
+ 
+    # ══════════════════════════════════════════════════════════════════════
+    # FIX 3b: Activity chapter — build proper H5P.Column content items
+    #          instead of Course Presentation slide-style elements (x/y coords)
+    #
+    #          The Interactive Book uses H5P.Column chapters where each sub-item
+    #          is wrapped as: {"content": {"library":..., "params":...}, "useSeparator":...}
+    #          NOT the {"x":, "y":, "action":{"library":...}} format used by CP slides.
+    # ══════════════════════════════════════════════════════════════════════
     if has_activity:
         act_ch_idx = len(chapters)
         act_ch_num = act_ch_idx + 1
         ch_obj = chapters_ref[act_ch_idx]
-
+ 
         type_names = " & ".join(activity_groups.keys())
         act_heading = f"Activity — {type_names}"
-        deep_find_set_first(ch_obj, ["title", "chapterTitle", "chapter_title", "heading"], act_heading)
-
-        # Build activity HTML content for the chapter
-        activity_html_parts: List[str] = []
-        activity_html_parts.append(f"<h2>{act_heading}</h2>")
-
-        all_act_elements: List[Dict[str, Any]] = []
+ 
+        # Set chapter title in metadata
+        meta = ch_obj.get("metadata")
+        if isinstance(meta, dict):
+            meta["title"] = act_heading
+        deep_find_set_first(ch_obj, ["title", "chapterTitle", "chapter_title",
+                                     "heading"], act_heading)
+ 
+        # Build proper Column content items for the activity chapter
+        activity_content_items: List[Dict[str, Any]] = []
+ 
+        # Add a heading text block
+        activity_content_items.append({
+            "content": {
+                "params": {
+                    "text": (f"<h2>{act_heading}</h2>"
+                             f"<p>Complete the activities below.</p>"),
+                },
+                "library": "H5P.AdvancedText 1.1",
+                "metadata": {
+                    "contentType": "Text",
+                    "license": "U",
+                    "title": "Untitled Text",
+                },
+                "subContentId": str(uuid.uuid4()),
+            },
+            "useSeparator": "auto",
+        })
+ 
+        # Build actual H5P activity sub-content items for each activity type
         for atype, questions in activity_groups.items():
-            if questions:
-                all_act_elements.extend(_build_cp_activity_slide_elements(atype, questions))
-                _ensure_cp_activity_dependencies(work_dir, atype)
-
-        # Try to inject activity elements into the chapter's content structure
-        # Interactive Book chapters may use AdvancedText or a content/params structure
-        adv_blocks = [b for b in _iter_library_blocks(ch_obj) if str(b.get("library", "")).startswith("H5P.AdvancedText")]
-        if adv_blocks:
-            adv_blocks[0].setdefault("params", {})
-            adv_blocks[0]["params"]["text"] = f"<h2>{act_heading}</h2><p>Complete the activities below.</p>"
+            if not questions:
+                continue
+ 
+            at_lower = (atype or "").strip().lower()
+            _ensure_cp_activity_dependencies(work_dir, atype)
+ 
+            if "fill" in at_lower or "blank" in at_lower:
+                q_lines = []
+                for q in questions:
+                    sentence = (q.get("sentence") or "").strip()
+                    answer = (q.get("answer") or "").strip()
+                    if not sentence or not answer:
+                        continue
+                    text = sentence
+                    if f"*{answer}*" not in text:
+                        text = text.replace("___", f"*{answer}*", 1)
+                    if f"*{answer}*" not in text:
+                        text = text.replace(answer, f"*{answer}*", 1)
+                    if f"*{answer}*" not in text:
+                        text += f" *{answer}*"
+                    q_lines.append(f"<p>{text}</p>")
+ 
+                if q_lines:
+                    activity_content_items.append({
+                        "content": {
+                            "params": {
+                                "questions": q_lines,
+                                "overallFeedback": [{"from": 0, "to": 100}],
+                                "showSolutions": "Show solution",
+                                "tryAgain": "Retry",
+                                "behaviour": {
+                                    "enableRetry": True,
+                                    "enableSolutionsButton": True,
+                                    "caseSensitive": False,
+                                    "autoCheck": False,
+                                    "acceptSpellingErrors": False,
+                                },
+                            },
+                            "library": "H5P.Blanks 1.14",
+                            "metadata": {
+                                "contentType": "Fill in the Blanks",
+                                "license": "U",
+                                "title": "Fill in the Blanks",
+                            },
+                            "subContentId": str(uuid.uuid4()),
+                        },
+                        "useSeparator": "auto",
+                    })
+ 
+            elif "drag" in at_lower and "word" in at_lower:
+                lines = []
+                for q in questions:
+                    sentence = (q.get("sentence") or "").strip()
+                    missing = (q.get("missing_word") or "").strip()
+                    if not sentence or not missing:
+                        continue
+                    text = sentence
+                    if f"*{missing}*" not in text:
+                        text = text.replace("___", f"*{missing}*", 1)
+                    if f"*{missing}*" not in text:
+                        text = text.replace(missing, f"*{missing}*", 1)
+                    if f"*{missing}*" not in text:
+                        text += f" *{missing}*"
+                    lines.append(text)
+ 
+                if lines:
+                    activity_content_items.append({
+                        "content": {
+                            "params": {
+                                "textField": "\n".join(lines),
+                                "overallFeedback": [{"from": 0, "to": 100}],
+                                "behaviour": {
+                                    "enableRetry": True,
+                                    "enableSolutionsButton": True,
+                                    "instantFeedback": False,
+                                },
+                                "taskDescription": "<p>Drag the words into the correct blanks.</p>",
+                            },
+                            "library": "H5P.DragText 1.10",
+                            "metadata": {
+                                "contentType": "Drag the Words",
+                                "license": "U",
+                                "title": "Drag the Words",
+                            },
+                            "subContentId": str(uuid.uuid4()),
+                        },
+                        "useSeparator": "auto",
+                    })
+ 
+            elif "mark" in at_lower and "word" in at_lower:
+                combined_text = ""
+                for q in questions:
+                    paragraph = (q.get("paragraph") or "").strip()
+                    marked = q.get("marked_words") or []
+                    if not paragraph or not marked:
+                        continue
+                    text = paragraph
+                    for w in marked:
+                        w = w.strip()
+                        if w and f"*{w}*" not in text:
+                            text = text.replace(w, f"*{w}*", 1)
+                    combined_text += text + "\n\n"
+ 
+                if combined_text.strip():
+                    activity_content_items.append({
+                        "content": {
+                            "params": {
+                                "textField": combined_text.strip(),
+                                "overallFeedback": [{"from": 0, "to": 100}],
+                                "behaviour": {
+                                    "enableRetry": True,
+                                    "enableSolutionsButton": True,
+                                },
+                                "taskDescription": "<p>Select the correct words.</p>",
+                                "checkAnswerButton": "Check",
+                                "tryAgainButton": "Retry",
+                                "showSolutionButton": "Show solution",
+                            },
+                            "library": "H5P.MarkTheWords 1.11",
+                            "metadata": {
+                                "contentType": "Mark the Words",
+                                "license": "U",
+                                "title": "Mark the Words",
+                            },
+                            "subContentId": str(uuid.uuid4()),
+                        },
+                        "useSeparator": "auto",
+                    })
+ 
+            elif "true" in at_lower or "false" in at_lower:
+                for q in questions:
+                    statement = (q.get("statement") or "").strip()
+                    correct = (q.get("correct_answer") or "").strip().lower()
+                    if not statement:
+                        continue
+                    activity_content_items.append({
+                        "content": {
+                            "params": {
+                                "question": f"<p>{statement}</p>",
+                                "correct": ("true" if correct in ("true", "yes", "1")
+                                            else "false"),
+                                "behaviour": {
+                                    "enableRetry": True,
+                                    "enableSolutionsButton": True,
+                                    "confirmCheckDialog": False,
+                                    "confirmRetryDialog": False,
+                                },
+                                "l10n": {"trueText": "True", "falseText": "False"},
+                                "media": {"type": {}},
+                            },
+                            "library": "H5P.TrueFalse 1.8",
+                            "metadata": {
+                                "contentType": "True/False Question",
+                                "license": "U",
+                                "title": "True/False",
+                            },
+                            "subContentId": str(uuid.uuid4()),
+                        },
+                        "useSeparator": "auto",
+                    })
+ 
+        # Replace the chapter's content with the built activity items
+        ch_params = ch_obj.get("params")
+        if isinstance(ch_params, dict):
+            ch_params["content"] = activity_content_items
         else:
-            deep_find_set_first(ch_obj, ["text", "html", "content", "introduction"], f"<h2>{act_heading}</h2><p>Complete the activities below.</p>")
-
-        # Inject the activity elements into the chapter's content
-        # Interactive Book chapters can hold H5P sub-content via a 'content' list or 'params.content'
-        if "content" in ch_obj and isinstance(ch_obj["content"], list):
-            ch_obj["content"] = all_act_elements if all_act_elements else ch_obj["content"]
-        elif "params" in ch_obj and isinstance(ch_obj.get("params"), dict):
-            if "content" in ch_obj["params"] and isinstance(ch_obj["params"]["content"], list):
-                ch_obj["params"]["content"] = all_act_elements if all_act_elements else ch_obj["params"]["content"]
-            else:
-                ch_obj["params"]["content"] = all_act_elements
-        else:
-            ch_obj["content"] = all_act_elements
-
-        # Remove any image blocks from the activity chapter
-        img_blocks = [b for b in _iter_library_blocks(ch_obj) if str(b.get("library", "")).startswith("H5P.Image")]
-        for ib in img_blocks:
-            ib["params"] = {}
-
-        # QA report entries
+            ch_obj["params"] = {"content": activity_content_items}
+ 
+        # Ensure the activity chapter uses H5P.Column library
+        ch_obj["library"] = "H5P.Column 1.18"
+ 
+        # Remove any leftover image blocks from the activity chapter
+        # (they would be stale template images)
+        if isinstance(ch_params, dict):
+            activity_items = ch_params.get("content", [])
+            cleaned = []
+            for item in activity_items:
+                if isinstance(item, dict):
+                    inner = (item.get("content") or {})
+                    if isinstance(inner, dict):
+                        lib = str(inner.get("library") or "")
+                        if lib.startswith("H5P.Image"):
+                            continue
+                cleaned.append(item)
+            ch_params["content"] = cleaned
+ 
+        # QA report entries for activity questions
         for atype, questions in activity_groups.items():
             for qi, q_data in enumerate(questions):
                 ev = q_data.get("evidence") or {}
-                q_summary = q_data.get("statement") or q_data.get("sentence") or q_data.get("paragraph") or ""
-                q_answer = q_data.get("correct_answer") or q_data.get("answer") or q_data.get("missing_word") or ""
+                q_summary = (q_data.get("statement") or q_data.get("sentence")
+                             or q_data.get("paragraph") or "")
+                q_answer = (q_data.get("correct_answer") or q_data.get("answer")
+                            or q_data.get("missing_word") or "")
                 if isinstance(q_data.get("marked_words"), list):
                     q_answer = ", ".join(q_data["marked_words"])
                 qa_items.append({
@@ -2532,8 +2882,10 @@ def update_interactive_book_template_with_images(
                     "expected": q_answer,
                     "evidence": ev,
                 })
-
-    _set_presentation_description_safe(content, description, title=title, slides_data=chapters)
+ 
+    # Set the overall description (for non-cover areas)
+    _set_presentation_description_safe(content, description, title=title,
+                                       slides_data=chapters)
     _save_json(work_dir, "content/content.json", content)
     return qa_items
 
