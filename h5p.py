@@ -3494,15 +3494,20 @@ def call_llm_summary(chunks: List[ContentChunk], n: int, course: str) -> Dict[st
     src = join_chunks_for_prompt(chunks)
     user = f"""
 Create an H5P Summary activity with EXACTLY {n} statement groups for course: {course}
-
+ 
 Each group has ONE correct statement and 2 incorrect (but plausible) statements.
 The correct statement must be a true fact from the SOURCE text.
 The incorrect statements must sound plausible but be factually wrong based on the SOURCE.
-
+ 
 Return JSON:
 {{
   "title":"string",
-  "description":"string",
+  "description":"string — a short, specific task instruction that mentions the actual topic from the SOURCE. Do NOT use generic placeholder text like 'Choose the correct statement'. Instead write something like 'Select the correct statement about [topic from SOURCE]'.",
+  "overall_feedback":[
+    {{"from":0,"to":40,"feedback":"string — specific encouraging feedback for low scores mentioning the topic"}},
+    {{"from":41,"to":80,"feedback":"string — specific feedback for mid scores"}},
+    {{"from":81,"to":100,"feedback":"string — specific congratulatory feedback for high scores"}}
+  ],
   "groups":[
     {{
       "correct_statement":"a true statement taken directly from SOURCE",
@@ -3512,18 +3517,67 @@ Return JSON:
     }}
   ]
 }}
-
+ 
 Rules:
 1. EXACTLY {n} groups.
 2. Every correct_statement MUST be grounded in a specific fact from SOURCE.
 3. Incorrect statements should be related to the same topic but contain a wrong detail (e.g. swapped term, wrong number, reversed cause/effect).
 4. Spread groups across different parts of the SOURCE — do not cluster from one section.
 5. Each statement should be a complete, clear sentence.
-
+6. The "description" MUST be written specifically for this content — mention the actual topic/subject from the SOURCE. Never use a generic template phrase.
+7. The "overall_feedback" entries MUST reference the actual topic. Do NOT use generic phrases like "Keep trying" or "Well done".
+ 
 SOURCE:
 {src}
 """.strip()
     return call_openai_chat_json(system, user)
+ 
+ 
+def update_summary_template(work_dir: str, title: str, description: str, groups: List[Dict[str, Any]], overall_feedback: Optional[List[Dict[str, Any]]] = None) -> None:
+    update_h5p_title(work_dir, title)
+    content = _load_json(work_dir, "content/content.json")
+ 
+    # ── Force-set description/taskDescription at ALL levels ──────────────
+    desc_text = (description or "").strip()
+    if desc_text:
+        desc_html = desc_text if desc_text.startswith("<") else f"<p>{desc_text}</p>"
+        # Force top-level taskDescription (what H5P actually renders)
+        content["taskDescription"] = desc_html
+        # Also update any nested description/introduction fields
+        update_activity_description_fields(content, desc_text)
+ 
+    # ── Force-set overall feedback ──────────────────────────────────────
+    if overall_feedback:
+        content["overallFeedback"] = overall_feedback
+        # Also try to set it in any nested location
+        deep_find_set_all(content, ["overallFeedback"], overall_feedback)
+ 
+    # H5P Summary expects each group's "summary" to be a list of strings.
+    # The FIRST string is the correct answer; the rest are incorrect options.
+    summary_objs = []
+    for grp in groups:
+        correct = (grp.get("correct_statement") or "").strip()
+        incorrects = grp.get("incorrect_statements") or []
+        # Ensure we have strings
+        incorrects = [(s or "").strip() for s in incorrects if (s or "").strip()]
+        if not correct:
+            continue
+        # Build the statement list: correct first, then incorrects
+        statements = [correct] + incorrects
+        summary_objs.append({
+            "subContentId": random_subcontent_id(),
+            "tip": (grp.get("tip") or "").strip(),
+            "summary": statements,
+        })
+ 
+    if not summary_objs:
+        raise ValueError("No valid summary groups were generated.")
+ 
+    if not deep_find_set_first(content, ["summaries", "summary", "items"], summary_objs):
+        found = deep_find_first_key(content, ["summaries", "summary", "items"])
+        raise KeyError(f"Template missing summaries/items field. Nearest match: {found}")
+ 
+    _save_json(work_dir, "content/content.json", content)
 
 def _cornell_mime(url: str) -> str:
     u = (url or "").lower()
@@ -3669,40 +3723,6 @@ def update_cornell_notes_template(
 
     _save_json(work_dir, "content/content.json", content)
     return content
-
-
-def update_summary_template(work_dir: str, title: str, description: str, groups: List[Dict[str, Any]]) -> None:
-    update_h5p_title(work_dir, title)
-    content = _load_json(work_dir, "content/content.json")
-    deep_find_set_first(content, ["taskDescription", "introduction", "description", "instructions"], description)
-
-    # H5P Summary expects each group's "summary" to be a list of strings.
-    # The FIRST string is the correct answer; the rest are incorrect options.
-    summary_objs = []
-    for grp in groups:
-        correct = (grp.get("correct_statement") or "").strip()
-        incorrects = grp.get("incorrect_statements") or []
-        # Ensure we have strings
-        incorrects = [(s or "").strip() for s in incorrects if (s or "").strip()]
-        if not correct:
-            continue
-        # Build the statement list: correct first, then incorrects
-        statements = [correct] + incorrects
-        summary_objs.append({
-            "subContentId": random_subcontent_id(),
-            "tip": (grp.get("tip") or "").strip(),
-            "summary": statements,
-        })
-
-    if not summary_objs:
-        raise ValueError("No valid summary groups were generated.")
-
-    if not deep_find_set_first(content, ["summaries", "summary", "items"], summary_objs):
-        found = deep_find_first_key(content, ["summaries", "summary", "items"])
-        raise KeyError(f"Template missing summaries/items field. Nearest match: {found}")
-
-    _save_json(work_dir, "content/content.json", content)
-
 
 def build_question_set_truefalse(work_dir: str, title: str, description: str, tf_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     update_h5p_title(work_dir, title)
@@ -4756,12 +4776,18 @@ if st.session_state["suggestions"]:
                     unzip_h5p(templates["Summary"], work_dir)
                     gen_data = call_llm_summary(chunks, run_n, enriched_course)
                     _gen_bar.progress(65, text="AI content generated — building template...")
-                    update_summary_template(work_dir, gen_data["title"], gen_data["description"], gen_data.get("groups", []))
+                    update_summary_template(
+                        work_dir,
+                        gen_data["title"],
+                        gen_data["description"],
+                        gen_data.get("groups", []),
+                        overall_feedback=gen_data.get("overall_feedback"),
+                    )
                     title = gen_data["title"]
-
+ 
                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
                     zip_dir_to_file(work_dir, out_h5p)
-
+ 
                     qa_items = []
                     for i, grp in enumerate(gen_data.get("groups", []), start=1):
                         correct = grp.get("correct_statement", "")
@@ -4771,7 +4797,7 @@ if st.session_state["suggestions"]:
                             "content": f"Correct: {correct}\nIncorrect: {'; '.join(incorrects)}",
                             "evidence": grp.get("evidence", {}),
                         })
-
+ 
                     out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
                     write_qa_report_html(out_qa, title, typ, qa_items)
 
