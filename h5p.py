@@ -1027,12 +1027,27 @@ def build_fallback_query(course: str, pdf_headings: List[str]) -> str:
 
 
 
-def _find_first_library_list(d: Any) -> Optional[List]:
-    """Find a list that appears to contain H5P 'library' items."""
+def _find_first_library_list(d):
+    """Find a list that appears to contain H5P 'library' items.
+ 
+    Handles TWO formats:
+    1. Direct: [{"library": "...", "params": {...}}, ...]
+    2. Column wrapper: [{"content": {"library": "...", "params": {...}}, "useSeparator": "auto"}, ...]
+    """
     if isinstance(d, dict):
         for k, v in d.items():
-            if k == "content" and isinstance(v, list) and (not v or (isinstance(v[0], dict) and "library" in v[0])):
-                return v
+            if k == "content" and isinstance(v, list):
+                if not v:
+                    return v  # empty list — still valid target
+                first = v[0]
+                if isinstance(first, dict):
+                    # Direct format: item has "library" key
+                    if "library" in first:
+                        return v
+                    # Column wrapper format: item has "content" dict with "library"
+                    inner = first.get("content")
+                    if isinstance(inner, dict) and "library" in inner:
+                        return v
             found = _find_first_library_list(v)
             if found is not None:
                 return found
@@ -1512,88 +1527,270 @@ SOURCE:
 """
     return call_openai_chat_json(system, user)
 
-
 def update_page_template_with_images(
-    work_dir: str,
-    title: str,
-    sections: List[Dict[str, Any]],
-    course: str = "",
-    pdf_headings: Optional[List[str]] = None,
-    pdf_keywords: Optional[List[str]] = None,
-) -> List[Dict[str, Any]]:
-    """Populate an H5P Page with Image + Text blocks."""
+    work_dir,
+    title,
+    sections,
+    course="",
+    pdf_headings=None,
+    pdf_keywords=None,
+    tf_items=None,
+):
+    """Populate an H5P Page (Column) with Text + Image blocks + optional QuestionSet.
+ 
+    Handles the H5P.Column wrapper format where each item is:
+      {"content": {"library": ..., "params": ...}, "useSeparator": "auto"}
+ 
+    Args:
+        work_dir:      Extracted H5P template directory.
+        title:         Activity title.
+        sections:      List of section dicts from LLM (heading, body_html, image_query, evidence).
+        course:        Course name for image search.
+        pdf_headings:  PDF headings for image search.
+        pdf_keywords:  PDF keywords for image search.
+        tf_items:      Optional list of True/False question dicts for a QuestionSet block.
+ 
+    Returns:
+        qa_items list for QA evidence report.
+    """
+    import uuid
+    import re
+    import os
+ 
     pdf_headings = pdf_headings or []
     pdf_keywords = pdf_keywords or []
-
-    
-
+    tf_items = tf_items or []
+ 
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
-
+ 
+    # Find the content list (works with both direct and Column wrapper formats)
     lib_list = _find_first_library_list(content)
     if lib_list is None:
-        raise KeyError("Could not find Page 'content' list to populate.")
-
+        # Fallback: create the content list if it doesn't exist
+        if "content" not in content or not isinstance(content["content"], list):
+            content["content"] = []
+        lib_list = content["content"]
+ 
+    # Detect whether the template uses Column wrapper format
+    uses_column_wrapper = False
+    if lib_list:
+        first = lib_list[0]
+        if isinstance(first, dict) and "useSeparator" in first:
+            uses_column_wrapper = True
+    else:
+        # Empty list — check if parent is H5P.Column by looking at h5p.json
+        h5p_meta = _load_json(work_dir, "h5p.json")
+        if "Column" in (h5p_meta.get("mainLibrary") or ""):
+            uses_column_wrapper = True
+ 
     images_dir = os.path.join(work_dir, "content", "images")
     os.makedirs(images_dir, exist_ok=True)
-
-    new_blocks: List[Dict[str, Any]] = []
-    qa_items: List[Dict[str, Any]] = []
-
-    def h5p_image(img_rel: str, mime: str, alt: str = "", caption: str = "") -> Dict[str, Any]:
+ 
+    # Remove old template images
+    for old_img in os.listdir(images_dir):
+        old_path = os.path.join(images_dir, old_img)
+        if os.path.isfile(old_path):
+            try:
+                os.remove(old_path)
+            except Exception:
+                pass
+ 
+    new_blocks = []
+    qa_items = []
+ 
+    def _wrap_column(library_block):
+        """Wrap a library block in Column format if needed."""
+        if uses_column_wrapper:
+            return {
+                "content": library_block,
+                "useSeparator": "auto",
+            }
+        return library_block
+ 
+    def _make_text_block(html):
         return {
-            "library": "H5P.Image 1.1",
+            "params": {"text": html},
+            "library": "H5P.AdvancedText 1.1",
+            "metadata": {"contentType": "Text", "license": "U", "title": "Untitled Text"},
+            "subContentId": str(uuid.uuid4()),
+        }
+ 
+    def _make_image_block(img_rel, mime, alt=""):
+        return {
             "params": {
-                "title": caption,
-                "alt": alt,
+                "decorative": False,
+                "contentName": "Image",
+                "expandImage": "Expand Image",
+                "minimizeImage": "Minimize Image",
                 "file": {
                     "path": img_rel,
                     "mime": mime,
                     "copyright": {"license": "U"},
                 },
             },
-            "metadata": {"title": "Image", "license": "U"},
+            "library": "H5P.Image 1.1",
+            "metadata": {"contentType": "Image", "license": "U", "title": "Untitled Image"},
+            "subContentId": str(uuid.uuid4()),
         }
-
-    def h5p_adv_text(html: str) -> Dict[str, Any]:
-        return {
-            "library": "H5P.AdvancedText 1.1",
-            "params": {"text": html},
-            "metadata": {"title": "Text", "license": "U"},
-        }
-
+ 
+    # --- Build content sections: heading text + image per section ---
     for i, sec in enumerate(sections, start=1):
         heading = (sec.get("heading") or "").strip()
         body = (sec.get("body_html") or "").strip()
         img_q = (sec.get("image_query") or "").strip()
         ev = sec.get("evidence") or {}
-        src_file = (ev.get("source_file") or "").strip()
-        locator = (ev.get("locator") or "").strip()
-        quote = (ev.get("quote") or "").strip()
-
+ 
         if not body:
             continue
-
-        context_for_img = f"{heading} {re.sub('<[^<]+?>','', body)}".strip()
-        queries = build_image_queries(course=course, pdf_headings=pdf_headings, pdf_keywords=pdf_keywords, context_text=context_for_img, llm_image_query=img_q)
-        fallback = build_fallback_query(course, pdf_headings)
-        dl = ensure_image(images_dir, queries=queries, stem=f"page_{i}", fallback_query=fallback)
-
-        new_blocks.append(h5p_image(dl["path"], dl["mime"], alt=heading, caption=heading))
-
+ 
+        # Add heading + body text block
         html = f"<h3>{heading}</h3>\n{body}" if heading else body
-        new_blocks.append(h5p_adv_text(html))
-
+        new_blocks.append(_wrap_column(_make_text_block(html)))
+ 
+        # Add image block
+        context_for_img = f"{heading} {re.sub('<[^<]+?>', '', body)}".strip()
+        queries = build_image_queries(
+            course=course, pdf_headings=pdf_headings,
+            pdf_keywords=pdf_keywords, context_text=context_for_img,
+            llm_image_query=img_q,
+        )
+        fallback = build_fallback_query(course, pdf_headings)
+        dl = ensure_image(images_dir, queries=queries, stem=f"page_{i}",
+                          fallback_query=fallback)
+ 
+        new_blocks.append(_wrap_column(_make_image_block(dl["path"], dl["mime"], alt=heading)))
+ 
         qa_items.append({
             "label": f"Page section {i}",
-            "content": f"{heading}\n{re.sub('<[^<]+?>','',body)[:500]}",
+            "content": f"{heading}\n{re.sub('<[^<]+?>', '', body)[:500]}",
             "expected": "",
-            "evidence": {"source_file": src_file, "locator": locator, "quote": quote},
+            "evidence": {"source_file": (ev.get("source_file") or ""),
+                         "locator": (ev.get("locator") or ""),
+                         "quote": (ev.get("quote") or "")},
         })
-
+ 
+    # --- Build QuestionSet block if True/False items provided ---
+    if tf_items:
+        tf_questions = []
+        for it in tf_items:
+            statement = (it.get("statement") or "").strip()
+            correct_answer = it.get("correctAnswer", True)
+            if not statement:
+                continue
+            tf_questions.append({
+                "params": {
+                    "media": {"disableImageZooming": False},
+                    "correct": "true" if correct_answer else "false",
+                    "behaviour": {
+                        "enableRetry": True,
+                        "enableSolutionsButton": True,
+                        "enableCheckButton": True,
+                        "confirmCheckDialog": False,
+                        "confirmRetryDialog": False,
+                        "autoCheck": False,
+                    },
+                    "l10n": {
+                        "trueText": "True",
+                        "falseText": "False",
+                        "score": "You got @score of @total points",
+                        "checkAnswer": "Check",
+                        "showSolutionButton": "Show solution",
+                        "tryAgain": "Retry",
+                        "wrongAnswerMessage": "Wrong answer",
+                        "correctAnswerMessage": "Correct answer",
+                        "scoreBarLabel": "You got :num out of :total points",
+                    },
+                    "confirmCheck": {
+                        "header": "Finish ?",
+                        "body": "Are you sure you wish to finish ?",
+                        "cancelLabel": "Cancel",
+                        "confirmLabel": "Finish",
+                    },
+                    "confirmRetry": {
+                        "header": "Retry ?",
+                        "body": "Are you sure you wish to retry ?",
+                        "cancelLabel": "Cancel",
+                        "confirmLabel": "Confirm",
+                    },
+                    "question": f"<p>{statement}</p>",
+                },
+                "library": "H5P.TrueFalse 1.8",
+                "metadata": {
+                    "contentType": "True/False Question",
+                    "license": "U",
+                    "title": "Untitled True/False Question",
+                },
+                "subContentId": str(uuid.uuid4()),
+            })
+ 
+        if tf_questions:
+            question_set_block = {
+                "params": {
+                    "introPage": {
+                        "showIntroPage": False,
+                        "startButtonText": "Start Quiz",
+                        "introduction": "",
+                    },
+                    "progressType": "dots",
+                    "passPercentage": 50,
+                    "questions": tf_questions,
+                    "disableBackwardsNavigation": False,
+                    "randomQuestions": False,
+                    "endGame": {
+                        "showResultPage": True,
+                        "showSolutionButton": True,
+                        "showRetryButton": True,
+                        "noResultMessage": "Finished",
+                        "message": "Your result:",
+                        "overallFeedback": [{"from": 0, "to": 100}],
+                        "finishButtonText": "Finish",
+                        "solutionButtonText": "Show solution",
+                        "retryButtonText": "Retry",
+                        "showAnimations": False,
+                        "skippable": False,
+                        "skipButtonText": "Skip video",
+                    },
+                    "override": {
+                        "checkButton": True,
+                    },
+                    "texts": {
+                        "prevButton": "Previous question",
+                        "nextButton": "Next question",
+                        "finishButton": "Finish",
+                        "submitButton": "Submit",
+                        "textualProgress": "Question: @current of @total questions",
+                        "jumpToQuestion": "Question %d of %total",
+                        "questionLabel": "Question",
+                        "readSpeakerProgress": "Question @current of @total",
+                        "unansweredText": "Unanswered",
+                        "answeredText": "Answered",
+                        "currentQuestionText": "Current question",
+                    },
+                },
+                "library": "H5P.QuestionSet 1.20",
+                "metadata": {
+                    "contentType": "Question Set",
+                    "license": "U",
+                    "title": "True/False Quiz",
+                },
+                "subContentId": str(uuid.uuid4()),
+            }
+            new_blocks.append(_wrap_column(question_set_block))
+ 
+            # Add QA items for questions
+            for qi, it in enumerate(tf_items, start=1):
+                ev = it.get("evidence") or {}
+                qa_items.append({
+                    "label": f"Q{qi} True/False",
+                    "content": f"{it.get('statement', '')} (answer: {it.get('correctAnswer')})",
+                    "expected": str(it.get("correctAnswer", "")),
+                    "evidence": ev,
+                })
+ 
     if not new_blocks:
         raise ValueError("No Page content was generated.")
-
+ 
     lib_list[:] = new_blocks
     _save_json(work_dir, "content/content.json", content)
     return qa_items
@@ -5332,8 +5529,15 @@ if st.session_state["suggestions"]:
                 elif typ == "Page":
                     work_dir = os.path.join(tmp, "_work_page")
                     unzip_h5p(templates["Page"], work_dir)
-
+ 
+                    # Step 1: Generate content sections
+                    _gen_bar.progress(30, text="Generating page content from PDFs...")
                     gen_data = call_llm_page_content(chunks, n_sections=min(6, max(3, run_n // 2)), course=enriched_course)
+ 
+                    # Step 2: Generate True/False questions for the QuestionSet
+                    _gen_bar.progress(50, text="Generating True/False questions...")
+                    tf_data = call_llm_truefalse_statements(chunks, min(run_n, 8), enriched_course)
+ 
                     _gen_bar.progress(65, text="AI content generated — building template...")
                     title = gen_data.get("title", f"Page - {course_name.strip()}")
                     qa_items = update_page_template_with_images(
@@ -5343,11 +5547,12 @@ if st.session_state["suggestions"]:
                         course=course_name.strip(),
                         pdf_headings=st.session_state.get("pdf_headings_cache") or [],
                         pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
+                        tf_items=tf_data.get("items", []),
                     )
-
+ 
                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
                     zip_dir_to_file(work_dir, out_h5p)
-
+ 
                     out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
                     write_qa_report_html(out_qa, title, typ, qa_items)
 
