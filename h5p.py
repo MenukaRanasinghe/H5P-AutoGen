@@ -1682,7 +1682,8 @@ Return JSON:
 
 STRICT RULES:
 1. EXACTLY {n_slides} slides — no more, no less.
-2. Each "heading" MUST be a topic or section title that appears in the SOURCE.
+2. Each "heading" MUST be a specific, descriptive topic name from the SOURCE.
+   - Do NOT use generic headings like "Introduction", "Overview", "Summary", "Conclusion", "Key Points", "Getting Started".
 3. Each bullet MUST be a factual statement directly stated in the SOURCE.
    - Use 3-5 SHORT bullets per slide (≤12 words each).
    - Pick only the most important facts; do NOT overload slides with text.
@@ -1928,6 +1929,48 @@ def _html_bullets(heading: str, bullets: List[str], max_bullets: int = 4) -> str
         return f"<h2>{h}</h2><ul>{li}</ul>"
     return f"<ul>{li}</ul>"
 
+def _set_presentation_description_safe(content: dict, description: str, title: str = "", slides_data: list = None) -> None:
+    """Set Course Presentation / Interactive Book description at SAFE locations only.
+ 
+    CRITICAL: Ignores the LLM-generated description (which is often hallucinated).
+    Instead, builds a factual description from the title + first slide heading.
+    """
+    # Build description from ACTUAL content, not LLM output
+    desc = ""
+    if slides_data:
+        first_heading = ""
+        for s in (slides_data or []):
+            h = (s.get("heading") or s.get("chapter_title") or s.get("title") or "").strip()
+            if h:
+                first_heading = h
+                break
+        if title and first_heading:
+            desc = f"<p>{title} — {first_heading}</p>"
+        elif title:
+            desc = f"<p>{title}</p>"
+ 
+    if not desc and title:
+        desc = f"<p>{title}</p>"
+ 
+    if not desc:
+        return
+ 
+    _DESC_KEYS = ["introduction", "description", "taskDescription"]
+ 
+    for key in _DESC_KEYS:
+        if key in content:
+            content[key] = desc
+            return
+ 
+    pres = content.get("presentation")
+    if isinstance(pres, dict):
+        for key in _DESC_KEYS:
+            if key in pres:
+                pres[key] = desc
+                return
+ 
+    content["introduction"] = desc
+
 
 def _build_cp_activity_slide_elements(activity_type: str, questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Build H5P element(s) for ALL activity questions on a SINGLE Course Presentation slide.
@@ -2164,7 +2207,11 @@ def update_course_presentation_template_with_images(
 
         deep_find_set_first(slide_obj, ["slideTitle", "title", "heading"], heading)
 
-        html = _html_bullets(heading, bullets)
+        # Slide 1: title-only (no bullets); other slides: heading + bullets
+        if i == 1:
+            html = f"<h2>{heading}</h2>" if heading else _html_bullets(heading, bullets)
+        else:
+            html = _html_bullets(heading, bullets)
 
         # --- Strip interactive activity elements from this content slide ---
         if "elements" in slide_obj and isinstance(slide_obj["elements"], list):
@@ -2183,11 +2230,29 @@ def update_course_presentation_template_with_images(
 
             slide_obj["elements"] = [el for el in slide_obj["elements"] if not _is_activity_element(el)]
 
-        # --- Update AdvancedText content (or create one if missing) ---
         adv_blocks = [b for b in _iter_library_blocks(slide_obj) if str(b.get("library", "")).startswith("H5P.AdvancedText")]
         if adv_blocks:
             adv_blocks[0].setdefault("params", {})
             adv_blocks[0]["params"]["text"] = html
+            # ── FIX: Remove ALL extra AdvancedText elements from this slide ──
+            # Templates may have 2+ text elements (e.g. heading + description).
+            # Keep only the first one (now updated); discard extras to prevent
+            # stale template text leaking into the generated output.
+            if "elements" in slide_obj and isinstance(slide_obj["elements"], list):
+                kept_action_id = id(adv_blocks[0])
+                cleaned = []
+                for el in slide_obj["elements"]:
+                    if not isinstance(el, dict):
+                        cleaned.append(el)
+                        continue
+                    act = el.get("action")
+                    if isinstance(act, dict) and str(act.get("library", "")).startswith("H5P.AdvancedText"):
+                        if id(act) == kept_action_id:
+                            cleaned.append(el)
+                        # else: discard extra AdvancedText
+                    else:
+                        cleaned.append(el)
+                slide_obj["elements"] = cleaned
         elif not deep_find_set_first(slide_obj, ["text", "html", "content", "questionText"], html):
             # No existing text element found — inject one so the slide is never blank
             if "elements" not in slide_obj or not isinstance(slide_obj.get("elements"), list):
@@ -2306,7 +2371,7 @@ def update_course_presentation_template_with_images(
                     "evidence": ev,
                 })
 
-    deep_find_set_first(content, ["introduction", "description", "taskDescription"], description)
+    _set_presentation_description_safe(content, description, title=title, slides_data=slides)
     _save_json(work_dir, "content/content.json", content)
     return qa_items
 
@@ -2468,7 +2533,7 @@ def update_interactive_book_template_with_images(
                     "evidence": ev,
                 })
 
-    deep_find_set_first(content, ["description", "introduction", "taskDescription"], description)
+    _set_presentation_description_safe(content, description, title=title, slides_data=chapters)
     _save_json(work_dir, "content/content.json", content)
     return qa_items
 
