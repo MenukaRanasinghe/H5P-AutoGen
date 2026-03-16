@@ -1,4 +1,5 @@
 import math
+import math as _math
 import os
 import re
 import json
@@ -3949,7 +3950,46 @@ SOURCE:
 """.strip()
     return call_openai_chat_json(system, user)
  
+def call_llm_virtual_tour_interactions(chunks, n_hotspots, course):
+    """Generate text-based hotspot interactions for a 360° Virtual Tour from PDF content."""
+    system = (
+        "You are a strict content extractor. You ONLY use facts from the SOURCE text. "
+        "Return JSON only."
+    )
+    src_txt = join_chunks_for_prompt(chunks, max_chars=65000)
+    user = f"""
+Create {n_hotspots} informational hotspot labels for a 360° Virtual Tour activity.
+Course: {course}
  
+Each hotspot will appear as a clickable point on a 360° image. When clicked, it shows
+a title and a short informational text popup.
+ 
+Return JSON:
+{{
+  "hotspots": [
+    {{
+      "label": "string — a short 2-5 word title for the hotspot (e.g. 'Key Responsibilities', 'Safety Requirements')",
+      "body_html": "string — 2-4 sentences of informational content in simple HTML (<p>, <ul>, <li>, <b> only). Must be factual content from SOURCE.",
+      "evidence": {{"source_file":"string","locator":"PDF p.X/Y","quote":"short exact quote from SOURCE"}}
+    }}
+  ]
+}}
+ 
+Rules:
+1. EXACTLY {n_hotspots} hotspots.
+2. Each hotspot must cover a DIFFERENT topic/section from the SOURCE.
+3. Labels must be short and descriptive (2-5 words).
+4. body_html must contain useful, factual content directly from SOURCE.
+5. Keep body_html concise — 2-4 sentences maximum per hotspot.
+6. Use simple HTML only: <p>, <ul>, <li>, <b>.
+7. Spread hotspots across different parts of the SOURCE content.
+8. Do NOT invent facts — every statement must be traceable to SOURCE.
+ 
+SOURCE:
+{src_txt}
+""".strip()
+    return call_openai_chat_json(system, user)
+
 def update_summary_template(work_dir: str, title: str, groups: List[Dict[str, Any]], overall_feedback: Optional[List[Dict[str, Any]]] = None, introduction: Optional[str] = None) -> None:
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
@@ -4188,34 +4228,133 @@ def build_question_set_truefalse(work_dir: str, title: str, description: str, tf
         qa.append({"label": f"Q{i}", "content": f"{it.get('statement','')} (answer: {it.get('correctAnswer')})", "evidence": it.get("evidence", {})})
     return qa
 
-def update_virtual_tour_template(work_dir: str, title: str, image_bytes: bytes, image_name: str) -> List[Dict[str, Any]]:
+def update_virtual_tour_template(
+    work_dir,
+    title,
+    image_bytes,
+    image_name,
+    hotspots=None,
+):
+    """Build a clean Virtual Tour (360) with a single scene and LLM-generated interactions.
+ 
+    Args:
+        work_dir:     Extracted H5P template directory.
+        title:        Activity title.
+        image_bytes:  Raw bytes of the 360° image.
+        image_name:   Original filename (used to determine extension).
+        hotspots:     List of dicts with 'label' and 'body_html' keys (from LLM).
+                      Each becomes a clickable text-popup interaction on the 360 scene.
+ 
+    Returns:
+        qa_items list for the QA evidence report.
+    """
+    hotspots = hotspots or []
+ 
     update_h5p_title(work_dir, title)
-    content = _load_json(work_dir, "content/content.json")
-
+ 
+    # ── Determine file extension and MIME type ────────────────────────────
     ext = image_name.rsplit(".", 1)[-1].lower() if "." in image_name else "jpg"
     mime = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
-
+ 
+    # ── Clean out ALL old template images ─────────────────────────────────
     images_dir = os.path.join(work_dir, "content", "images")
+    if os.path.isdir(images_dir):
+        shutil.rmtree(images_dir)
     os.makedirs(images_dir, exist_ok=True)
-
-    fname = f"tour360.{ext}"
+ 
+    # ── Save the user's 360 image ─────────────────────────────────────────
+    fname = f"scene360.{ext}"
     rel_path = f"images/{fname}"
     abs_path = os.path.join(images_dir, fname)
-
+ 
     with open(abs_path, "wb") as f:
         f.write(image_bytes)
-
-    # simplest possible patch: replace first image-like object found
-    deep_find_set_first(content, ["path"], rel_path)
-    deep_find_set_first(content, ["mime"], mime)
-
+ 
+    # ── Build interactions from hotspots ───────────────────────────────────
+    # 360 scene positions use "yaw,pitch" in radians.
+    # Distribute hotspots evenly around the horizontal (yaw) axis,
+    # with slight vertical variation to avoid a flat line.
+    interactions = []
+    n = len(hotspots)
+ 
+    for i, hs in enumerate(hotspots):
+        label = (hs.get("label") or f"Info {i+1}").strip()
+        body = (hs.get("body_html") or "").strip()
+        if not body:
+            body = f"<p>{label}</p>"
+ 
+        # Distribute yaw evenly across full circle (-π to π)
+        yaw = -_math.pi + (2 * _math.pi * i / max(n, 1))
+        # Slight pitch variation so hotspots aren't all on the equator
+        pitch = 0.15 * ((-1) ** i) * ((i % 3) + 1) / 3.0
+ 
+        interactions.append({
+            "interactionpos": f"{yaw},{pitch}",
+            "action": {
+                "library": "H5P.AdvancedText 1.1",
+                "params": {
+                    "text": f"<h3>{label}</h3>\n{body}",
+                },
+                "subContentId": str(uuid.uuid4()),
+                "metadata": {
+                    "contentType": "Text",
+                    "license": "U",
+                    "title": label,
+                },
+            },
+        })
+ 
+    # ── Build a completely fresh content.json ──────────────────────────────
+    content = {
+        "threeImage": {
+            "scenes": [
+                {
+                    "sceneId": 0,
+                    "sceneType": "360",
+                    "showBackButton": False,
+                    "scenesrc": {
+                        "path": rel_path,
+                        "mime": mime,
+                        "copyright": {"license": "U"},
+                    },
+                    "scenename": title,
+                    "scenedescription": "",
+                    "cameraStartPosition": "0,0",
+                    "interactions": interactions,
+                }
+            ],
+            "startSceneId": 0,
+        },
+        "behaviour": {
+            "sceneRenderingQuality": "high",
+            "label": {
+                "showLabel": True,
+                "labelPosition": "right",
+            },
+        },
+    }
+ 
     _save_json(work_dir, "content/content.json", content)
-
-    return [{
-        "label": "360 image",
-        "content": rel_path,
-        "evidence": {}
+ 
+    # ── Build QA items ────────────────────────────────────────────────────
+    qa_items = [{
+        "label": "360 Scene",
+        "content": f"Single 360° scene: {title} ({rel_path})",
+        "evidence": {},
     }]
+ 
+    for i, hs in enumerate(hotspots, start=1):
+        ev = hs.get("evidence") or {}
+        label = (hs.get("label") or f"Hotspot {i}").strip()
+        body_plain = re.sub(r"<[^>]+>", "", hs.get("body_html") or "")
+        qa_items.append({
+            "label": f"Hotspot {i}: {label}",
+            "content": body_plain[:400],
+            "expected": "",
+            "evidence": ev,
+        })
+ 
+    return qa_items
 
 def write_qa_report_html(path: str, title: str, activity_type: str, qa_items: List[Dict[str, Any]]) -> None:
     def esc(s: str) -> str:
@@ -4655,18 +4794,68 @@ if st.session_state["suggestions"]:
         ib_n_questions = 0
 
     elif chosen["type"] == "Virtual Tour (360)":
-     vt_360_file = st.file_uploader(
-        "Upload 360 image *",
-        type=["jpg", "jpeg", "png", "webp"],
-        help="Upload the panorama image for the virtual tour."
-    )
-     n_items = 1
-     cp_n_slides = None
-     cp_activity_types = []
-     cp_n_questions = 0
-     ib_n_pages = None
-     ib_activity_types = []
-     ib_n_questions = 0    
+        st.markdown("#### Virtual Tour — 360° Panoramic Image")
+        st.info(
+            "**⚠️ This activity requires a 360° equirectangular panoramic image.**\\n\\n"
+            "A 360° image is a special wide photograph (typically **2:1 aspect ratio**, "
+            "e.g. 4096×2048 or 8192×4096) that wraps around the viewer to create an "
+            "immersive experience.\\n\\n"
+            "**Do NOT upload a regular photo** — it will appear stretched and distorted.\\n\\n"
+            "**How to get a 360° image:**\\n"
+            "- Use a **360° camera** (e.g. Insta360, Ricoh Theta, GoPro MAX)\\n"
+            "- Use a **phone app** that stitches panoramas (e.g. Google Street View app)\\n"
+            "- Download from a **360° image library** (e.g. Poly Haven, Flickr 360° group)\\n"
+            "- Export equirectangular images from **Google Street View**"
+        )
+        vt_360_file = st.file_uploader(
+            "Upload 360° panoramic image *",
+            type=["jpg", "jpeg", "png", "webp"],
+            help="Must be an equirectangular 360° panoramic image (2:1 aspect ratio recommended).",
+        )
+        if vt_360_file is not None:
+            try:
+                from PIL import Image as _PILImage
+                import io as _io
+                _pil = _PILImage.open(_io.BytesIO(vt_360_file.getvalue()))
+                _w, _h = _pil.size
+                _ratio = _w / _h if _h > 0 else 0
+                st.image(
+                    vt_360_file.getvalue(),
+                    caption=f"Preview — {_w}×{_h}px (ratio {_ratio:.2f}:1)",
+                    use_container_width=True,
+                )
+                if abs(_ratio - 2.0) > 0.3:
+                    st.warning(
+                        f"⚠️ This image has a **{_ratio:.2f}:1** aspect ratio. "
+                        f"360° panoramic images should be **2:1** (e.g. 4096×2048). "
+                        f"If this is not a 360° image, it will appear stretched/distorted."
+                    )
+                else:
+                    st.success(
+                        f"✅ Looks like a valid 360° panorama ({_w}×{_h}px, {_ratio:.1f}:1 ratio)."
+                    )
+            except ImportError:
+                st.caption("Install Pillow (`pip install Pillow`) for image preview & validation.")
+            except Exception:
+                st.caption("Could not preview image.")
+ 
+        vt_n_hotspots = st.number_input(
+            "Number of info hotspots",
+            min_value=2,
+            max_value=8,
+            value=4,
+            step=1,
+            help="Clickable points on the 360° image that show informational text from the PDF.",
+        )
+        st.caption(f"Will generate **{int(vt_n_hotspots)} clickable hotspots** with content from the uploaded PDFs.")
+ 
+        n_items = 1
+        cp_n_slides = None
+        cp_activity_types = []
+        cp_n_questions = 0
+        ib_n_pages = None
+        ib_activity_types = []
+        ib_n_questions = 0  
 
     # --- Interactive Book specific options ---
     elif chosen["type"] == "Interactive Book":
@@ -4958,25 +5147,36 @@ if st.session_state["suggestions"]:
 
                 elif typ == "Virtual Tour (360)":
                     if vt_360_file is None:
-                        raise ValueError("Please upload a 360 image for Virtual Tour (360).")
-
+                        raise ValueError("Please upload a 360° panoramic image for Virtual Tour (360).")
+ 
                     work_dir = os.path.join(tmp, "_work_virtual_tour")
                     unzip_h5p(templates["Virtual Tour (360)"], work_dir)
-
+ 
                     title = f"Virtual Tour - {course_name.strip()}"
-
+ 
+                    # Generate hotspot interactions from PDF content
+                    _gen_bar.progress(30, text="Generating hotspot content from PDFs...")
+                    hotspot_data = call_llm_virtual_tour_interactions(
+                        chunks,
+                        n_hotspots=int(vt_n_hotspots),
+                        course=enriched_course,
+                    )
+                    hotspots = hotspot_data.get("hotspots") or []
+ 
+                    _gen_bar.progress(65, text=f"Building 360° tour with {len(hotspots)} hotspots...")
                     qa_items = update_virtual_tour_template(
                         work_dir,
                         title,
                         vt_360_file.getvalue(),
                         vt_360_file.name,
-                   )
-
+                        hotspots=hotspots,
+                    )
+ 
                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
                     zip_dir_to_file(work_dir, out_h5p)
-
+ 
                     out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                    write_qa_report_html(out_qa, title, typ, qa_items)    
+                    write_qa_report_html(out_qa, title, typ, qa_items)  
 
                 elif typ == "Interactive Book":
                     work_dir = os.path.join(tmp, "_work_interactive_book")
