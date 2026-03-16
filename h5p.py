@@ -1534,52 +1534,52 @@ def update_page_template_with_images(
     course="",
     pdf_headings=None,
     pdf_keywords=None,
-    tf_items=None,
+    activities=None,
 ):
-    """Populate an H5P Page (Column) with Text + Image blocks + optional QuestionSet.
+    """Populate an H5P Page (Column) with Text + Image + individual activity blocks.
  
-    Handles the H5P.Column wrapper format where each item is:
-      {"content": {"library": ..., "params": ...}, "useSeparator": "auto"}
+    Generates:
+      - Text + Image pairs per content section
+      - Individual activity blocks (TrueFalse, DragText, MultiChoice, etc.)
+        each as a standalone Column item — NOT wrapped in a QuestionSet.
  
     Args:
         work_dir:      Extracted H5P template directory.
         title:         Activity title.
-        sections:      List of section dicts from LLM (heading, body_html, image_query, evidence).
+        sections:      List of section dicts (heading, body_html, image_query, evidence).
         course:        Course name for image search.
         pdf_headings:  PDF headings for image search.
         pdf_keywords:  PDF keywords for image search.
-        tf_items:      Optional list of True/False question dicts for a QuestionSet block.
- 
+        activities:    List of dicts, each with:
+                         {"type": "truefalse"|"dragtext"|"multichoice",
+                          "data": <question dict from LLM>,
+                          "evidence": {...}}
     Returns:
         qa_items list for QA evidence report.
     """
-    import uuid
-    import re
-    import os
+    import uuid as _uuid
+    import re as _re
  
     pdf_headings = pdf_headings or []
     pdf_keywords = pdf_keywords or []
-    tf_items = tf_items or []
+    activities = activities or []
  
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
  
-    # Find the content list (works with both direct and Column wrapper formats)
     lib_list = _find_first_library_list(content)
     if lib_list is None:
-        # Fallback: create the content list if it doesn't exist
         if "content" not in content or not isinstance(content["content"], list):
             content["content"] = []
         lib_list = content["content"]
  
-    # Detect whether the template uses Column wrapper format
+    # Detect Column wrapper format
     uses_column_wrapper = False
     if lib_list:
         first = lib_list[0]
         if isinstance(first, dict) and "useSeparator" in first:
             uses_column_wrapper = True
     else:
-        # Empty list — check if parent is H5P.Column by looking at h5p.json
         h5p_meta = _load_json(work_dir, "h5p.json")
         if "Column" in (h5p_meta.get("mainLibrary") or ""):
             uses_column_wrapper = True
@@ -1599,42 +1599,34 @@ def update_page_template_with_images(
     new_blocks = []
     qa_items = []
  
-    def _wrap_column(library_block):
-        """Wrap a library block in Column format if needed."""
+    def _wrap(block):
         if uses_column_wrapper:
-            return {
-                "content": library_block,
-                "useSeparator": "auto",
-            }
-        return library_block
+            return {"content": block, "useSeparator": "auto"}
+        return block
  
-    def _make_text_block(html):
+    def _text_block(html):
         return {
             "params": {"text": html},
             "library": "H5P.AdvancedText 1.1",
             "metadata": {"contentType": "Text", "license": "U", "title": "Untitled Text"},
-            "subContentId": str(uuid.uuid4()),
+            "subContentId": str(_uuid.uuid4()),
         }
  
-    def _make_image_block(img_rel, mime, alt=""):
+    def _image_block(img_rel, mime, alt=""):
         return {
             "params": {
                 "decorative": False,
                 "contentName": "Image",
                 "expandImage": "Expand Image",
                 "minimizeImage": "Minimize Image",
-                "file": {
-                    "path": img_rel,
-                    "mime": mime,
-                    "copyright": {"license": "U"},
-                },
+                "file": {"path": img_rel, "mime": mime, "copyright": {"license": "U"}},
             },
             "library": "H5P.Image 1.1",
             "metadata": {"contentType": "Image", "license": "U", "title": "Untitled Image"},
-            "subContentId": str(uuid.uuid4()),
+            "subContentId": str(_uuid.uuid4()),
         }
  
-    # --- Build content sections: heading text + image per section ---
+    # ── Content sections: text + image ──────────────────────────────────
     for i, sec in enumerate(sections, start=1):
         heading = (sec.get("heading") or "").strip()
         body = (sec.get("body_html") or "").strip()
@@ -1644,12 +1636,10 @@ def update_page_template_with_images(
         if not body:
             continue
  
-        # Add heading + body text block
         html = f"<h3>{heading}</h3>\n{body}" if heading else body
-        new_blocks.append(_wrap_column(_make_text_block(html)))
+        new_blocks.append(_wrap(_text_block(html)))
  
-        # Add image block
-        context_for_img = f"{heading} {re.sub('<[^<]+?>', '', body)}".strip()
+        context_for_img = f"{heading} {_re.sub('<[^<]+?>', '', body)}".strip()
         queries = build_image_queries(
             course=course, pdf_headings=pdf_headings,
             pdf_keywords=pdf_keywords, context_text=context_for_img,
@@ -1658,138 +1648,176 @@ def update_page_template_with_images(
         fallback = build_fallback_query(course, pdf_headings)
         dl = ensure_image(images_dir, queries=queries, stem=f"page_{i}",
                           fallback_query=fallback)
- 
-        new_blocks.append(_wrap_column(_make_image_block(dl["path"], dl["mime"], alt=heading)))
+        new_blocks.append(_wrap(_image_block(dl["path"], dl["mime"], alt=heading)))
  
         qa_items.append({
             "label": f"Page section {i}",
-            "content": f"{heading}\n{re.sub('<[^<]+?>', '', body)[:500]}",
+            "content": f"{heading}\n{_re.sub('<[^<]+?>', '', body)[:500]}",
             "expected": "",
-            "evidence": {"source_file": (ev.get("source_file") or ""),
-                         "locator": (ev.get("locator") or ""),
-                         "quote": (ev.get("quote") or "")},
+            "evidence": {"source_file": ev.get("source_file", ""),
+                         "locator": ev.get("locator", ""),
+                         "quote": ev.get("quote", "")},
         })
  
-    # --- Build QuestionSet block if True/False items provided ---
-    if tf_items:
-        tf_questions = []
-        for it in tf_items:
-            statement = (it.get("statement") or "").strip()
-            correct_answer = it.get("correctAnswer", True)
+    # ── Activity heading ────────────────────────────────────────────────
+    if activities:
+        new_blocks.append(_wrap(_text_block(
+            "<h3>Test your knowledge</h3>\n<p>Answer the questions below based on what you have read.</p>"
+        )))
+ 
+    # ── Individual activity blocks ──────────────────────────────────────
+    deps_needed = set()
+ 
+    for act in activities:
+        atype = (act.get("type") or "").strip().lower()
+        data = act.get("data") or {}
+        ev = act.get("evidence") or {}
+ 
+        if atype == "truefalse":
+            statement = (data.get("statement") or "").strip()
+            correct = data.get("correctAnswer", True)
             if not statement:
                 continue
-            tf_questions.append({
+            block = {
                 "params": {
                     "media": {"disableImageZooming": False},
-                    "correct": "true" if correct_answer else "false",
+                    "correct": "true" if correct else "false",
                     "behaviour": {
-                        "enableRetry": True,
-                        "enableSolutionsButton": True,
-                        "enableCheckButton": True,
-                        "confirmCheckDialog": False,
-                        "confirmRetryDialog": False,
-                        "autoCheck": False,
+                        "enableRetry": True, "enableSolutionsButton": True,
+                        "enableCheckButton": True, "confirmCheckDialog": False,
+                        "confirmRetryDialog": False, "autoCheck": False,
                     },
                     "l10n": {
-                        "trueText": "True",
-                        "falseText": "False",
+                        "trueText": "True", "falseText": "False",
                         "score": "You got @score of @total points",
-                        "checkAnswer": "Check",
-                        "showSolutionButton": "Show solution",
-                        "tryAgain": "Retry",
-                        "wrongAnswerMessage": "Wrong answer",
+                        "checkAnswer": "Check", "showSolutionButton": "Show solution",
+                        "tryAgain": "Retry", "wrongAnswerMessage": "Wrong answer",
                         "correctAnswerMessage": "Correct answer",
                         "scoreBarLabel": "You got :num out of :total points",
                     },
-                    "confirmCheck": {
-                        "header": "Finish ?",
-                        "body": "Are you sure you wish to finish ?",
-                        "cancelLabel": "Cancel",
-                        "confirmLabel": "Finish",
-                    },
-                    "confirmRetry": {
-                        "header": "Retry ?",
-                        "body": "Are you sure you wish to retry ?",
-                        "cancelLabel": "Cancel",
-                        "confirmLabel": "Confirm",
-                    },
+                    "confirmCheck": {"header": "Finish ?", "body": "Are you sure you wish to finish ?",
+                                     "cancelLabel": "Cancel", "confirmLabel": "Finish"},
+                    "confirmRetry": {"header": "Retry ?", "body": "Are you sure you wish to retry ?",
+                                     "cancelLabel": "Cancel", "confirmLabel": "Confirm"},
                     "question": f"<p>{statement}</p>",
                 },
                 "library": "H5P.TrueFalse 1.8",
-                "metadata": {
-                    "contentType": "True/False Question",
-                    "license": "U",
-                    "title": "Untitled True/False Question",
-                },
-                "subContentId": str(uuid.uuid4()),
+                "metadata": {"contentType": "True/False Question", "license": "U",
+                              "title": "True/False"},
+                "subContentId": str(_uuid.uuid4()),
+            }
+            new_blocks.append(_wrap(block))
+            deps_needed.add("H5P.TrueFalse")
+            qa_items.append({
+                "label": "True/False",
+                "content": f"{statement} (answer: {correct})",
+                "expected": str(correct),
+                "evidence": ev,
             })
  
-        if tf_questions:
-            question_set_block = {
+        elif atype == "dragtext":
+            sentence = (data.get("sentence") or "").strip()
+            missing = (data.get("missing_word") or "").strip()
+            if not sentence or not missing:
+                continue
+            text = sentence
+            if f"*{missing}*" not in text:
+                text = text.replace("___", f"*{missing}*", 1)
+            if f"*{missing}*" not in text:
+                text = text.replace(missing, f"*{missing}*", 1)
+            if f"*{missing}*" not in text:
+                text += f" *{missing}*"
+            block = {
                 "params": {
-                    "introPage": {
-                        "showIntroPage": False,
-                        "startButtonText": "Start Quiz",
-                        "introduction": "",
-                    },
-                    "progressType": "dots",
-                    "passPercentage": 50,
-                    "questions": tf_questions,
-                    "disableBackwardsNavigation": False,
-                    "randomQuestions": False,
-                    "endGame": {
-                        "showResultPage": True,
-                        "showSolutionButton": True,
-                        "showRetryButton": True,
-                        "noResultMessage": "Finished",
-                        "message": "Your result:",
-                        "overallFeedback": [{"from": 0, "to": 100}],
-                        "finishButtonText": "Finish",
-                        "solutionButtonText": "Show solution",
-                        "retryButtonText": "Retry",
-                        "showAnimations": False,
-                        "skippable": False,
-                        "skipButtonText": "Skip video",
-                    },
-                    "override": {
-                        "checkButton": True,
-                    },
-                    "texts": {
-                        "prevButton": "Previous question",
-                        "nextButton": "Next question",
-                        "finishButton": "Finish",
-                        "submitButton": "Submit",
-                        "textualProgress": "Question: @current of @total questions",
-                        "jumpToQuestion": "Question %d of %total",
-                        "questionLabel": "Question",
-                        "readSpeakerProgress": "Question @current of @total",
-                        "unansweredText": "Unanswered",
-                        "answeredText": "Answered",
-                        "currentQuestionText": "Current question",
-                    },
+                    "textField": text,
+                    "overallFeedback": [{"from": 0, "to": 100}],
+                    "behaviour": {"enableRetry": True, "enableSolutionsButton": True,
+                                  "instantFeedback": False},
+                    "taskDescription": "<p>Drag the correct word into the blank.</p>",
                 },
-                "library": "H5P.QuestionSet 1.20",
-                "metadata": {
-                    "contentType": "Question Set",
-                    "license": "U",
-                    "title": "True/False Quiz",
-                },
-                "subContentId": str(uuid.uuid4()),
+                "library": "H5P.DragText 1.10",
+                "metadata": {"contentType": "Drag the Words", "license": "U",
+                              "title": "Drag the Words"},
+                "subContentId": str(_uuid.uuid4()),
             }
-            new_blocks.append(_wrap_column(question_set_block))
+            new_blocks.append(_wrap(block))
+            deps_needed.add("H5P.DragText")
+            qa_items.append({
+                "label": "Drag the Words",
+                "content": sentence,
+                "expected": missing,
+                "evidence": ev,
+            })
  
-            # Add QA items for questions
-            for qi, it in enumerate(tf_items, start=1):
-                ev = it.get("evidence") or {}
-                qa_items.append({
-                    "label": f"Q{qi} True/False",
-                    "content": f"{it.get('statement', '')} (answer: {it.get('correctAnswer')})",
-                    "expected": str(it.get("correctAnswer", "")),
-                    "evidence": ev,
-                })
+        elif atype == "multichoice":
+            question = (data.get("question") or "").strip()
+            options = data.get("options") or []
+            correct_idx = int(data.get("correctIndex", 0) or 0)
+            if not question or len(options) < 2:
+                continue
+            correct_idx = max(0, min(correct_idx, len(options) - 1))
+            answers = [{"text": f"<div>{opt}</div>", "correct": (j == correct_idx),
+                        "tpiEnabled": True, "selectedFeedback": "<div>&nbsp;</div>",
+                        "unselectedFeedback": "<div>&nbsp;</div>"}
+                       for j, opt in enumerate(options)]
+            block = {
+                "params": {
+                    "question": f"<p>{question}</p>",
+                    "answers": answers,
+                    "overallFeedback": [{"from": 0, "to": 100}],
+                    "behaviour": {
+                        "enableRetry": True, "enableSolutionsButton": True,
+                        "enableCheckButton": True, "type": "auto",
+                        "singlePoint": True, "randomAnswers": True,
+                        "showSolutionsRequiresInput": True, "confirmCheckDialog": False,
+                        "confirmRetryDialog": False, "autoCheck": False,
+                    },
+                    "UI": {
+                        "checkAnswerButton": "Check",
+                        "submitAnswerButton": "Submit",
+                        "showSolutionButton": "Show solution",
+                        "tryAgainButton": "Retry",
+                        "tipsLabel": "Show tip",
+                        "scoreBarLabel": "You got :num out of :total points",
+                    },
+                    "confirmCheck": {"header": "Finish ?", "body": "Are you sure you wish to finish ?",
+                                     "cancelLabel": "Cancel", "confirmLabel": "Finish"},
+                    "confirmRetry": {"header": "Retry ?", "body": "Are you sure you wish to retry ?",
+                                     "cancelLabel": "Cancel", "confirmLabel": "Confirm"},
+                },
+                "library": "H5P.MultiChoice 1.16",
+                "metadata": {"contentType": "Multiple Choice", "license": "U",
+                              "title": "Multiple Choice"},
+                "subContentId": str(_uuid.uuid4()),
+            }
+            new_blocks.append(_wrap(block))
+            deps_needed.add("H5P.MultiChoice")
+            qa_items.append({
+                "label": "Multiple Choice",
+                "content": question,
+                "expected": options[correct_idx] if options else "",
+                "evidence": ev,
+            })
  
     if not new_blocks:
         raise ValueError("No Page content was generated.")
+ 
+    # ── Ensure h5p.json has required dependencies ───────────────────────
+    _dep_map = {
+        "H5P.TrueFalse": {"machineName": "H5P.TrueFalse", "majorVersion": 1, "minorVersion": 8},
+        "H5P.DragText": {"machineName": "H5P.DragText", "majorVersion": 1, "minorVersion": 10},
+        "H5P.MultiChoice": {"machineName": "H5P.MultiChoice", "majorVersion": 1, "minorVersion": 16},
+    }
+    h5p_path = os.path.join(work_dir, "h5p.json")
+    h5p_meta = json.loads(open(h5p_path, "r", encoding="utf-8").read())
+    existing_deps = h5p_meta.get("preloadedDependencies") or []
+    existing_names = {d.get("machineName") for d in existing_deps}
+    for dep_name in deps_needed:
+        if dep_name not in existing_names and dep_name in _dep_map:
+            existing_deps.append(_dep_map[dep_name])
+    h5p_meta["preloadedDependencies"] = existing_deps
+    with open(h5p_path, "w", encoding="utf-8") as f:
+        json.dump(h5p_meta, f, ensure_ascii=False, indent=2)
  
     lib_list[:] = new_blocks
     _save_json(work_dir, "content/content.json", content)
@@ -5095,7 +5123,7 @@ if st.session_state["suggestions"]:
     st.markdown("---")
     st.markdown("### Choose one suggested type")
 
-    other_label = "Other (choose from templates)"
+    other_label = "Other (choose from all types)"
 
     # Make a compact radio list with template availability (plus an "Other" option)
     options: List[str] = []
@@ -5368,8 +5396,15 @@ if st.session_state["suggestions"]:
         ib_n_questions = 0
 
         # ── ESSAY: always 1 question, no number input needed ──
+        # ── ESSAY: always 1 question, no number input needed ──
         if chosen["type"] == "Essay":
             n_items = 1
+            st.info("Essay generates a single question/instruction for the learner to respond to. All content is taken directly from the uploaded PDF(s).")
+
+        # ── PAGE: fixed layout, no number input needed ──
+        elif chosen["type"] == "Page":
+            n_items = 3
+            st.info("Page generates content sections with images and a short True/False quiz from the uploaded PDF(s).")
             st.info("Essay generates a single question/instruction for the learner to respond to. All content is taken directly from the uploaded PDF(s).")
 
         # Enforce question limits for selected types
@@ -5530,16 +5565,44 @@ if st.session_state["suggestions"]:
                     work_dir = os.path.join(tmp, "_work_page")
                     unzip_h5p(templates["Page"], work_dir)
  
-                    # Step 1: Generate content sections
-                    _gen_bar.progress(30, text="Generating page content from PDFs...")
-                    gen_data = call_llm_page_content(chunks, n_sections=min(6, max(3, run_n // 2)), course=enriched_course)
+                    # Step 1: Generate content sections (3-4 sections)
+                    _gen_bar.progress(25, text="Generating page content from PDFs...")
+                    gen_data = call_llm_page_content(chunks, n_sections=4, course=enriched_course)
  
-                    # Step 2: Generate True/False questions for the QuestionSet
-                    _gen_bar.progress(50, text="Generating True/False questions...")
-                    tf_data = call_llm_truefalse_statements(chunks, min(run_n, 8), enriched_course)
+                    # Step 2: Generate 1 True/False question
+                    _gen_bar.progress(40, text="Generating True/False question...")
+                    tf_data = call_llm_truefalse_statements(chunks, 1, enriched_course)
  
-                    _gen_bar.progress(65, text="AI content generated — building template...")
+                    # Step 3: Generate 1 Drag the Words question
+                    _gen_bar.progress(50, text="Generating Drag the Words question...")
+                    dw_data = call_llm_drag_words(chunks, 1, enriched_course)
+ 
+                    # Step 4: Generate 1 Multiple Choice question
+                    _gen_bar.progress(60, text="Generating Multiple Choice question...")
+                    mc_data = call_llm_multichoice_questions(chunks, 1, enriched_course)
+ 
+                    _gen_bar.progress(70, text="AI content generated — building template...")
                     title = gen_data.get("title", f"Page - {course_name.strip()}")
+ 
+                    # Build the activities list
+                    page_activities = []
+ 
+                    # True/False
+                    for it in (tf_data.get("items") or [])[:1]:
+                        page_activities.append({
+                            "type": "truefalse",
+                            "data": it,
+                            "evidence": it.get("evidence") or {},
+                        })
+ 
+                    # Multiple Choice
+                    for it in (mc_data.get("items") or [])[:1]:
+                        page_activities.append({
+                            "type": "multichoice",
+                            "data": it,
+                            "evidence": it.get("evidence") or {},
+                        })
+ 
                     qa_items = update_page_template_with_images(
                         work_dir,
                         title,
@@ -5547,7 +5610,7 @@ if st.session_state["suggestions"]:
                         course=course_name.strip(),
                         pdf_headings=st.session_state.get("pdf_headings_cache") or [],
                         pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
-                        tf_items=tf_data.get("items", []),
+                        activities=page_activities,
                     )
  
                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
