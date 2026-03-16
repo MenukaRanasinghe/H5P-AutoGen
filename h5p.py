@@ -3502,7 +3502,7 @@ The incorrect statements must sound plausible but be factually wrong based on th
 Return JSON:
 {{
   "title":"string",
-  "description":"string — a short, specific task instruction that mentions the actual topic from the SOURCE. Do NOT use generic placeholder text like 'Choose the correct statement'. Instead write something like 'Select the correct statement about [topic from SOURCE]'.",
+   "introduction":"string — a 2-4 sentence introduction paragraph that tells the learner what this activity covers. It MUST reference the specific topics and concepts from the SOURCE text. For example: 'This activity covers the key concepts from [specific topic]. Read each set of statements and select the one that is correct based on what you have studied about [specific details from SOURCE].' Do NOT use generic filler text. The introduction must be directly relevant to the SOURCE content.",
   "overall_feedback":[
     {{"from":0,"to":40,"feedback":"string — specific encouraging feedback for low scores mentioning the topic"}},
     {{"from":41,"to":80,"feedback":"string — specific feedback for mid scores"}},
@@ -3524,7 +3524,7 @@ Rules:
 3. Incorrect statements should be related to the same topic but contain a wrong detail (e.g. swapped term, wrong number, reversed cause/effect).
 4. Spread groups across different parts of the SOURCE — do not cluster from one section.
 5. Each statement should be a complete, clear sentence.
-6. The "description" MUST be written specifically for this content — mention the actual topic/subject from the SOURCE. Never use a generic template phrase.
+6. The "introduction" MUST be a 1 sentence paragraph written specifically about the content from SOURCE. It must mention specific topics, concepts, or learning areas from the SOURCE. Never reuse template default text.
 7. The "overall_feedback" entries MUST reference the actual topic. Do NOT use generic phrases like "Keep trying" or "Well done".
  
 SOURCE:
@@ -3533,50 +3533,44 @@ SOURCE:
     return call_openai_chat_json(system, user)
  
  
-def update_summary_template(work_dir: str, title: str, description: str, groups: List[Dict[str, Any]], overall_feedback: Optional[List[Dict[str, Any]]] = None) -> None:
+def update_summary_template(work_dir: str, title: str, groups: List[Dict[str, Any]], overall_feedback: Optional[List[Dict[str, Any]]] = None, introduction: Optional[str] = None) -> None:
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
- 
-    # ── Force-set description/taskDescription at ALL levels ──────────────
-    desc_text = (description or "").strip()
-    if desc_text:
-        desc_html = desc_text if desc_text.startswith("<") else f"<p>{desc_text}</p>"
-        # Force top-level taskDescription (what H5P actually renders)
-        content["taskDescription"] = desc_html
-        # Also update any nested description/introduction fields
-        update_activity_description_fields(content, desc_text)
- 
+
+    # ── Force-set introduction text ("intro" is the key H5P Summary uses) ──
+    intro_text = (introduction or "").strip()
+    if intro_text:
+        intro_html = intro_text if intro_text.startswith("<") else f"<p>{intro_text}</p>"
+        content["intro"] = intro_html
+
     # ── Force-set overall feedback ──────────────────────────────────────
     if overall_feedback:
         content["overallFeedback"] = overall_feedback
-        # Also try to set it in any nested location
         deep_find_set_all(content, ["overallFeedback"], overall_feedback)
- 
+
     # H5P Summary expects each group's "summary" to be a list of strings.
     # The FIRST string is the correct answer; the rest are incorrect options.
     summary_objs = []
     for grp in groups:
         correct = (grp.get("correct_statement") or "").strip()
         incorrects = grp.get("incorrect_statements") or []
-        # Ensure we have strings
         incorrects = [(s or "").strip() for s in incorrects if (s or "").strip()]
         if not correct:
             continue
-        # Build the statement list: correct first, then incorrects
         statements = [correct] + incorrects
         summary_objs.append({
             "subContentId": random_subcontent_id(),
             "tip": (grp.get("tip") or "").strip(),
             "summary": statements,
         })
- 
+
     if not summary_objs:
         raise ValueError("No valid summary groups were generated.")
- 
+
     if not deep_find_set_first(content, ["summaries", "summary", "items"], summary_objs):
         found = deep_find_first_key(content, ["summaries", "summary", "items"])
         raise KeyError(f"Template missing summaries/items field. Nearest match: {found}")
- 
+
     _save_json(work_dir, "content/content.json", content)
 
 def _cornell_mime(url: str) -> str:
@@ -4779,9 +4773,9 @@ if st.session_state["suggestions"]:
                     update_summary_template(
                         work_dir,
                         gen_data["title"],
-                        gen_data["description"],
                         gen_data.get("groups", []),
                         overall_feedback=gen_data.get("overall_feedback"),
+                        introduction=gen_data.get("introduction"),  # <-- NEW: pass introduction
                     )
                     title = gen_data["title"]
  
