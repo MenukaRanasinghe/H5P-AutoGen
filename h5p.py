@@ -1089,7 +1089,10 @@ Rules (STRICT — violations cause rejection):
 - The card must be directly supported by the QUOTE.
 - evidence.quote must be copied character-for-character from SOURCE — do NOT paraphrase or summarise.
 - Double-check: after writing each card, verify that BACK is a contiguous substring of evidence.quote.
-- image_query must be 2–6 words describing the professional TOPIC/CONCEPT of the card (e.g. "workplace safety equipment", "first aid training", "health hygiene standards"). Use specific domain terminology from the PDF, NOT generic terms like "child care" or "education". No brands, no logos, no text overlays, no people's names.
+- image_query must be 3–7 words describing a SPECIFIC, CONCRETE, PHOTOGRAPHABLE object or scene related to the card topic. Include physical details like setting, material, or action.
+  GOOD examples: "nurse checking patient blood pressure", "fire extinguisher mounted on office wall", "employee washing hands at sink", "laptop displaying spreadsheet on desk", "hard hat and safety goggles on workbench"
+  BAD examples: "workplace safety" (too abstract), "health and hygiene" (too vague), "training" (not visual), "education" (generic)
+  Each card's image_query MUST describe a DIFFERENT physical object/scene from every other card. No brands, no logos, no text overlays, no people's names.
 
 SOURCE:
 {src_txt}
@@ -1360,10 +1363,15 @@ def update_dialog_cards_template(
         if not front or not back:
             continue
 
-        context_for_img = f"{front} {back} {quote}".strip()
+        # Use answer + quote for image context (NOT the question — it contains
+        # "What is...", "How does..." etc. which pollute image searches)
+        context_for_img = f"{back} {quote}".strip()
         queries = build_image_queries(course=course, pdf_headings=pdf_headings, pdf_keywords=pdf_keywords, context_text=context_for_img, llm_image_query=img_q)
+        # Put the LLM's specific image query first (most targeted)
+        if img_q and img_q not in queries:
+            queries.insert(0, img_q)
         fallback = build_fallback_query(course, pdf_headings)
-        dl = ensure_image(images_dir, queries=queries, stem=f"dialog_{i}", fallback_query=fallback, prefer_vectors=True)
+        dl = ensure_image(images_dir, queries=queries, stem=f"dialog_{i}", fallback_query=fallback, prefer_vectors=False)
 
         card_obj = copy.deepcopy(sample_card) if sample_card else {}
         card_obj[front_key] = front
@@ -5149,6 +5157,441 @@ def update_game_map_template(work_dir, title, stages, bg_image_bytes, bg_image_n
  
     return qa_items
 
+def call_llm_find_multiple_hotspots(chunks, n_items, course):
+    """Generate a Find Multiple Hotspots activity from PDF content.
+ 
+    Produces a categorisation question + grid of items (some correct, some
+    incorrect). Each item gets an image_query for visual representation.
+ 
+    Args:
+        chunks:  ContentChunk list from PDF extraction.
+        n_items: Total number of items in the grid (6-9).
+        course:  Enriched course context string.
+ 
+    Returns:
+        Dict with title, questionTitle, hotspotName, items[].
+    """
+    system = (
+        "You are a strict content extractor for H5P Find Multiple Hotspots activities. "
+        "You ONLY use facts from the SOURCE text. Return JSON only."
+    )
+    src_txt = join_chunks_for_prompt(chunks, max_chars=65000)
+ 
+    n_items = max(6, min(9, int(n_items)))
+    n_correct = max(2, n_items // 3)
+ 
+    user = f"""
+Create a "Find Multiple Hotspots" activity for course: {course}
+ 
+This activity shows a grid of labelled images/cards. The learner must click
+ALL items that match a specific category or criterion. Some items are correct
+(match), others are incorrect (distractors).
+ 
+Return JSON:
+{{
+  "title": "string — descriptive activity title",
+  "questionTitle": "string — the question shown to the learner, e.g. 'Find all items related to workplace safety'",
+  "hotspotName": "string — short name for what the correct items are, e.g. 'safety equipment'",
+  "items": [
+    {{
+      "label": "string — short 1-4 word label for the item card",
+      "correct": true,
+      "feedbackText": "string — feedback when clicked (explain WHY correct or incorrect)",
+      "image_query": "string — 3-7 words describing a SPECIFIC CONCRETE photographable object. Include physical details like material, colour, setting.",
+      "evidence": {{"source_file":"string","locator":"PDF p.X/Y","quote":"exact quote from SOURCE"}}
+    }}
+  ]
+}}
+ 
+STRICT RULES:
+1. EXACTLY {n_items} items total.
+2. EXACTLY {n_correct} items with "correct": true, and {n_items - n_correct} with "correct": false.
+3. questionTitle must clearly state what the learner needs to find.
+4. Each item label: SHORT (1-4 words).
+5. feedbackText for CORRECT items: congratulatory + brief explanation from SOURCE.
+6. feedbackText for INCORRECT items: explain why it doesn't match, using SOURCE facts.
+7. image_query: SPECIFIC physical objects, NOT abstract concepts.
+   GOOD: "red fire extinguisher wall mounted", "yellow hard hat construction site"
+   BAD: "safety", "compliance", "training"
+8. Each image_query must describe a DIFFERENT physical object.
+9. All content grounded in SOURCE text.
+10. Mix correct and incorrect items in the list — do NOT group all correct ones together.
+11. The question must test meaningful knowledge from the SOURCE.
+ 
+SOURCE:
+{src_txt}
+""".strip()
+    return call_openai_chat_json(system, user)
+ 
+ 
+# ── Card color palette for text fallbacks ───────────────────────────────
+_HOTSPOT_CARD_COLORS = [
+    (66, 133, 244),   # Blue
+    (234, 67, 53),    # Red
+    (251, 188, 4),    # Yellow
+    (52, 168, 83),    # Green
+    (171, 71, 188),   # Purple
+    (255, 112, 67),   # Deep Orange
+    (0, 172, 193),    # Cyan
+    (124, 179, 66),   # Light Green
+    (255, 167, 38),   # Orange
+]
+ 
+ 
+def _hotspot_get_font(size=28):
+    """Load a clean sans-serif font for text cards."""
+    from PIL import ImageFont
+    paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ]
+    for fp in paths:
+        if os.path.isfile(fp):
+            try:
+                return ImageFont.truetype(fp, size)
+            except Exception:
+                continue
+    from PIL import ImageFont
+    return ImageFont.load_default()
+ 
+ 
+def _create_text_card_image(label, color, cell_w, cell_h):
+    """Create a single coloured text card (fallback when image download fails)."""
+    from PIL import Image, ImageDraw
+    import textwrap
+ 
+    card = Image.new("RGB", (cell_w, cell_h), (255, 255, 255))
+    draw = ImageDraw.Draw(card)
+ 
+    margin = 8
+    r, g, b = color
+    draw.rectangle([margin, margin, cell_w - margin, cell_h - margin], fill=color)
+    border_color = (max(0, r - 40), max(0, g - 40), max(0, b - 40))
+    draw.rectangle(
+        [margin, margin, cell_w - margin, cell_h - margin],
+        outline=border_color, width=3,
+    )
+ 
+    font = _hotspot_get_font(min(30, cell_h // 6))
+    lines = textwrap.wrap(label, width=max(8, cell_w // 20))
+    if not lines:
+        lines = [label[:20]]
+ 
+    line_heights = []
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        line_heights.append(bbox[3] - bbox[1])
+ 
+    total_h = sum(line_heights) + (len(lines) - 1) * 8
+    y_start = (cell_h - total_h) // 2
+ 
+    for li, line in enumerate(lines):
+        bbox = draw.textbbox((0, 0), line, font=font)
+        tw = bbox[2] - bbox[0]
+        x = (cell_w - tw) // 2
+        y = y_start + sum(line_heights[:li]) + li * 8
+        draw.text((x + 1, y + 1), line, fill=(0, 0, 0, 128), font=font)
+        draw.text((x, y), line, fill=(255, 255, 255), font=font)
+ 
+    return card
+ 
+ 
+def _create_hotspot_grid_image(
+    items,
+    images_dir,
+    course="",
+    pdf_headings=None,
+    pdf_keywords=None,
+    canvas_w=1200,
+    canvas_h=800,
+):
+    """Create a 3-column grid background image for Find Multiple Hotspots.
+ 
+    For each item, attempts to download a real image via Freepik / Wikimedia /
+    AI generation. If the download fails, a coloured text card is used instead.
+ 
+    Args:
+        items:        List of item dicts with 'label', 'image_query'.
+        images_dir:   Directory to save temporary downloaded images.
+        course:       Course name for image search.
+        pdf_headings: PDF headings for image search.
+        pdf_keywords: PDF keywords for image search.
+        canvas_w:     Output image width  (px).
+        canvas_h:     Output image height (px).
+ 
+    Returns:
+        (png_bytes, cell_positions)
+        png_bytes:      PNG image bytes.
+        cell_positions: List of dicts {x, y, width, height} as percentages.
+    """
+    from PIL import Image
+    import io as _io
+ 
+    pdf_headings = pdf_headings or []
+    pdf_keywords = pdf_keywords or []
+ 
+    n = len(items)
+    if n <= 0:
+        raise ValueError("No items for hotspot grid.")
+ 
+    if n <= 4:
+        cols, rows = 2, 2
+    elif n <= 6:
+        cols, rows = 3, 2
+    else:
+        cols, rows = 3, 3
+ 
+    padding = 16
+    cell_w = (canvas_w - padding * (cols + 1)) // cols
+    cell_h = (canvas_h - padding * (rows + 1)) // rows
+ 
+    canvas = Image.new("RGB", (canvas_w, canvas_h), (248, 249, 250))
+    cell_positions = []
+ 
+    for idx, item in enumerate(items):
+        if idx >= cols * rows:
+            break
+ 
+        row = idx // cols
+        col = idx % cols
+        cx = padding + col * (cell_w + padding)
+        cy = padding + row * (cell_h + padding)
+ 
+        label = (item.get("label") or f"Item {idx + 1}").strip()
+        img_query = (item.get("image_query") or "").strip()
+ 
+        cell_img = None
+ 
+        # ── Try to download a real image ────────────────────────────────
+        if img_query:
+            queries = build_image_queries(
+                course=course,
+                pdf_headings=pdf_headings,
+                pdf_keywords=pdf_keywords,
+                context_text=label,
+                llm_image_query=img_query,
+            )
+            if img_query not in queries:
+                queries.insert(0, img_query)
+ 
+            dl = download_image_to_h5p_multi(
+                images_dir,
+                queries=queries[:5],
+                stem=f"hotspot_item_{idx}",
+                prefer_vectors=False,
+            )
+ 
+            if dl:
+                img_path = os.path.join(
+                    images_dir, os.path.basename(dl["path"])
+                )
+                if os.path.isfile(img_path):
+                    try:
+                        from PIL import ImageDraw as _IDraw
+ 
+                        pil_img = Image.open(img_path).convert("RGB")
+ 
+                        label_h = 44
+                        target_w = cell_w - 16
+                        target_h = cell_h - label_h - 16
+ 
+                        pil_img.thumbnail((target_w, target_h), Image.LANCZOS)
+ 
+                        cell_canvas = Image.new(
+                            "RGB", (cell_w, cell_h), (255, 255, 255)
+                        )
+                        ix = (cell_w - pil_img.width) // 2
+                        iy = max(6, (cell_h - label_h - pil_img.height) // 2)
+                        cell_canvas.paste(pil_img, (ix, iy))
+ 
+                        draw = _IDraw.Draw(cell_canvas)
+                        font = _hotspot_get_font(min(22, cell_h // 8))
+                        bbox = draw.textbbox((0, 0), label, font=font)
+                        tw = bbox[2] - bbox[0]
+                        tx = (cell_w - tw) // 2
+                        ty = cell_h - label_h + 6
+                        draw.text((tx, ty), label, fill=(50, 50, 50), font=font)
+                        draw.rectangle(
+                            [0, 0, cell_w - 1, cell_h - 1],
+                            outline=(220, 220, 220), width=2,
+                        )
+ 
+                        cell_img = cell_canvas
+                    except Exception:
+                        pass  # fall through to text card
+ 
+        # ── Fallback: coloured text card ────────────────────────────────
+        if cell_img is None:
+            color = _HOTSPOT_CARD_COLORS[idx % len(_HOTSPOT_CARD_COLORS)]
+            cell_img = _create_text_card_image(label, color, cell_w, cell_h)
+ 
+        canvas.paste(cell_img, (cx, cy))
+ 
+        cell_positions.append({
+            "x": round(cx / canvas_w * 100, 4),
+            "y": round(cy / canvas_h * 100, 4),
+            "width": round(cell_w / canvas_w * 100, 4),
+            "height": round(cell_h / canvas_h * 100, 4),
+        })
+ 
+    buf = _io.BytesIO()
+    canvas.save(buf, format="PNG", quality=95)
+    return buf.getvalue(), cell_positions
+ 
+ 
+def update_find_multiple_hotspots_template(
+    work_dir,
+    title,
+    question_title,
+    hotspot_name,
+    items,
+    course="",
+    pdf_headings=None,
+    pdf_keywords=None,
+):
+    """Populate a Find Multiple Hotspots H5P template.
+ 
+    1. Generates a grid background image (real images or text card fallbacks).
+    2. Places rectangular hotspot zones on each grid cell.
+    3. Writes content.json with hotspot definitions.
+ 
+    Args:
+        work_dir:       Extracted H5P template directory.
+        title:          Activity title (h5p.json).
+        question_title: Question shown to the learner.
+        hotspot_name:   Short name for the correct category.
+        items:          List of item dicts (label, correct, feedbackText, image_query, evidence).
+        course:         Course name for image search.
+        pdf_headings:   PDF headings for image search.
+        pdf_keywords:   PDF keywords for image search.
+ 
+    Returns:
+        qa_items list for QA evidence report.
+    """
+    import io as _io
+ 
+    pdf_headings = pdf_headings or []
+    pdf_keywords = pdf_keywords or []
+ 
+    update_h5p_title(work_dir, title)
+ 
+    # ── Clean old images ────────────────────────────────────────────────
+    images_dir = os.path.join(work_dir, "content", "images")
+    if os.path.isdir(images_dir):
+        shutil.rmtree(images_dir)
+    os.makedirs(images_dir, exist_ok=True)
+ 
+    # ── Create grid background image ────────────────────────────────────
+    grid_bytes, cell_positions = _create_hotspot_grid_image(
+        items=items,
+        images_dir=images_dir,
+        course=course,
+        pdf_headings=pdf_headings,
+        pdf_keywords=pdf_keywords,
+        canvas_w=1200,
+        canvas_h=800,
+    )
+ 
+    bg_fname = "backgroundImage.png"
+    bg_path = os.path.join(images_dir, bg_fname)
+    with open(bg_path, "wb") as f:
+        f.write(grid_bytes)
+ 
+    bg_w, bg_h = 1200, 800
+    try:
+        from PIL import Image as _PILImage
+        pil = _PILImage.open(_io.BytesIO(grid_bytes))
+        bg_w, bg_h = pil.size
+    except Exception:
+        pass
+ 
+    # ── Build hotspot definitions ───────────────────────────────────────
+    hotspots = []
+    qa_items = []
+ 
+    for idx, item in enumerate(items):
+        if idx >= len(cell_positions):
+            break
+ 
+        pos = cell_positions[idx]
+        label = (item.get("label") or f"Item {idx + 1}").strip()
+        correct = bool(item.get("correct", False))
+        feedback = (item.get("feedbackText") or "").strip()
+        ev = item.get("evidence") or {}
+ 
+        if not feedback:
+            if correct:
+                feedback = f"Correct! '{label}' is a {hotspot_name}."
+            else:
+                feedback = f"Not quite — '{label}' is not a {hotspot_name}."
+ 
+        hotspots.append({
+            "userSettings": {
+                "correct": correct,
+                "feedbackText": feedback,
+            },
+            "computedSettings": {
+                "x": pos["x"],
+                "y": pos["y"],
+                "width": pos["width"],
+                "height": pos["height"],
+                "figure": "rectangle",
+            },
+        })
+ 
+        status = "CORRECT" if correct else "INCORRECT"
+        qa_items.append({
+            "label": f"Item {idx + 1}: {label} ({status})",
+            "content": f"Label: {label}\nCorrect: {correct}\nFeedback: {feedback}",
+            "expected": str(correct),
+            "evidence": ev,
+        })
+ 
+    # ── Write content.json ──────────────────────────────────────────────
+    content = {
+        "imageMultipleHotspotQuestion": {
+            "backgroundImageSettings": {
+                "questionTitle": question_title,
+                "backgroundImage": {
+                    "path": f"images/{bg_fname}",
+                    "mime": "image/png",
+                    "copyright": {"license": "U"},
+                    "width": bg_w,
+                    "height": bg_h,
+                },
+            },
+            "hotspotSettings": {
+                "hotspot": hotspots,
+                "taskDescription": question_title,
+                "hotspotName": hotspot_name,
+                "noneSelectedFeedback": (
+                    "You didn't select anything! Try clicking on the items."
+                ),
+                "alreadySelectedFeedback": "You have already found this one!",
+            },
+        }
+    }
+ 
+    _save_json(work_dir, "content/content.json", content)
+ 
+    # ── Summary QA entry ────────────────────────────────────────────────
+    n_correct = sum(1 for it in items if it.get("correct"))
+    n_incorrect = len(items) - n_correct
+    qa_items.insert(0, {
+        "label": "Activity Overview",
+        "content": (
+            f"Question: {question_title}\n"
+            f"Total items: {len(items)} ({n_correct} correct, "
+            f"{n_incorrect} distractors)\n"
+            f"Hotspot name: {hotspot_name}"
+        ),
+        "expected": "",
+        "evidence": {},
+    })
+ 
+    return qa_items
+
 def update_summary_template(work_dir: str, title: str, groups: List[Dict[str, Any]], overall_feedback: Optional[List[Dict[str, Any]]] = None, introduction: Optional[str] = None) -> None:
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
@@ -6189,6 +6632,28 @@ if st.session_state["suggestions"]:
         ib_activity_types = []
         ib_n_questions = 0  
 
+    elif chosen["type"] == "Find Multiple Hotspots":
+         n_items = st.number_input(
+             "Number of items in the grid",
+             min_value=6,
+             max_value=9,
+             value=9,
+             step=1,
+             help="Total items shown in a 3×3 grid (6 = 3×2, 9 = 3×3). "
+                  "About 1/3 will be correct answers.",
+         )
+         n_correct = max(2, n_items // 3)
+         st.caption(
+             f"Will generate a **{3 if n_items > 6 else 3}×{(n_items + 2) // 3}** grid "
+             f"with **{n_correct} correct** and **{n_items - n_correct} distractor** items."
+         )
+         cp_n_slides = None
+         cp_activity_types = []
+         cp_n_questions = 0
+         ib_n_pages = None
+         ib_activity_types = []
+         ib_n_questions = 0    
+
     elif chosen["type"] == "Game Map":
          st.markdown("#### Game Map — Background Image")
          st.info(
@@ -6688,7 +7153,45 @@ if st.session_state["suggestions"]:
                      zip_dir_to_file(work_dir, out_h5p)
 
                      out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                     write_qa_report_html(out_qa, title, typ, qa_items)         
+                     write_qa_report_html(out_qa, title, typ, qa_items)  
+
+                elif typ == "Find Multiple Hotspots":
+                    work_dir = os.path.join(tmp, "_work_find_hotspots")
+                    unzip_h5p(templates["Find Multiple Hotspots"], work_dir)
+ 
+                    _gen_bar.progress(30, text="Generating hotspot items from PDFs...")
+                    gen_data = call_llm_find_multiple_hotspots(
+                        chunks, run_n, enriched_course
+                    )
+ 
+                    _gen_bar.progress(50, text="Creating grid image with downloaded images...")
+                    title = gen_data.get(
+                        "title",
+                        f"Find Multiple Hotspots - {course_name.strip()}",
+                    )
+                    question_title = gen_data.get(
+                        "questionTitle", "Find all the correct items"
+                    )
+                    hotspot_name = gen_data.get("hotspotName", "correct items")
+ 
+                    qa_items = update_find_multiple_hotspots_template(
+                        work_dir,
+                        title=title,
+                        question_title=question_title,
+                        hotspot_name=hotspot_name,
+                        items=gen_data.get("items", []),
+                        course=course_name.strip(),
+                        pdf_headings=st.session_state.get("pdf_headings_cache") or [],
+                        pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
+                    )
+ 
+                    _gen_bar.progress(85, text="Packaging H5P file...")
+                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                    zip_dir_to_file(work_dir, out_h5p)
+ 
+                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                    write_qa_report_html(out_qa, title, typ, qa_items)            
+
 
                 elif typ == "Interactive Book":
                     work_dir = os.path.join(tmp, "_work_interactive_book")
