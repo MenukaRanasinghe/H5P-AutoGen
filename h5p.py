@@ -1,4 +1,5 @@
 import math
+import math as _math
 import os
 import re
 import json
@@ -1026,12 +1027,27 @@ def build_fallback_query(course: str, pdf_headings: List[str]) -> str:
 
 
 
-def _find_first_library_list(d: Any) -> Optional[List]:
-    """Find a list that appears to contain H5P 'library' items."""
+def _find_first_library_list(d):
+    """Find a list that appears to contain H5P 'library' items.
+ 
+    Handles TWO formats:
+    1. Direct: [{"library": "...", "params": {...}}, ...]
+    2. Column wrapper: [{"content": {"library": "...", "params": {...}}, "useSeparator": "auto"}, ...]
+    """
     if isinstance(d, dict):
         for k, v in d.items():
-            if k == "content" and isinstance(v, list) and (not v or (isinstance(v[0], dict) and "library" in v[0])):
-                return v
+            if k == "content" and isinstance(v, list):
+                if not v:
+                    return v  # empty list — still valid target
+                first = v[0]
+                if isinstance(first, dict):
+                    # Direct format: item has "library" key
+                    if "library" in first:
+                        return v
+                    # Column wrapper format: item has "content" dict with "library"
+                    inner = first.get("content")
+                    if isinstance(inner, dict) and "library" in inner:
+                        return v
             found = _find_first_library_list(v)
             if found is not None:
                 return found
@@ -1511,88 +1527,298 @@ SOURCE:
 """
     return call_openai_chat_json(system, user)
 
-
 def update_page_template_with_images(
-    work_dir: str,
-    title: str,
-    sections: List[Dict[str, Any]],
-    course: str = "",
-    pdf_headings: Optional[List[str]] = None,
-    pdf_keywords: Optional[List[str]] = None,
-) -> List[Dict[str, Any]]:
-    """Populate an H5P Page with Image + Text blocks."""
+    work_dir,
+    title,
+    sections,
+    course="",
+    pdf_headings=None,
+    pdf_keywords=None,
+    activities=None,
+):
+    """Populate an H5P Page (Column) with Text + Image + individual activity blocks.
+ 
+    Generates:
+      - Text + Image pairs per content section
+      - Individual activity blocks (TrueFalse, DragText, MultiChoice, etc.)
+        each as a standalone Column item — NOT wrapped in a QuestionSet.
+ 
+    Args:
+        work_dir:      Extracted H5P template directory.
+        title:         Activity title.
+        sections:      List of section dicts (heading, body_html, image_query, evidence).
+        course:        Course name for image search.
+        pdf_headings:  PDF headings for image search.
+        pdf_keywords:  PDF keywords for image search.
+        activities:    List of dicts, each with:
+                         {"type": "truefalse"|"dragtext"|"multichoice",
+                          "data": <question dict from LLM>,
+                          "evidence": {...}}
+    Returns:
+        qa_items list for QA evidence report.
+    """
+    import uuid as _uuid
+    import re as _re
+ 
     pdf_headings = pdf_headings or []
     pdf_keywords = pdf_keywords or []
-
-    
-
+    activities = activities or []
+ 
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
-
+ 
     lib_list = _find_first_library_list(content)
     if lib_list is None:
-        raise KeyError("Could not find Page 'content' list to populate.")
-
+        if "content" not in content or not isinstance(content["content"], list):
+            content["content"] = []
+        lib_list = content["content"]
+ 
+    # Detect Column wrapper format
+    uses_column_wrapper = False
+    if lib_list:
+        first = lib_list[0]
+        if isinstance(first, dict) and "useSeparator" in first:
+            uses_column_wrapper = True
+    else:
+        h5p_meta = _load_json(work_dir, "h5p.json")
+        if "Column" in (h5p_meta.get("mainLibrary") or ""):
+            uses_column_wrapper = True
+ 
     images_dir = os.path.join(work_dir, "content", "images")
     os.makedirs(images_dir, exist_ok=True)
-
-    new_blocks: List[Dict[str, Any]] = []
-    qa_items: List[Dict[str, Any]] = []
-
-    def h5p_image(img_rel: str, mime: str, alt: str = "", caption: str = "") -> Dict[str, Any]:
+ 
+    # Remove old template images
+    for old_img in os.listdir(images_dir):
+        old_path = os.path.join(images_dir, old_img)
+        if os.path.isfile(old_path):
+            try:
+                os.remove(old_path)
+            except Exception:
+                pass
+ 
+    new_blocks = []
+    qa_items = []
+ 
+    def _wrap(block):
+        if uses_column_wrapper:
+            return {"content": block, "useSeparator": "auto"}
+        return block
+ 
+    def _text_block(html):
         return {
-            "library": "H5P.Image 1.1",
-            "params": {
-                "title": caption,
-                "alt": alt,
-                "file": {
-                    "path": img_rel,
-                    "mime": mime,
-                    "copyright": {"license": "U"},
-                },
-            },
-            "metadata": {"title": "Image", "license": "U"},
-        }
-
-    def h5p_adv_text(html: str) -> Dict[str, Any]:
-        return {
-            "library": "H5P.AdvancedText 1.1",
             "params": {"text": html},
-            "metadata": {"title": "Text", "license": "U"},
+            "library": "H5P.AdvancedText 1.1",
+            "metadata": {"contentType": "Text", "license": "U", "title": "Untitled Text"},
+            "subContentId": str(_uuid.uuid4()),
         }
-
+ 
+    def _image_block(img_rel, mime, alt=""):
+        return {
+            "params": {
+                "decorative": False,
+                "contentName": "Image",
+                "expandImage": "Expand Image",
+                "minimizeImage": "Minimize Image",
+                "file": {"path": img_rel, "mime": mime, "copyright": {"license": "U"}},
+            },
+            "library": "H5P.Image 1.1",
+            "metadata": {"contentType": "Image", "license": "U", "title": "Untitled Image"},
+            "subContentId": str(_uuid.uuid4()),
+        }
+ 
+    # ── Content sections: text + image ──────────────────────────────────
     for i, sec in enumerate(sections, start=1):
         heading = (sec.get("heading") or "").strip()
         body = (sec.get("body_html") or "").strip()
         img_q = (sec.get("image_query") or "").strip()
         ev = sec.get("evidence") or {}
-        src_file = (ev.get("source_file") or "").strip()
-        locator = (ev.get("locator") or "").strip()
-        quote = (ev.get("quote") or "").strip()
-
+ 
         if not body:
             continue
-
-        context_for_img = f"{heading} {re.sub('<[^<]+?>','', body)}".strip()
-        queries = build_image_queries(course=course, pdf_headings=pdf_headings, pdf_keywords=pdf_keywords, context_text=context_for_img, llm_image_query=img_q)
-        fallback = build_fallback_query(course, pdf_headings)
-        dl = ensure_image(images_dir, queries=queries, stem=f"page_{i}", fallback_query=fallback)
-
-        new_blocks.append(h5p_image(dl["path"], dl["mime"], alt=heading, caption=heading))
-
+ 
         html = f"<h3>{heading}</h3>\n{body}" if heading else body
-        new_blocks.append(h5p_adv_text(html))
-
+        new_blocks.append(_wrap(_text_block(html)))
+ 
+        context_for_img = f"{heading} {_re.sub('<[^<]+?>', '', body)}".strip()
+        queries = build_image_queries(
+            course=course, pdf_headings=pdf_headings,
+            pdf_keywords=pdf_keywords, context_text=context_for_img,
+            llm_image_query=img_q,
+        )
+        fallback = build_fallback_query(course, pdf_headings)
+        dl = ensure_image(images_dir, queries=queries, stem=f"page_{i}",
+                          fallback_query=fallback)
+        new_blocks.append(_wrap(_image_block(dl["path"], dl["mime"], alt=heading)))
+ 
         qa_items.append({
             "label": f"Page section {i}",
-            "content": f"{heading}\n{re.sub('<[^<]+?>','',body)[:500]}",
+            "content": f"{heading}\n{_re.sub('<[^<]+?>', '', body)[:500]}",
             "expected": "",
-            "evidence": {"source_file": src_file, "locator": locator, "quote": quote},
+            "evidence": {"source_file": ev.get("source_file", ""),
+                         "locator": ev.get("locator", ""),
+                         "quote": ev.get("quote", "")},
         })
-
+ 
+    # ── Activity heading ────────────────────────────────────────────────
+    if activities:
+        new_blocks.append(_wrap(_text_block(
+            "<h3>Test your knowledge</h3>\n<p>Answer the questions below based on what you have read.</p>"
+        )))
+ 
+    # ── Individual activity blocks ──────────────────────────────────────
+    deps_needed = set()
+ 
+    for act in activities:
+        atype = (act.get("type") or "").strip().lower()
+        data = act.get("data") or {}
+        ev = act.get("evidence") or {}
+ 
+        if atype == "truefalse":
+            statement = (data.get("statement") or "").strip()
+            correct = data.get("correctAnswer", True)
+            if not statement:
+                continue
+            block = {
+                "params": {
+                    "media": {"disableImageZooming": False},
+                    "correct": "true" if correct else "false",
+                    "behaviour": {
+                        "enableRetry": True, "enableSolutionsButton": True,
+                        "enableCheckButton": True, "confirmCheckDialog": False,
+                        "confirmRetryDialog": False, "autoCheck": False,
+                    },
+                    "l10n": {
+                        "trueText": "True", "falseText": "False",
+                        "score": "You got @score of @total points",
+                        "checkAnswer": "Check", "showSolutionButton": "Show solution",
+                        "tryAgain": "Retry", "wrongAnswerMessage": "Wrong answer",
+                        "correctAnswerMessage": "Correct answer",
+                        "scoreBarLabel": "You got :num out of :total points",
+                    },
+                    "confirmCheck": {"header": "Finish ?", "body": "Are you sure you wish to finish ?",
+                                     "cancelLabel": "Cancel", "confirmLabel": "Finish"},
+                    "confirmRetry": {"header": "Retry ?", "body": "Are you sure you wish to retry ?",
+                                     "cancelLabel": "Cancel", "confirmLabel": "Confirm"},
+                    "question": f"<p>{statement}</p>",
+                },
+                "library": "H5P.TrueFalse 1.8",
+                "metadata": {"contentType": "True/False Question", "license": "U",
+                              "title": "True/False"},
+                "subContentId": str(_uuid.uuid4()),
+            }
+            new_blocks.append(_wrap(block))
+            deps_needed.add("H5P.TrueFalse")
+            qa_items.append({
+                "label": "True/False",
+                "content": f"{statement} (answer: {correct})",
+                "expected": str(correct),
+                "evidence": ev,
+            })
+ 
+        elif atype == "dragtext":
+            sentence = (data.get("sentence") or "").strip()
+            missing = (data.get("missing_word") or "").strip()
+            if not sentence or not missing:
+                continue
+            text = sentence
+            if f"*{missing}*" not in text:
+                text = text.replace("___", f"*{missing}*", 1)
+            if f"*{missing}*" not in text:
+                text = text.replace(missing, f"*{missing}*", 1)
+            if f"*{missing}*" not in text:
+                text += f" *{missing}*"
+            block = {
+                "params": {
+                    "textField": text,
+                    "overallFeedback": [{"from": 0, "to": 100}],
+                    "behaviour": {"enableRetry": True, "enableSolutionsButton": True,
+                                  "instantFeedback": False},
+                    "taskDescription": "<p>Drag the correct word into the blank.</p>",
+                },
+                "library": "H5P.DragText 1.10",
+                "metadata": {"contentType": "Drag the Words", "license": "U",
+                              "title": "Drag the Words"},
+                "subContentId": str(_uuid.uuid4()),
+            }
+            new_blocks.append(_wrap(block))
+            deps_needed.add("H5P.DragText")
+            qa_items.append({
+                "label": "Drag the Words",
+                "content": sentence,
+                "expected": missing,
+                "evidence": ev,
+            })
+ 
+        elif atype == "multichoice":
+            question = (data.get("question") or "").strip()
+            options = data.get("options") or []
+            correct_idx = int(data.get("correctIndex", 0) or 0)
+            if not question or len(options) < 2:
+                continue
+            correct_idx = max(0, min(correct_idx, len(options) - 1))
+            answers = [{"text": f"<div>{opt}</div>", "correct": (j == correct_idx),
+                        "tpiEnabled": True, "selectedFeedback": "<div>&nbsp;</div>",
+                        "unselectedFeedback": "<div>&nbsp;</div>"}
+                       for j, opt in enumerate(options)]
+            block = {
+                "params": {
+                    "question": f"<p>{question}</p>",
+                    "answers": answers,
+                    "overallFeedback": [{"from": 0, "to": 100}],
+                    "behaviour": {
+                        "enableRetry": True, "enableSolutionsButton": True,
+                        "enableCheckButton": True, "type": "auto",
+                        "singlePoint": True, "randomAnswers": True,
+                        "showSolutionsRequiresInput": True, "confirmCheckDialog": False,
+                        "confirmRetryDialog": False, "autoCheck": False,
+                    },
+                    "UI": {
+                        "checkAnswerButton": "Check",
+                        "submitAnswerButton": "Submit",
+                        "showSolutionButton": "Show solution",
+                        "tryAgainButton": "Retry",
+                        "tipsLabel": "Show tip",
+                        "scoreBarLabel": "You got :num out of :total points",
+                    },
+                    "confirmCheck": {"header": "Finish ?", "body": "Are you sure you wish to finish ?",
+                                     "cancelLabel": "Cancel", "confirmLabel": "Finish"},
+                    "confirmRetry": {"header": "Retry ?", "body": "Are you sure you wish to retry ?",
+                                     "cancelLabel": "Cancel", "confirmLabel": "Confirm"},
+                },
+                "library": "H5P.MultiChoice 1.16",
+                "metadata": {"contentType": "Multiple Choice", "license": "U",
+                              "title": "Multiple Choice"},
+                "subContentId": str(_uuid.uuid4()),
+            }
+            new_blocks.append(_wrap(block))
+            deps_needed.add("H5P.MultiChoice")
+            qa_items.append({
+                "label": "Multiple Choice",
+                "content": question,
+                "expected": options[correct_idx] if options else "",
+                "evidence": ev,
+            })
+ 
     if not new_blocks:
         raise ValueError("No Page content was generated.")
-
+ 
+    # ── Ensure h5p.json has required dependencies ───────────────────────
+    _dep_map = {
+        "H5P.TrueFalse": {"machineName": "H5P.TrueFalse", "majorVersion": 1, "minorVersion": 8},
+        "H5P.DragText": {"machineName": "H5P.DragText", "majorVersion": 1, "minorVersion": 10},
+        "H5P.MultiChoice": {"machineName": "H5P.MultiChoice", "majorVersion": 1, "minorVersion": 16},
+    }
+    h5p_path = os.path.join(work_dir, "h5p.json")
+    h5p_meta = json.loads(open(h5p_path, "r", encoding="utf-8").read())
+    existing_deps = h5p_meta.get("preloadedDependencies") or []
+    existing_names = {d.get("machineName") for d in existing_deps}
+    for dep_name in deps_needed:
+        if dep_name not in existing_names and dep_name in _dep_map:
+            existing_deps.append(_dep_map[dep_name])
+    h5p_meta["preloadedDependencies"] = existing_deps
+    with open(h5p_path, "w", encoding="utf-8") as f:
+        json.dump(h5p_meta, f, ensure_ascii=False, indent=2)
+ 
     lib_list[:] = new_blocks
     _save_json(work_dir, "content/content.json", content)
     return qa_items
@@ -1682,7 +1908,8 @@ Return JSON:
 
 STRICT RULES:
 1. EXACTLY {n_slides} slides — no more, no less.
-2. Each "heading" MUST be a topic or section title that appears in the SOURCE.
+2. Each "heading" MUST be a specific, descriptive topic name from the SOURCE.
+   - Do NOT use generic headings like "Introduction", "Overview", "Summary", "Conclusion", "Key Points", "Getting Started".
 3. Each bullet MUST be a factual statement directly stated in the SOURCE.
    - Use 3-5 SHORT bullets per slide (≤12 words each).
    - Pick only the most important facts; do NOT overload slides with text.
@@ -1928,6 +2155,48 @@ def _html_bullets(heading: str, bullets: List[str], max_bullets: int = 4) -> str
         return f"<h2>{h}</h2><ul>{li}</ul>"
     return f"<ul>{li}</ul>"
 
+def _set_presentation_description_safe(content: dict, description: str, title: str = "", slides_data: list = None) -> None:
+    """Set Course Presentation / Interactive Book description at SAFE locations only.
+ 
+    CRITICAL: Ignores the LLM-generated description (which is often hallucinated).
+    Instead, builds a factual description from the title + first slide heading.
+    """
+    # Build description from ACTUAL content, not LLM output
+    desc = ""
+    if slides_data:
+        first_heading = ""
+        for s in (slides_data or []):
+            h = (s.get("heading") or s.get("chapter_title") or s.get("title") or "").strip()
+            if h:
+                first_heading = h
+                break
+        if title and first_heading:
+            desc = f"<p>{title} — {first_heading}</p>"
+        elif title:
+            desc = f"<p>{title}</p>"
+ 
+    if not desc and title:
+        desc = f"<p>{title}</p>"
+ 
+    if not desc:
+        return
+ 
+    _DESC_KEYS = ["introduction", "description", "taskDescription"]
+ 
+    for key in _DESC_KEYS:
+        if key in content:
+            content[key] = desc
+            return
+ 
+    pres = content.get("presentation")
+    if isinstance(pres, dict):
+        for key in _DESC_KEYS:
+            if key in pres:
+                pres[key] = desc
+                return
+ 
+    content["introduction"] = desc
+
 
 def _build_cp_activity_slide_elements(activity_type: str, questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Build H5P element(s) for ALL activity questions on a SINGLE Course Presentation slide.
@@ -2164,7 +2433,11 @@ def update_course_presentation_template_with_images(
 
         deep_find_set_first(slide_obj, ["slideTitle", "title", "heading"], heading)
 
-        html = _html_bullets(heading, bullets)
+        # Slide 1: title-only (no bullets); other slides: heading + bullets
+        if i == 1:
+            html = f"<h2>{heading}</h2>" if heading else _html_bullets(heading, bullets)
+        else:
+            html = _html_bullets(heading, bullets)
 
         # --- Strip interactive activity elements from this content slide ---
         if "elements" in slide_obj and isinstance(slide_obj["elements"], list):
@@ -2183,11 +2456,29 @@ def update_course_presentation_template_with_images(
 
             slide_obj["elements"] = [el for el in slide_obj["elements"] if not _is_activity_element(el)]
 
-        # --- Update AdvancedText content (or create one if missing) ---
         adv_blocks = [b for b in _iter_library_blocks(slide_obj) if str(b.get("library", "")).startswith("H5P.AdvancedText")]
         if adv_blocks:
             adv_blocks[0].setdefault("params", {})
             adv_blocks[0]["params"]["text"] = html
+            # ── FIX: Remove ALL extra AdvancedText elements from this slide ──
+            # Templates may have 2+ text elements (e.g. heading + description).
+            # Keep only the first one (now updated); discard extras to prevent
+            # stale template text leaking into the generated output.
+            if "elements" in slide_obj and isinstance(slide_obj["elements"], list):
+                kept_action_id = id(adv_blocks[0])
+                cleaned = []
+                for el in slide_obj["elements"]:
+                    if not isinstance(el, dict):
+                        cleaned.append(el)
+                        continue
+                    act = el.get("action")
+                    if isinstance(act, dict) and str(act.get("library", "")).startswith("H5P.AdvancedText"):
+                        if id(act) == kept_action_id:
+                            cleaned.append(el)
+                        # else: discard extra AdvancedText
+                    else:
+                        cleaned.append(el)
+                slide_obj["elements"] = cleaned
         elif not deep_find_set_first(slide_obj, ["text", "html", "content", "questionText"], html):
             # No existing text element found — inject one so the slide is never blank
             if "elements" not in slide_obj or not isinstance(slide_obj.get("elements"), list):
@@ -2306,7 +2597,7 @@ def update_course_presentation_template_with_images(
                     "evidence": ev,
                 })
 
-    deep_find_set_first(content, ["introduction", "description", "taskDescription"], description)
+    _set_presentation_description_safe(content, description, title=title, slides_data=slides)
     _save_json(work_dir, "content/content.json", content)
     return qa_items
 
@@ -2320,43 +2611,147 @@ def update_interactive_book_template_with_images(
     pdf_keywords: Optional[List[str]] = None,
     activity_groups: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> List[Dict[str, Any]]:
-    """Populate an Interactive Book template while preserving its structure."""
+    """Populate an Interactive Book template while preserving its structure.
+ 
+    FIXED: cover description, cover image, and template activity stripping.
+    """
     pdf_headings = pdf_headings or []
     pdf_keywords = pdf_keywords or []
     activity_groups = activity_groups or {}
-
+ 
+    # Activity library prefixes to strip from content chapters
+    _ACTIVITY_LIBS = (
+        "H5P.DragText", "H5P.Blanks", "H5P.TrueFalse", "H5P.MarkTheWords",
+        "H5P.MultiChoice", "H5P.SingleChoiceSet",
+    )
+ 
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
-
+ 
     chapters_ref = _best_list_by_score(content, _score_chapters_list)
     if chapters_ref is None:
         raise KeyError(
             "Could not locate a 'chapters' list in the Interactive Book template. "
             "Export a blank Interactive Book with at least 1 chapter and re-add it to ./templates."
         )
-
+ 
     sample_chapter = chapters_ref[0] if chapters_ref and isinstance(chapters_ref[0], dict) else None
-
+ 
     images_dir = os.path.join(work_dir, "content", "images")
     os.makedirs(images_dir, exist_ok=True)
-
+ 
     qa_items: List[Dict[str, Any]] = []
-
+ 
     has_activity = bool(activity_groups and any(activity_groups.values()))
     target_chapters = max(1, len(chapters)) + (1 if has_activity else 0)
     while len(chapters_ref) < target_chapters:
         chapters_ref.append(copy.deepcopy(sample_chapter) if sample_chapter else {})
     while len(chapters_ref) > target_chapters:
         chapters_ref.pop()
-
+ 
+    # ══════════════════════════════════════════════════════════════════════
+    # FIX 1: Update bookCover.coverDescription with generated description
+    # ══════════════════════════════════════════════════════════════════════
+    book_cover = content.get("bookCover")
+    if isinstance(book_cover, dict):
+        # Build a meaningful cover description from the generated content
+        cover_desc = ""
+        if description and description.strip():
+            cover_desc = description.strip()
+        elif title:
+            # Fallback: build from title + first chapter heading
+            first_ch_title = ""
+            for ch in chapters:
+                t = (ch.get("chapter_title") or ch.get("title") or "").strip()
+                if t:
+                    first_ch_title = t
+                    break
+            if first_ch_title:
+                cover_desc = f"{title} — {first_ch_title}"
+            else:
+                cover_desc = title
+ 
+        if cover_desc:
+            if not cover_desc.strip().startswith("<"):
+                cover_desc = f"<p>{cover_desc}</p>"
+            book_cover["coverDescription"] = cover_desc
+ 
+    # ══════════════════════════════════════════════════════════════════════
+    # FIX 2: Replace bookCover.coverMedium image with a relevant one
+    #         (previously searched for "coverImage"/"image"/"backgroundImage"
+    #          but template uses "coverMedium")
+    # ══════════════════════════════════════════════════════════════════════
+    if isinstance(book_cover, dict):
+        # Build an image query from the title and first chapter content
+        cover_img_context = title or ""
+        for ch in chapters[:2]:
+            ch_title = (ch.get("chapter_title") or ch.get("title") or "").strip()
+            if ch_title:
+                cover_img_context += " " + ch_title
+            for sec in (ch.get("sections") or [])[:1]:
+                h = (sec.get("heading") or "").strip()
+                if h:
+                    cover_img_context += " " + h
+ 
+        cover_queries = build_image_queries(
+            course=course, pdf_headings=pdf_headings, pdf_keywords=pdf_keywords,
+            context_text=cover_img_context.strip(), llm_image_query="",
+        )
+        cover_fallback = build_fallback_query(course, pdf_headings)
+        cover_dl = ensure_image(
+            images_dir, queries=cover_queries, stem="ib_cover",
+            fallback_query=cover_fallback,
+        )
+ 
+        cover_medium = book_cover.get("coverMedium")
+        if isinstance(cover_medium, dict):
+            # Update the existing coverMedium image
+            cm_params = cover_medium.get("params")
+            if isinstance(cm_params, dict):
+                file_obj = cm_params.get("file")
+                cm_params["file"] = (
+                    {"path": cover_dl["path"], "mime": cover_dl["mime"],
+                     "copyright": {"license": "U"}}
+                    if not isinstance(file_obj, dict)
+                    else h5p_set_image_fields(file_obj, cover_dl["path"], cover_dl["mime"])
+                )
+        else:
+            # Create a new coverMedium entry
+            book_cover["coverMedium"] = {
+                "params": {
+                    "decorative": False,
+                    "contentName": "Image",
+                    "file": {
+                        "path": cover_dl["path"],
+                        "mime": cover_dl["mime"],
+                        "copyright": {"license": "U"},
+                    },
+                },
+                "library": "H5P.Image 1.1",
+                "metadata": {
+                    "contentType": "Image",
+                    "license": "U",
+                    "title": "Cover Image",
+                },
+                "subContentId": str(uuid.uuid4()),
+            }
+ 
+    # ══════════════════════════════════════════════════════════════════════
+    # Content chapters
+    # ══════════════════════════════════════════════════════════════════════
     for ci, ch in enumerate(chapters, start=1):
         if ci > len(chapters_ref):
             break
-
+ 
         ch_obj = chapters_ref[ci - 1]
         ch_title = (ch.get("chapter_title") or ch.get("title") or f"Chapter {ci}").strip()
+ 
+        # Set the chapter title in metadata (the template stores it here)
+        meta = ch_obj.get("metadata")
+        if isinstance(meta, dict):
+            meta["title"] = ch_title
         deep_find_set_first(ch_obj, ["title", "chapterTitle", "chapter_title", "heading"], ch_title)
-
+ 
         sections = ch.get("sections") or []
         parts: List[str] = []
         for sec in sections:
@@ -2367,98 +2762,344 @@ def update_interactive_book_template_with_images(
             if body:
                 parts.append(body)
         chapter_html = "\n".join(parts).strip() or f"<p>{ch_title}</p>"
-
-        adv_blocks = [b for b in _iter_library_blocks(ch_obj) if str(b.get("library", "")).startswith("H5P.AdvancedText")]
+ 
+        # ══════════════════════════════════════════════════════════════════
+        # FIX 3a: Strip template activity elements from content chapters
+        #          Only keep AdvancedText blocks; remove TrueFalse, Blanks,
+        #          MultiChoice, DragText, MarkTheWords, etc.
+        # ══════════════════════════════════════════════════════════════════
+        ch_params = ch_obj.get("params")
+        if isinstance(ch_params, dict):
+            content_items = ch_params.get("content")
+            if isinstance(content_items, list):
+                cleaned_items = []
+                for item in content_items:
+                    if not isinstance(item, dict):
+                        cleaned_items.append(item)
+                        continue
+                    inner = item.get("content", {})
+                    if not isinstance(inner, dict):
+                        cleaned_items.append(item)
+                        continue
+                    lib = str(inner.get("library") or "")
+                    # Strip any activity library elements (template leftovers)
+                    if any(lib.startswith(prefix) for prefix in _ACTIVITY_LIBS):
+                        continue  # skip this stale template activity
+                    cleaned_items.append(item)
+                ch_params["content"] = cleaned_items
+ 
+        # Update the AdvancedText block with generated HTML
+        adv_blocks = [b for b in _iter_library_blocks(ch_obj)
+                      if str(b.get("library", "")).startswith("H5P.AdvancedText")]
         if adv_blocks:
             adv_blocks[0].setdefault("params", {})
             adv_blocks[0]["params"]["text"] = chapter_html
         else:
-            deep_find_set_first(ch_obj, ["text", "html", "content", "introduction"], chapter_html)
-
+            # No AdvancedText found — inject one into the chapter's content list
+            if isinstance(ch_params, dict):
+                if not isinstance(ch_params.get("content"), list):
+                    ch_params["content"] = []
+                ch_params["content"].insert(0, {
+                    "content": {
+                        "params": {"text": chapter_html},
+                        "library": "H5P.AdvancedText 1.1",
+                        "metadata": {
+                            "contentType": "Text",
+                            "license": "U",
+                            "title": "Untitled Text",
+                        },
+                        "subContentId": str(uuid.uuid4()),
+                    },
+                    "useSeparator": "auto",
+                })
+            else:
+                deep_find_set_first(ch_obj, ["text", "html", "content", "introduction"],
+                                    chapter_html)
+ 
+        # Chapter image
         first_sec = sections[0] if sections else {}
         img_q = (first_sec.get("image_query") or "").strip()
-
+ 
         context_for_img = re.sub("<[^<]+?>", " ", chapter_html)
-        queries = build_image_queries(course=course, pdf_headings=pdf_headings, pdf_keywords=pdf_keywords, context_text=context_for_img, llm_image_query=img_q)
+        queries = build_image_queries(
+            course=course, pdf_headings=pdf_headings, pdf_keywords=pdf_keywords,
+            context_text=context_for_img, llm_image_query=img_q,
+        )
         fallback = build_fallback_query(course, pdf_headings)
-        dl = ensure_image(images_dir, queries=queries, stem=f"ib_ch_{ci}", fallback_query=fallback)
-
-        img_blocks = [b for b in _iter_library_blocks(ch_obj) if str(b.get("library", "")).startswith("H5P.Image")]
+        dl = ensure_image(images_dir, queries=queries, stem=f"ib_ch_{ci}",
+                          fallback_query=fallback)
+ 
+        img_blocks = [b for b in _iter_library_blocks(ch_obj)
+                      if str(b.get("library", "")).startswith("H5P.Image")]
         if img_blocks:
             file_obj = (img_blocks[0].get("params") or {}).get("file")
             img_blocks[0].setdefault("params", {})
             img_blocks[0]["params"]["file"] = (
-                {"path": dl["path"], "mime": dl["mime"], "copyright": {"license": "U"}}
+                {"path": dl["path"], "mime": dl["mime"],
+                 "copyright": {"license": "U"}}
                 if not isinstance(file_obj, dict)
                 else h5p_set_image_fields(file_obj, dl["path"], dl["mime"])
             )
         else:
-            found = deep_find_first_key(ch_obj, ["coverImage", "image", "backgroundImage"])
+            found = deep_find_first_key(ch_obj,
+                                        ["coverImage", "coverMedium", "image",
+                                         "backgroundImage"])
             if found and isinstance(found[1], dict):
                 k, v = found
                 ch_obj[k] = h5p_set_image_fields(v, dl["path"], dl["mime"])
-
+ 
         for si, sec in enumerate(sections, start=1):
             ev = sec.get("evidence") or {}
             qa_items.append({
                 "label": f"Chapter {ci} — Section {si}",
-                "content": f"{sec.get('heading','')}\n{re.sub('<[^<]+?>','', sec.get('body_html',''))[:450]}",
+                "content": (
+                    f"{sec.get('heading', '')}\n"
+                    f"{re.sub('<[^<]+?>', '', sec.get('body_html', ''))[:450]}"
+                ),
                 "expected": "",
                 "evidence": ev,
             })
-
-    # --- ONE activity chapter at the end with ALL questions from all types ---
+ 
+    # ══════════════════════════════════════════════════════════════════════
+    # FIX 3b: Activity chapter — build proper H5P.Column content items
+    #          instead of Course Presentation slide-style elements (x/y coords)
+    #
+    #          The Interactive Book uses H5P.Column chapters where each sub-item
+    #          is wrapped as: {"content": {"library":..., "params":...}, "useSeparator":...}
+    #          NOT the {"x":, "y":, "action":{"library":...}} format used by CP slides.
+    # ══════════════════════════════════════════════════════════════════════
     if has_activity:
         act_ch_idx = len(chapters)
         act_ch_num = act_ch_idx + 1
         ch_obj = chapters_ref[act_ch_idx]
-
+ 
         type_names = " & ".join(activity_groups.keys())
         act_heading = f"Activity — {type_names}"
-        deep_find_set_first(ch_obj, ["title", "chapterTitle", "chapter_title", "heading"], act_heading)
-
-        # Build activity HTML content for the chapter
-        activity_html_parts: List[str] = []
-        activity_html_parts.append(f"<h2>{act_heading}</h2>")
-
-        all_act_elements: List[Dict[str, Any]] = []
+ 
+        # Set chapter title in metadata
+        meta = ch_obj.get("metadata")
+        if isinstance(meta, dict):
+            meta["title"] = act_heading
+        deep_find_set_first(ch_obj, ["title", "chapterTitle", "chapter_title",
+                                     "heading"], act_heading)
+ 
+        # Build proper Column content items for the activity chapter
+        activity_content_items: List[Dict[str, Any]] = []
+ 
+        # Add a heading text block
+        activity_content_items.append({
+            "content": {
+                "params": {
+                    "text": (f"<h2>{act_heading}</h2>"
+                             f"<p>Complete the activities below.</p>"),
+                },
+                "library": "H5P.AdvancedText 1.1",
+                "metadata": {
+                    "contentType": "Text",
+                    "license": "U",
+                    "title": "Untitled Text",
+                },
+                "subContentId": str(uuid.uuid4()),
+            },
+            "useSeparator": "auto",
+        })
+ 
+        # Build actual H5P activity sub-content items for each activity type
         for atype, questions in activity_groups.items():
-            if questions:
-                all_act_elements.extend(_build_cp_activity_slide_elements(atype, questions))
-                _ensure_cp_activity_dependencies(work_dir, atype)
-
-        # Try to inject activity elements into the chapter's content structure
-        # Interactive Book chapters may use AdvancedText or a content/params structure
-        adv_blocks = [b for b in _iter_library_blocks(ch_obj) if str(b.get("library", "")).startswith("H5P.AdvancedText")]
-        if adv_blocks:
-            adv_blocks[0].setdefault("params", {})
-            adv_blocks[0]["params"]["text"] = f"<h2>{act_heading}</h2><p>Complete the activities below.</p>"
+            if not questions:
+                continue
+ 
+            at_lower = (atype or "").strip().lower()
+            _ensure_cp_activity_dependencies(work_dir, atype)
+ 
+            if "fill" in at_lower or "blank" in at_lower:
+                q_lines = []
+                for q in questions:
+                    sentence = (q.get("sentence") or "").strip()
+                    answer = (q.get("answer") or "").strip()
+                    if not sentence or not answer:
+                        continue
+                    text = sentence
+                    if f"*{answer}*" not in text:
+                        text = text.replace("___", f"*{answer}*", 1)
+                    if f"*{answer}*" not in text:
+                        text = text.replace(answer, f"*{answer}*", 1)
+                    if f"*{answer}*" not in text:
+                        text += f" *{answer}*"
+                    q_lines.append(f"<p>{text}</p>")
+ 
+                if q_lines:
+                    activity_content_items.append({
+                        "content": {
+                            "params": {
+                                "questions": q_lines,
+                                "overallFeedback": [{"from": 0, "to": 100}],
+                                "showSolutions": "Show solution",
+                                "tryAgain": "Retry",
+                                "behaviour": {
+                                    "enableRetry": True,
+                                    "enableSolutionsButton": True,
+                                    "caseSensitive": False,
+                                    "autoCheck": False,
+                                    "acceptSpellingErrors": False,
+                                },
+                            },
+                            "library": "H5P.Blanks 1.14",
+                            "metadata": {
+                                "contentType": "Fill in the Blanks",
+                                "license": "U",
+                                "title": "Fill in the Blanks",
+                            },
+                            "subContentId": str(uuid.uuid4()),
+                        },
+                        "useSeparator": "auto",
+                    })
+ 
+            elif "drag" in at_lower and "word" in at_lower:
+                lines = []
+                for q in questions:
+                    sentence = (q.get("sentence") or "").strip()
+                    missing = (q.get("missing_word") or "").strip()
+                    if not sentence or not missing:
+                        continue
+                    text = sentence
+                    if f"*{missing}*" not in text:
+                        text = text.replace("___", f"*{missing}*", 1)
+                    if f"*{missing}*" not in text:
+                        text = text.replace(missing, f"*{missing}*", 1)
+                    if f"*{missing}*" not in text:
+                        text += f" *{missing}*"
+                    lines.append(text)
+ 
+                if lines:
+                    activity_content_items.append({
+                        "content": {
+                            "params": {
+                                "textField": "\n".join(lines),
+                                "overallFeedback": [{"from": 0, "to": 100}],
+                                "behaviour": {
+                                    "enableRetry": True,
+                                    "enableSolutionsButton": True,
+                                    "instantFeedback": False,
+                                },
+                                "taskDescription": "<p>Drag the words into the correct blanks.</p>",
+                            },
+                            "library": "H5P.DragText 1.10",
+                            "metadata": {
+                                "contentType": "Drag the Words",
+                                "license": "U",
+                                "title": "Drag the Words",
+                            },
+                            "subContentId": str(uuid.uuid4()),
+                        },
+                        "useSeparator": "auto",
+                    })
+ 
+            elif "mark" in at_lower and "word" in at_lower:
+                combined_text = ""
+                for q in questions:
+                    paragraph = (q.get("paragraph") or "").strip()
+                    marked = q.get("marked_words") or []
+                    if not paragraph or not marked:
+                        continue
+                    text = paragraph
+                    for w in marked:
+                        w = w.strip()
+                        if w and f"*{w}*" not in text:
+                            text = text.replace(w, f"*{w}*", 1)
+                    combined_text += text + "\n\n"
+ 
+                if combined_text.strip():
+                    activity_content_items.append({
+                        "content": {
+                            "params": {
+                                "textField": combined_text.strip(),
+                                "overallFeedback": [{"from": 0, "to": 100}],
+                                "behaviour": {
+                                    "enableRetry": True,
+                                    "enableSolutionsButton": True,
+                                },
+                                "taskDescription": "<p>Select the correct words.</p>",
+                                "checkAnswerButton": "Check",
+                                "tryAgainButton": "Retry",
+                                "showSolutionButton": "Show solution",
+                            },
+                            "library": "H5P.MarkTheWords 1.11",
+                            "metadata": {
+                                "contentType": "Mark the Words",
+                                "license": "U",
+                                "title": "Mark the Words",
+                            },
+                            "subContentId": str(uuid.uuid4()),
+                        },
+                        "useSeparator": "auto",
+                    })
+ 
+            elif "true" in at_lower or "false" in at_lower:
+                for q in questions:
+                    statement = (q.get("statement") or "").strip()
+                    correct = (q.get("correct_answer") or "").strip().lower()
+                    if not statement:
+                        continue
+                    activity_content_items.append({
+                        "content": {
+                            "params": {
+                                "question": f"<p>{statement}</p>",
+                                "correct": ("true" if correct in ("true", "yes", "1")
+                                            else "false"),
+                                "behaviour": {
+                                    "enableRetry": True,
+                                    "enableSolutionsButton": True,
+                                    "confirmCheckDialog": False,
+                                    "confirmRetryDialog": False,
+                                },
+                                "l10n": {"trueText": "True", "falseText": "False"},
+                                "media": {"type": {}},
+                            },
+                            "library": "H5P.TrueFalse 1.8",
+                            "metadata": {
+                                "contentType": "True/False Question",
+                                "license": "U",
+                                "title": "True/False",
+                            },
+                            "subContentId": str(uuid.uuid4()),
+                        },
+                        "useSeparator": "auto",
+                    })
+ 
+        # Replace the chapter's content with the built activity items
+        ch_params = ch_obj.get("params")
+        if isinstance(ch_params, dict):
+            ch_params["content"] = activity_content_items
         else:
-            deep_find_set_first(ch_obj, ["text", "html", "content", "introduction"], f"<h2>{act_heading}</h2><p>Complete the activities below.</p>")
-
-        # Inject the activity elements into the chapter's content
-        # Interactive Book chapters can hold H5P sub-content via a 'content' list or 'params.content'
-        if "content" in ch_obj and isinstance(ch_obj["content"], list):
-            ch_obj["content"] = all_act_elements if all_act_elements else ch_obj["content"]
-        elif "params" in ch_obj and isinstance(ch_obj.get("params"), dict):
-            if "content" in ch_obj["params"] and isinstance(ch_obj["params"]["content"], list):
-                ch_obj["params"]["content"] = all_act_elements if all_act_elements else ch_obj["params"]["content"]
-            else:
-                ch_obj["params"]["content"] = all_act_elements
-        else:
-            ch_obj["content"] = all_act_elements
-
-        # Remove any image blocks from the activity chapter
-        img_blocks = [b for b in _iter_library_blocks(ch_obj) if str(b.get("library", "")).startswith("H5P.Image")]
-        for ib in img_blocks:
-            ib["params"] = {}
-
-        # QA report entries
+            ch_obj["params"] = {"content": activity_content_items}
+ 
+        # Ensure the activity chapter uses H5P.Column library
+        ch_obj["library"] = "H5P.Column 1.18"
+ 
+        # Remove any leftover image blocks from the activity chapter
+        # (they would be stale template images)
+        if isinstance(ch_params, dict):
+            activity_items = ch_params.get("content", [])
+            cleaned = []
+            for item in activity_items:
+                if isinstance(item, dict):
+                    inner = (item.get("content") or {})
+                    if isinstance(inner, dict):
+                        lib = str(inner.get("library") or "")
+                        if lib.startswith("H5P.Image"):
+                            continue
+                cleaned.append(item)
+            ch_params["content"] = cleaned
+ 
+        # QA report entries for activity questions
         for atype, questions in activity_groups.items():
             for qi, q_data in enumerate(questions):
                 ev = q_data.get("evidence") or {}
-                q_summary = q_data.get("statement") or q_data.get("sentence") or q_data.get("paragraph") or ""
-                q_answer = q_data.get("correct_answer") or q_data.get("answer") or q_data.get("missing_word") or ""
+                q_summary = (q_data.get("statement") or q_data.get("sentence")
+                             or q_data.get("paragraph") or "")
+                q_answer = (q_data.get("correct_answer") or q_data.get("answer")
+                            or q_data.get("missing_word") or "")
                 if isinstance(q_data.get("marked_words"), list):
                     q_answer = ", ".join(q_data["marked_words"])
                 qa_items.append({
@@ -2467,8 +3108,10 @@ def update_interactive_book_template_with_images(
                     "expected": q_answer,
                     "evidence": ev,
                 })
-
-    deep_find_set_first(content, ["description", "introduction", "taskDescription"], description)
+ 
+    # Set the overall description (for non-cover areas)
+    _set_presentation_description_safe(content, description, title=title,
+                                       slides_data=chapters)
     _save_json(work_dir, "content/content.json", content)
     return qa_items
 
@@ -2744,7 +3387,6 @@ def make_blanks_textfield(items: List[Dict[str, Any]]) -> str:
         lines.append(block)
 
     return "\n\n".join(lines)
-
 def make_mark_words_textfield(items: List[Dict[str, Any]]) -> str:
     lines = []
 
@@ -2767,12 +3409,11 @@ def make_mark_words_textfield(items: List[Dict[str, Any]]) -> str:
         block = f"{i}. {sentence_marked}"
 
         if hint:
-            block += f"\n({hint})"
+            block += f" ({hint})"
 
         lines.append(block)
 
-    return "\n\n".join(lines)
-
+    return "<br><br>".join(lines)
 
 def call_llm_drag_words(chunks: List[ContentChunk], n: int, course: str) -> Dict[str, Any]:
     system = "Create H5P Drag the Words strictly grounded in source text. Return JSON only."
@@ -3483,6 +4124,1070 @@ Source:
 """.strip()
     return call_openai_chat_json(system, user)
 
+# ============================================================
+# MISSING FUNCTION — paste this into app.py
+# right AFTER the call_llm_cornell_notes() function
+# (around line 1820, before the _cornell_mime function)
+# ============================================================
+
+def call_llm_summary(chunks: List[ContentChunk], n: int, course: str) -> Dict[str, Any]:
+    system = "Create H5P Summary strictly grounded in source text. Return JSON only."
+    src = join_chunks_for_prompt(chunks)
+    user = f"""
+Create an H5P Summary activity with EXACTLY {n} statement groups for course: {course}
+ 
+Each group has ONE correct statement and 2 incorrect (but plausible) statements.
+The correct statement must be a true fact from the SOURCE text.
+The incorrect statements must sound plausible but be factually wrong based on the SOURCE.
+ 
+Return JSON:
+{{
+  "title":"string",
+   "introduction":"string — a 2-4 sentence introduction paragraph that tells the learner what this activity covers. It MUST reference the specific topics and concepts from the SOURCE text. For example: 'This activity covers the key concepts from [specific topic]. Read each set of statements and select the one that is correct based on what you have studied about [specific details from SOURCE].' Do NOT use generic filler text. The introduction must be directly relevant to the SOURCE content.",
+  "overall_feedback":[
+    {{"from":0,"to":40,"feedback":"string — specific encouraging feedback for low scores mentioning the topic"}},
+    {{"from":41,"to":80,"feedback":"string — specific feedback for mid scores"}},
+    {{"from":81,"to":100,"feedback":"string — specific congratulatory feedback for high scores"}}
+  ],
+  "groups":[
+    {{
+      "correct_statement":"a true statement taken directly from SOURCE",
+      "incorrect_statements":["plausible but wrong statement 1","plausible but wrong statement 2"],
+      "tip":"optional short hint",
+      "evidence":{{"source_file":"string","locator":"Page X","quote":"exact quote from SOURCE supporting the correct statement"}}
+    }}
+  ]
+}}
+ 
+Rules:
+1. EXACTLY {n} groups.
+2. Every correct_statement MUST be grounded in a specific fact from SOURCE.
+3. Incorrect statements should be related to the same topic but contain a wrong detail (e.g. swapped term, wrong number, reversed cause/effect).
+4. Spread groups across different parts of the SOURCE — do not cluster from one section.
+5. Each statement should be a complete, clear sentence.
+6. The "introduction" MUST be a 1 sentence paragraph written specifically about the content from SOURCE. It must mention specific topics, concepts, or learning areas from the SOURCE. Never reuse template default text.
+7. The "overall_feedback" entries MUST reference the actual topic. Do NOT use generic phrases like "Keep trying" or "Well done".
+ 
+SOURCE:
+{src}
+""".strip()
+    return call_openai_chat_json(system, user)
+
+def call_llm_information_wall(chunks, n_panels, course):
+    """Generate Information Wall content with proper panel structure."""
+    system = (
+        "You are a strict content extractor for H5P Information Wall activities. "
+        "You ONLY use facts from the SOURCE text. Return JSON only."
+    )
+    src_txt = join_chunks_for_prompt(chunks, max_chars=65000)
+    user = f"""
+Create an Information Wall activity for course: {course}
+ 
+An Information Wall displays panels (like cards/tiles). Each panel has:
+- An image
+- A title
+- Multiple text entries that correspond to property labels
+ 
+You must define 3 property labels that are relevant to this topic.
+For example, for a security topic the properties might be:
+  ["Topic", "Description", "Key Points"]
+For a health topic:
+  ["Condition", "Overview", "Prevention"]
+ 
+Then create {n_panels} panels. Each panel MUST have EXACTLY 3 entries
+(one per property).
+ 
+Return JSON:
+{{
+  "title": "string — descriptive title for the Information Wall",
+  "header": "string — short header shown above the wall",
+  "properties": [
+    {{
+      "label": "string — first property label (used as the card title/name)",
+      "showLabel": false,
+      "searchInProperty": false,
+      "bold": true
+    }},
+    {{
+      "label": "string — second property label (main content)",
+      "showLabel": false,
+      "searchInProperty": true,
+      "bold": false
+    }},
+    {{
+      "label": "string — third property label (additional detail)",
+      "showLabel": true,
+      "searchInProperty": true,
+      "bold": false
+    }}
+  ],
+  "panels": [
+    {{
+      "panelTitle": "string — title shown on the panel card",
+      "entries": [
+        "HTML string for property 1 (short title, use <p><span style=\\"font-size:1.25em;\\">Title</span></p>)",
+        "HTML string for property 2 (main descriptive paragraph, use <p> tags)",
+        "HTML string for property 3 (additional key points, use <p> or <ol>/<ul> tags)"
+      ],
+      "keywords": "comma-separated search keywords for this panel",
+      "image_query": "2-5 words for finding a relevant professional image",
+      "image_alt": "short alt text describing what the image should show",
+      "evidence": {{
+        "source_file": "string",
+        "locator": "PDF p.X/Y",
+        "quote": "exact quote from SOURCE supporting this panel"
+      }}
+    }}
+  ]
+}}
+ 
+STRICT RULES:
+1. EXACTLY {n_panels} panels.
+2. EXACTLY 3 properties.
+3. Each panel MUST have EXACTLY 3 entries (matching the 3 properties).
+4. Entry 1: short styled title — <p><span style="font-size:1.25em;">Title Here</span></p>
+5. Entry 2: main descriptive content (1-3 sentences in <p> tags, can use <strong>).
+6. Entry 3: additional key points (use <p> or <ol>/<ul> with <li>).
+7. All content MUST be grounded in the SOURCE text.
+8. image_query: visual concept words only (no jargon, no brand names).
+9. Each panel covers a DIFFERENT topic from the SOURCE.
+10. HTML tags allowed: <p>, <strong>, <em>, <span>, <ul>, <ol>, <li> only.
+ 
+SOURCE:
+{src_txt}
+""".strip()
+    return call_openai_chat_json(system, user)
+ 
+def call_llm_virtual_tour_interactions(chunks, n_hotspots, course):
+    """Generate text-based hotspot interactions for a 360° Virtual Tour from PDF content."""
+    system = (
+        "You are a strict content extractor. You ONLY use facts from the SOURCE text. "
+        "Return JSON only."
+    )
+    src_txt = join_chunks_for_prompt(chunks, max_chars=65000)
+    user = f"""
+Create {n_hotspots} informational hotspot labels for a 360° Virtual Tour activity.
+Course: {course}
+ 
+Each hotspot will appear as a clickable point on a 360° image. When clicked, it shows
+a title and a short informational text popup.
+ 
+Return JSON:
+{{
+  "hotspots": [
+    {{
+      "label": "string — a short 2-5 word title for the hotspot (e.g. 'Key Responsibilities', 'Safety Requirements')",
+      "body_html": "string — 2-4 sentences of informational content in simple HTML (<p>, <ul>, <li>, <b> only). Must be factual content from SOURCE.",
+      "evidence": {{"source_file":"string","locator":"PDF p.X/Y","quote":"short exact quote from SOURCE"}}
+    }}
+  ]
+}}
+ 
+Rules:
+1. EXACTLY {n_hotspots} hotspots.
+2. Each hotspot must cover a DIFFERENT topic/section from the SOURCE.
+3. Labels must be short and descriptive (2-5 words).
+4. body_html must contain useful, factual content directly from SOURCE.
+5. Keep body_html concise — 2-4 sentences maximum per hotspot.
+6. Use simple HTML only: <p>, <ul>, <li>, <b>.
+7. Spread hotspots across different parts of the SOURCE content.
+8. Do NOT invent facts — every statement must be traceable to SOURCE.
+ 
+SOURCE:
+{src_txt}
+""".strip()
+    return call_openai_chat_json(system, user)
+
+def call_llm_memory_game(chunks, n_pairs, course):
+    """Generate Memory Game card concepts from PDF content.
+    
+    Each card MUST have a visually distinct image query describing
+    a concrete, photographable object — not an abstract concept.
+    """
+    system = (
+        "You are a strict content extractor for H5P Memory Game activities. "
+        "You ONLY use facts from the SOURCE text. Return JSON only."
+    )
+    src_txt = join_chunks_for_prompt(chunks, max_chars=65000)
+    user = f"""
+Create a Memory Game activity for course: {course}
+ 
+A Memory Game shows cards face-down. The learner flips two cards at a time
+trying to find matching pairs. Each card has an IMAGE and a short DESCRIPTION.
+Two identical cards form a pair.
+ 
+You must define EXACTLY {n_pairs} unique cards. Each card represents a different
+key concept, term, or topic from the SOURCE text.
+ 
+CRITICAL IMAGE RULES — EVERY card must have a DIFFERENT image:
+- Each image_query MUST describe a PHYSICALLY DIFFERENT, CONCRETE object or scene.
+- Use SPECIFIC nouns with physical details: "red fire extinguisher mounted on wall",
+  "stethoscope resting on wooden desk", "laptop showing code editor on screen",
+  "steel padlock on chain link fence", "CCTV camera on building corner".
+- NEVER use abstract terms alone like "security", "safety", "compliance" as main subject.
+- NEVER repeat the same core object across cards (e.g. two cards with "laptop" or "lock").
+- Each query MUST produce a DIFFERENT stock photo result than every other card.
+ 
+BAD (too similar — will return same photo):
+  "network security padlock" vs "cyber security lock" ← SAME OBJECT
+  "data protection" vs "privacy protection" ← SAME CONCEPT
+  
+GOOD (each physically different):
+  "server rack blinking lights dark room"
+  "ethernet cable plugged into router"
+  "fingerprint scanner office door"
+  "CCTV security camera building exterior"
+  "USB flash drive wooden desk"
+  "Wi-Fi router with antennas"
+ 
+Return JSON:
+{{
+  "title": "string — descriptive title for the Memory Game",
+  "cards": [
+    {{
+      "description": "string — short label (1-4 words)",
+      "image_query": "string — 3-7 words describing a SPECIFIC CONCRETE object. Include physical details (color, material, setting). Must be visually unique from ALL other cards.",
+      "image_alt": "string — short alt text",
+      "evidence": {{
+        "source_file": "string",
+        "locator": "PDF p.X/Y",
+        "quote": "exact quote from SOURCE"
+      }}
+    }}
+  ]
+}}
+ 
+RULES:
+1. EXACTLY {n_pairs} cards.
+2. Each card = different concept from SOURCE.
+3. description: 1-4 words (card label).
+4. image_query: VISUALLY UNIQUE concrete object per card.
+   No text, logos, brand names.
+5. All content grounded in SOURCE.
+6. Before finalising, verify: would searching each image_query on a stock site
+   return a DIFFERENT photo? If any two overlap, rewrite one.
+ 
+SOURCE:
+{src_txt}
+""".strip()
+    return call_openai_chat_json(system, user)
+
+def update_memory_game_template(
+    work_dir,
+    title,
+    cards,
+    course="",
+    pdf_headings=None,
+    pdf_keywords=None,
+):
+    """Populate an H5P Memory Game template with UNIQUE images per card.
+ 
+    Tracks used image URLs and file-content hashes so every card gets
+    a distinct image. On duplicate, retries with alternative queries.
+ 
+    N cards → N pairs → 2N visible cards on the board.
+    """
+    pdf_headings = pdf_headings or []
+    pdf_keywords = pdf_keywords or []
+ 
+    update_h5p_title(work_dir, title)
+    content = _load_json(work_dir, "content/content.json")
+ 
+    images_dir = os.path.join(work_dir, "content", "images")
+    if os.path.isdir(images_dir):
+        shutil.rmtree(images_dir)
+    os.makedirs(images_dir, exist_ok=True)
+ 
+    new_cards = []
+    qa_items = []
+ 
+    # ── Deduplication state ─────────────────────────────────────────────
+    used_urls = set()        # source URLs already downloaded
+    used_hashes = set()      # SHA-256 of file bytes already used
+ 
+    def _file_hash(filepath):
+        try:
+            with open(filepath, "rb") as fh:
+                return hashlib.sha256(fh.read()).hexdigest()
+        except Exception:
+            return None
+ 
+    def _try_download_one(query, stem_tag):
+        """Attempt a single image download. Returns (info_dict, abs_path) or (None, None)."""
+        q = (query or "").strip()
+        if not q:
+            return None, None
+ 
+        # AI generation
+        ai = openai_generate_image_to_path(images_dir, q, stem=f"{stem_tag}_ai")
+        if ai:
+            ap = os.path.join(images_dir, os.path.basename(ai["path"]))
+            return ai, ap
+ 
+        # Freepik
+        if FREEPIK_API_KEY:
+            cand = freepik_find_image_url(q, prefer_vectors=True)
+            if cand and cand.get("id"):
+                src_url = cand.get("page_url") or str(cand["id"])
+                if src_url not in used_urls:
+                    dl_meta = freepik_download_signed_url(int(cand["id"]), image_size="large")
+                    signed = ""
+                    if isinstance(dl_meta, dict):
+                        signed = dl_meta.get("signed_url") or dl_meta.get("url") or ""
+                    if signed:
+                        try:
+                            rr = requests.get(signed, headers={"User-Agent": USER_AGENT}, timeout=60)
+                            rr.raise_for_status()
+                            mime = (rr.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                            if not mime.startswith("image/"):
+                                mime = "image/jpeg"
+                            ext = ".jpg" if ("jpeg" in mime or "jpg" in mime) else ".png"
+                            fname = f"{safe_filename(stem_tag)}{ext}"
+                            ap = os.path.join(images_dir, fname)
+                            with open(ap, "wb") as fw:
+                                fw.write(rr.content)
+                            info = {
+                                "path": f"images/{fname}",
+                                "mime": mime,
+                                "credit": {
+                                    "provider": "freepik",
+                                    "source": src_url,
+                                    "title": cand.get("title") or "",
+                                    "author": cand.get("author_name") or "",
+                                },
+                            }
+                            return info, ap
+                        except Exception:
+                            pass
+ 
+        # Wikimedia
+        found = wikimedia_find_image_url(q)
+        if found:
+            wurl = found["url"]
+            if wurl not in used_urls:
+                mime = found["mime"]
+                ext = ".jpg" if ("jpeg" in mime or "jpg" in mime) else ".png"
+                fname = f"{safe_filename(stem_tag)}{ext}"
+                ap = os.path.join(images_dir, fname)
+                try:
+                    rr = requests.get(wurl, headers={"User-Agent": USER_AGENT}, timeout=60)
+                    rr.raise_for_status()
+                    with open(ap, "wb") as fw:
+                        fw.write(rr.content)
+                    info = {
+                        "path": f"images/{fname}",
+                        "mime": mime,
+                        "credit": {"provider": "wikimedia", "source": wurl},
+                    }
+                    return info, ap
+                except Exception:
+                    pass
+ 
+        return None, None
+ 
+    def _download_unique(queries, stem, fallback_q):
+        """Download image, skipping duplicates. Returns image info dict."""
+        all_q = []
+        seen_q = set()
+        for q in list(queries) + [fallback_q]:
+            q = (q or "").strip()
+            if not q:
+                continue
+            k = q.lower()
+            if k in seen_q:
+                continue
+            seen_q.add(k)
+            all_q.append(q)
+ 
+        for qi, q in enumerate(all_q):
+            tag = f"{stem}_q{qi}"
+            info, abs_path = _try_download_one(q, tag)
+            if info is None or abs_path is None:
+                continue
+ 
+            # Check for duplicate
+            fh = _file_hash(abs_path)
+            src = (info.get("credit") or {}).get("source") or ""
+ 
+            if (fh and fh in used_hashes) or (src and src in used_urls):
+                # Duplicate detected — delete and try next query
+                try:
+                    os.remove(abs_path)
+                except Exception:
+                    pass
+                continue
+ 
+            # Unique image — register and return
+            if fh:
+                used_hashes.add(fh)
+            if src:
+                used_urls.add(src)
+            return info
+ 
+        # All queries exhausted — write unique colored placeholder
+        fname = f"{safe_filename(stem)}_placeholder.png"
+        ap = os.path.join(images_dir, fname)
+        _write_colored_placeholder(ap, stem)
+        fh = _file_hash(ap) or stem
+        used_hashes.add(fh)
+        return {"path": f"images/{fname}", "mime": "image/png", "credit": {"provider": "placeholder"}}
+ 
+    # ── Build cards ─────────────────────────────────────────────────────
+    for i, card in enumerate(cards, start=1):
+        description = (card.get("description") or f"Card {i}").strip()
+        img_query = (card.get("image_query") or "").strip()
+        img_alt = (card.get("image_alt") or description).strip()
+        ev = card.get("evidence") or {}
+ 
+        context_for_img = f"{description} {img_query}".strip()
+        queries = build_image_queries(
+            course=course,
+            pdf_headings=pdf_headings,
+            pdf_keywords=pdf_keywords,
+            context_text=context_for_img,
+            llm_image_query=img_query,
+        )
+ 
+        # Put the LLM's specific query first (most targeted)
+        if img_query and img_query not in queries:
+            queries.insert(0, img_query)
+        # Add plain description as extra fallback
+        if description and description not in queries:
+            queries.append(f"{description} professional photo")
+ 
+        fallback = build_fallback_query(course, pdf_headings)
+ 
+        dl = _download_unique(queries, f"memory_card_{i}", fallback)
+ 
+        card_obj = {
+            "image": {
+                "path": dl["path"],
+                "mime": dl["mime"],
+                "copyright": {"license": "U"},
+                "width": 200,
+                "height": 200,
+            },
+            "description": description,
+            "imageAlt": img_alt,
+            "matchAlt": img_alt,
+        }
+        new_cards.append(card_obj)
+ 
+        qa_items.append({
+            "label": f"Card {i}: {description}",
+            "content": f"Image query: {img_query}\nAlt: {img_alt}",
+            "expected": "",
+            "evidence": ev,
+        })
+ 
+    if not new_cards:
+        raise ValueError("No Memory Game cards were generated.")
+ 
+    content["cards"] = new_cards
+    _save_json(work_dir, "content/content.json", content)
+    return qa_items
+
+def _write_colored_placeholder(path, seed_text):
+    """Write a unique colored PNG placeholder. Each seed → different color.
+    
+    Last-resort fallback so even if all image sources fail,
+    each Memory Game card has a visually distinct colored square.
+    """
+    import struct
+    import zlib
+ 
+    h = hashlib.md5((seed_text or "").encode()).hexdigest()
+    r = max(60, min(220, int(h[0:2], 16)))
+    g = max(60, min(220, int(h[2:4], 16)))
+    b = max(60, min(220, int(h[4:6], 16)))
+ 
+    width, height = 4, 4
+    sig = b'\x89PNG\r\n\x1a\n'
+ 
+    ihdr_data = struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)
+    ihdr_crc = zlib.crc32(b'IHDR' + ihdr_data) & 0xffffffff
+    ihdr = struct.pack('>I', 13) + b'IHDR' + ihdr_data + struct.pack('>I', ihdr_crc)
+ 
+    raw = b''
+    for _ in range(height):
+        raw += b'\x00'
+        for _ in range(width):
+            raw += bytes([r, g, b])
+    compressed = zlib.compress(raw)
+    idat_crc = zlib.crc32(b'IDAT' + compressed) & 0xffffffff
+    idat = struct.pack('>I', len(compressed)) + b'IDAT' + compressed + struct.pack('>I', idat_crc)
+ 
+    iend_crc = zlib.crc32(b'IEND') & 0xffffffff
+    iend = struct.pack('>I', 0) + b'IEND' + struct.pack('>I', iend_crc)
+ 
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(sig + ihdr + idat + iend)
+
+def call_llm_game_map_stages(chunks, n_stages, course):
+    """Generate Game Map stages with alternating read + quiz content from PDF.
+ 
+    Pattern: Even indices = reading, Odd indices = quiz
+    Quiz types cycle: multichoice → truefalse → dragtext → blanks
+    """
+    system = (
+        "You are a strict content extractor for H5P Game Map activities. "
+        "You ONLY use facts from the SOURCE text. Return JSON only."
+    )
+    src_txt = join_chunks_for_prompt(chunks, max_chars=65000)
+ 
+    activity_cycle = ["multichoice", "truefalse", "dragtext", "blanks"]
+    stage_specs = []
+    act_idx = 0
+    for i in range(n_stages):
+        if i % 2 == 0:
+            stage_specs.append({"index": i, "type": "reading"})
+        else:
+            stage_specs.append({"index": i, "type": activity_cycle[act_idx % len(activity_cycle)]})
+            act_idx += 1
+ 
+    stage_type_desc = "\n".join([
+        f"  Stage {s['index']+1}: {s['type']}" for s in stage_specs
+    ])
+ 
+    user = f"""
+Create a Game Map with EXACTLY {n_stages} stages for course: {course}
+ 
+The stages follow this pattern (alternating reading and quiz):
+{stage_type_desc}
+ 
+Return JSON:
+{{
+  "title": "string — descriptive title for the game map",
+  "stages": [
+    {{
+      "stage_index": 0,
+      "label": "string — short stage label (3-8 words)",
+      "type": "reading|multichoice|truefalse|dragtext|blanks",
+      "content": {{
+        // FOR "reading" type ONLY include:
+        "body_html": "string — 2-4 paragraphs of HTML (<p>, <ul>, <li>, <b>, <h3>)"
+ 
+        // FOR "multichoice" type ONLY include:
+        "question": "string",
+        "options": ["opt1", "opt2", "opt3", "opt4"],
+        "correctIndex": 0
+ 
+        // FOR "truefalse" type ONLY include:
+        "statement": "string",
+        "correctAnswer": true
+ 
+        // FOR "dragtext" type ONLY include:
+        "sentence": "string with ___ for the blank",
+        "missing_word": "string (1-2 words)"
+ 
+        // FOR "blanks" type ONLY include:
+        "sentence": "string with ___ for the blank",
+        "answer": "string (exact missing word)"
+      }},
+      "evidence": {{"source_file":"string","locator":"PDF p.X/Y","quote":"exact quote from SOURCE"}}
+    }}
+  ]
+}}
+ 
+STRICT RULES:
+1. EXACTLY {n_stages} stages following the type pattern above.
+2. Reading stages: 2-4 paragraphs of informative HTML from SOURCE.
+   Use <h3>, <p>, <ul>, <li>, <b> tags. Teach key facts.
+3. Quiz stages test what the PREVIOUS reading stage taught.
+4. MultiChoice: 3-4 options, exactly one correct.
+5. TrueFalse: clear factual statement + true/false.
+6. DragText: sentence with ___ blank, missing_word is 1-2 words.
+7. Blanks: sentence with ___ blank, answer is exact missing word.
+8. Every stage grounded in SOURCE text.
+9. Spread content across different sections of SOURCE.
+10. Labels must be specific and descriptive (not "Stage 1").
+11. evidence.quote copied exactly from SOURCE.
+ 
+SOURCE:
+{src_txt}
+""".strip()
+    return call_openai_chat_json(system, user)
+ 
+ 
+def _generate_stage_positions(n_stages):
+    """Generate x,y positions (%) for stages in a winding path across the image."""
+    if n_stages <= 0:
+        return []
+    positions = []
+    x_min, x_max = 12.0, 88.0
+    y_min, y_max = 12.0, 88.0
+    x_range = x_max - x_min
+    y_mid = (y_min + y_max) / 2.0
+    y_amp = (y_max - y_min) * 0.32
+    for i in range(n_stages):
+        t = i / max(n_stages - 1, 1)
+        x = x_min + t * x_range
+        y = y_mid + y_amp * _math.sin(t * _math.pi * 2.0 + 0.3)
+        y = max(y_min, min(y_max, y))
+        x += random.uniform(-2.5, 2.5)
+        y += random.uniform(-3.0, 3.0)
+        x = max(x_min, min(x_max, x))
+        y = max(y_min, min(y_max, y))
+        positions.append((round(x, 4), round(y, 4)))
+    return positions
+ 
+ 
+def _build_gm_reading(body_html):
+    return {
+        "contentType": {
+            "params": {"text": body_html},
+            "library": "H5P.AdvancedText 1.1",
+            "metadata": {"contentType": "Text", "license": "U", "title": "Untitled Text"},
+            "subContentId": str(uuid.uuid4()),
+        }
+    }
+ 
+ 
+def _build_gm_multichoice(question, options, correct_index):
+    answers = [{
+        "correct": (j == correct_index),
+        "tipsAndFeedback": {"tip": "", "chosenFeedback": "", "notChosenFeedback": ""},
+        "text": f"<div>{opt}</div>\n",
+    } for j, opt in enumerate(options)]
+    return {
+        "contentType": {
+            "params": {
+                "media": {"disableImageZooming": False},
+                "answers": answers,
+                "overallFeedback": [{"from": 0, "to": 100}],
+                "behaviour": {
+                    "enableRetry": True, "enableSolutionsButton": True,
+                    "enableCheckButton": True, "type": "auto", "singlePoint": False,
+                    "randomAnswers": True, "showSolutionsRequiresInput": True,
+                    "confirmCheckDialog": False, "confirmRetryDialog": False,
+                    "autoCheck": False, "passPercentage": 100, "showScorePoints": True,
+                },
+                "UI": {
+                    "checkAnswerButton": "Check", "submitAnswerButton": "Submit",
+                    "showSolutionButton": "Show solution", "tryAgainButton": "Retry",
+                    "tipsLabel": "Show tip",
+                    "scoreBarLabel": "You got :num out of :total points",
+                    "tipAvailable": "Tip available", "feedbackAvailable": "Feedback available",
+                    "readFeedback": "Read feedback", "wrongAnswer": "Wrong answer",
+                    "correctAnswer": "Correct answer",
+                    "shouldCheck": "Should have been checked",
+                    "shouldNotCheck": "Should not have been checked",
+                    "noInput": "Please answer before viewing the solution",
+                    "a11yCheck": "Check the answers.",
+                    "a11yShowSolution": "Show the solution.",
+                    "a11yRetry": "Retry the task.",
+                },
+                "confirmCheck": {"header": "Finish ?", "body": "Are you sure you wish to finish ?",
+                                 "cancelLabel": "Cancel", "confirmLabel": "Finish"},
+                "confirmRetry": {"header": "Retry ?", "body": "Are you sure you wish to retry ?",
+                                 "cancelLabel": "Cancel", "confirmLabel": "Confirm"},
+                "question": f"<p>{question}</p>\n",
+            },
+            "library": "H5P.MultiChoice 1.16",
+            "metadata": {"contentType": "Multiple Choice", "license": "U", "title": "Multiple Choice"},
+            "subContentId": str(uuid.uuid4()),
+        }
+    }
+ 
+ 
+def _build_gm_truefalse(statement, correct):
+    return {
+        "contentType": {
+            "params": {
+                "media": {"disableImageZooming": False},
+                "correct": "true" if correct else "false",
+                "behaviour": {
+                    "enableRetry": True, "enableSolutionsButton": True,
+                    "enableCheckButton": True, "confirmCheckDialog": False,
+                    "confirmRetryDialog": False, "autoCheck": False,
+                },
+                "l10n": {
+                    "trueText": "True", "falseText": "False",
+                    "score": "You got @score of @total points",
+                    "checkAnswer": "Check", "showSolutionButton": "Show solution",
+                    "tryAgain": "Retry", "wrongAnswerMessage": "Wrong answer",
+                    "correctAnswerMessage": "Correct answer",
+                    "scoreBarLabel": "You got :num out of :total points",
+                },
+                "confirmCheck": {"header": "Finish ?", "body": "Are you sure?",
+                                 "cancelLabel": "Cancel", "confirmLabel": "Finish"},
+                "confirmRetry": {"header": "Retry ?", "body": "Are you sure?",
+                                 "cancelLabel": "Cancel", "confirmLabel": "Confirm"},
+                "question": f"<p>{statement}</p>\n",
+            },
+            "library": "H5P.TrueFalse 1.8",
+            "metadata": {"contentType": "True/False Question", "license": "U", "title": "True/False"},
+            "subContentId": str(uuid.uuid4()),
+        }
+    }
+ 
+ 
+def _build_gm_dragtext(sentence, missing_word):
+    text = sentence
+    if f"*{missing_word}*" not in text:
+        text = text.replace("___", f"*{missing_word}*", 1)
+    if f"*{missing_word}*" not in text:
+        text = text.replace(missing_word, f"*{missing_word}*", 1)
+    if f"*{missing_word}*" not in text:
+        text += f" *{missing_word}*"
+    return {
+        "contentType": {
+            "params": {
+                "media": {"disableImageZooming": False},
+                "taskDescription": "<p>Drag the correct word into the blank.</p>\n",
+                "overallFeedback": [{"from": 0, "to": 100}],
+                "checkAnswer": "Check", "submitAnswer": "Submit",
+                "tryAgain": "Retry", "showSolution": "Show solution",
+                "dropZoneIndex": "Drop Zone @index.",
+                "empty": "Drop Zone @index is empty.",
+                "contains": "Drop Zone @index contains draggable @draggable.",
+                "ariaDraggableIndex": "@index of @count draggables.",
+                "tipLabel": "Show tip", "correctText": "Correct!",
+                "incorrectText": "Incorrect!", "resetDropTitle": "Reset drop",
+                "resetDropDescription": "Are you sure you want to reset this drop zone?",
+                "grabbed": "Draggable is grabbed.",
+                "cancelledDragging": "Cancelled dragging.",
+                "correctAnswer": "Correct answer:", "feedbackHeader": "Feedback",
+                "behaviour": {"enableRetry": True, "enableSolutionsButton": True,
+                              "enableCheckButton": True, "instantFeedback": False},
+                "scoreBarLabel": "You got :num out of :total points",
+                "a11yCheck": "Check the answers.",
+                "a11yShowSolution": "Show the solution.",
+                "a11yRetry": "Retry the task.",
+                "textField": text,
+            },
+            "library": "H5P.DragText 1.10",
+            "metadata": {"contentType": "Drag the Words", "license": "U", "title": "Drag the Words"},
+            "subContentId": str(uuid.uuid4()),
+        }
+    }
+ 
+ 
+def _build_gm_blanks(sentence, answer):
+    text = sentence
+    if f"*{answer}*" not in text:
+        text = text.replace("___", f"*{answer}*", 1)
+    if f"*{answer}*" not in text:
+        text = text.replace(answer, f"*{answer}*", 1)
+    if f"*{answer}*" not in text:
+        text += f" *{answer}*"
+    return {
+        "contentType": {
+            "params": {
+                "media": {"disableImageZooming": False},
+                "text": "<p>Fill in the missing word.</p>\n",
+                "overallFeedback": [{"from": 0, "to": 100}],
+                "showSolutions": "Show solution", "tryAgain": "Retry",
+                "checkAnswer": "Check", "submitAnswer": "Submit",
+                "notFilledOut": "Please fill in all blanks to view the solution",
+                "answerIsCorrect": "':ans' is correct",
+                "answerIsWrong": "':ans' is wrong",
+                "answeredCorrectly": "Answered correctly",
+                "answeredIncorrectly": "Answered incorrectly",
+                "solutionLabel": "Correct answer:",
+                "inputLabel": "Blank input @num of @total",
+                "inputHasTipLabel": "Tip available", "tipLabel": "Tip",
+                "behaviour": {
+                    "enableRetry": True, "enableSolutionsButton": True,
+                    "enableCheckButton": True, "autoCheck": False,
+                    "caseSensitive": False, "showSolutionsRequiresInput": True,
+                    "separateLines": False, "confirmCheckDialog": False,
+                    "confirmRetryDialog": False, "acceptSpellingErrors": False,
+                },
+                "scoreBarLabel": "You got :num out of :total points",
+                "a11yCheck": "Check the answers.",
+                "a11yShowSolution": "Show the solution.",
+                "a11yRetry": "Retry the task.",
+                "questions": [f"<p>{text}</p>"],
+            },
+            "library": "H5P.Blanks 1.14",
+            "metadata": {"contentType": "Fill in the Blanks", "license": "U",
+                         "title": "Fill in the Blanks"},
+            "subContentId": str(uuid.uuid4()),
+        }
+    }
+ 
+ 
+def _build_gm_element(stage_id, label, x, y, neighbors, is_start, content_block):
+    """Build one Game Map element (stage point on the map)."""
+    return {
+        "id": stage_id,
+        "label": label,
+        "telemetry": {
+            "x": str(x), "y": str(y),
+            "width": "4.375", "height": "7.556179377807371",
+        },
+        "neighbors": neighbors,
+        "type": "stage",
+        "canBeStartStage": is_start,
+        "time": {},
+        "accessRestrictions": {
+            "allOrAnyRestrictionSet": "all",
+            "restrictionSetList": [{
+                "allOrAnyRestriction": "any",
+                "restrictionList": [{"restrictionType": "totalScore"}],
+            }],
+        },
+        "specialStageExtraLives": 1,
+        "specialStageExtraTime": 1,
+        "contentsList": [content_block],
+    }
+ 
+ 
+def update_game_map_template(work_dir, title, stages, bg_image_bytes, bg_image_name):
+    """Populate a Game Map H5P template with stages and custom background.
+ 
+    Creates sequential stages connected by dotted paths on the background image.
+    Each stage is either a reading info-point or an interactive quiz.
+ 
+    Args:
+        work_dir:        Extracted H5P template directory.
+        title:           Activity headline.
+        stages:          List of stage dicts from call_llm_game_map_stages().
+        bg_image_bytes:  Raw bytes of the background image.
+        bg_image_name:   Original filename for extension detection.
+ 
+    Returns:
+        qa_items list for the QA evidence report.
+    """
+    update_h5p_title(work_dir, title)
+    content = _load_json(work_dir, "content/content.json")
+ 
+    # ── Clean out old images ────────────────────────────────────────────
+    images_dir = os.path.join(work_dir, "content", "images")
+    if os.path.isdir(images_dir):
+        shutil.rmtree(images_dir)
+    os.makedirs(images_dir, exist_ok=True)
+ 
+    # ── Save background image ───────────────────────────────────────────
+    ext = bg_image_name.rsplit(".", 1)[-1].lower() if "." in bg_image_name else "png"
+    _mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+             "webp": "image/webp", "gif": "image/gif"}
+    bg_mime = _mime.get(ext, "image/png")
+    bg_fname = f"backgroundImage.{ext}"
+    bg_rel = f"images/{bg_fname}"
+    with open(os.path.join(images_dir, bg_fname), "wb") as f:
+        f.write(bg_image_bytes)
+ 
+    bg_w, bg_h = 3000, 1737
+    try:
+        from PIL import Image as _PILImage
+        import io as _io
+        _pil = _PILImage.open(_io.BytesIO(bg_image_bytes))
+        bg_w, bg_h = _pil.size
+    except Exception:
+        pass
+ 
+    # ── Build elements ──────────────────────────────────────────────────
+    n = len(stages)
+    positions = _generate_stage_positions(n)
+    elements = []
+    qa_items = []
+ 
+    for i, stage in enumerate(stages):
+        label = (stage.get("label") or f"Stage {i+1}").strip()
+        stype = (stage.get("type") or "reading").strip().lower()
+        cd = stage.get("content") or {}
+        ev = stage.get("evidence") or {}
+        x, y = positions[i] if i < len(positions) else (50.0, 50.0)
+ 
+        neighbors = []
+        if i > 0:
+            neighbors.append(str(i - 1))
+        if i < n - 1:
+            neighbors.append(str(i + 1))
+ 
+        if stype == "reading":
+            body = (cd.get("body_html") or f"<p>{label}</p>").strip()
+            cb = _build_gm_reading(body)
+            qa_items.append({"label": f"Stage {i+1}: {label} (Reading)",
+                             "content": re.sub(r"<[^>]+>", "", body)[:400],
+                             "expected": "", "evidence": ev})
+ 
+        elif stype == "multichoice":
+            q = (cd.get("question") or "").strip()
+            opts = cd.get("options") or []
+            ci = int(cd.get("correctIndex", 0) or 0)
+            if q and len(opts) >= 2:
+                ci = max(0, min(ci, len(opts) - 1))
+                cb = _build_gm_multichoice(q, opts, ci)
+                qa_items.append({"label": f"Stage {i+1}: {label} (MC)", "content": q,
+                                 "expected": opts[ci], "evidence": ev})
+            else:
+                cb = _build_gm_reading(f"<p>{q or label}</p>")
+                qa_items.append({"label": f"Stage {i+1}: {label}", "content": q,
+                                 "expected": "", "evidence": ev})
+ 
+        elif stype == "truefalse":
+            stmt = (cd.get("statement") or "").strip()
+            ans = cd.get("correctAnswer", True)
+            if isinstance(ans, str):
+                ans = ans.lower() in ("true", "yes", "1")
+            if stmt:
+                cb = _build_gm_truefalse(stmt, ans)
+                qa_items.append({"label": f"Stage {i+1}: {label} (T/F)", "content": stmt,
+                                 "expected": str(ans), "evidence": ev})
+            else:
+                cb = _build_gm_reading(f"<p>{label}</p>")
+                qa_items.append({"label": f"Stage {i+1}: {label}", "content": "",
+                                 "expected": "", "evidence": ev})
+ 
+        elif stype == "dragtext":
+            sent = (cd.get("sentence") or "").strip()
+            mw = (cd.get("missing_word") or "").strip()
+            if sent and mw:
+                cb = _build_gm_dragtext(sent, mw)
+                qa_items.append({"label": f"Stage {i+1}: {label} (Drag)", "content": sent,
+                                 "expected": mw, "evidence": ev})
+            else:
+                cb = _build_gm_reading(f"<p>{sent or label}</p>")
+                qa_items.append({"label": f"Stage {i+1}: {label}", "content": sent,
+                                 "expected": "", "evidence": ev})
+ 
+        elif stype == "blanks":
+            sent = (cd.get("sentence") or "").strip()
+            ans = (cd.get("answer") or "").strip()
+            if sent and ans:
+                cb = _build_gm_blanks(sent, ans)
+                qa_items.append({"label": f"Stage {i+1}: {label} (Blanks)", "content": sent,
+                                 "expected": ans, "evidence": ev})
+            else:
+                cb = _build_gm_reading(f"<p>{sent or label}</p>")
+                qa_items.append({"label": f"Stage {i+1}: {label}", "content": sent,
+                                 "expected": "", "evidence": ev})
+        else:
+            body = (cd.get("body_html") or f"<p>{label}</p>").strip()
+            cb = _build_gm_reading(body)
+            qa_items.append({"label": f"Stage {i+1}: {label}", "content": label,
+                             "expected": "", "evidence": ev})
+ 
+        elements.append(_build_gm_element(
+            stage_id=str(uuid.uuid4()), label=label, x=x, y=y,
+            neighbors=neighbors, is_start=(i == 0), content_block=cb,
+        ))
+ 
+    # ── Assemble content.json ───────────────────────────────────────────
+    content["headline"] = title
+    content["showTitleScreen"] = False
+    content["gamemapSteps"] = {
+        "backgroundImageSettings": {
+            "backgroundImage": {
+                "path": bg_rel, "mime": bg_mime,
+                "copyright": {"license": "U"},
+                "width": bg_w, "height": bg_h,
+            }
+        },
+        "gamemap": {"elements": elements},
+    }
+ 
+    # Preserve or set defaults for visual/behaviour/l10n
+    content.setdefault("visual", {
+        "stages": {"colorStage": "rgba(0, 75, 252, 0.7)",
+                   "colorStageLocked": "rgba(153, 0, 0, 0.7)",
+                   "colorStageCleared": "rgba(0, 130, 0, 0.7)"},
+        "paths": {"displayPaths": True, "style": {
+            "colorPath": "rgba(0, 0, 0, 0.7)",
+            "colorPathCleared": "rgba(0, 130, 0, 0.7)",
+            "pathWidth": "0.2", "pathStyle": "dotted"}},
+        "misc": {"useAnimation": True},
+    })
+    content.setdefault("behaviour", {
+        "enableRetry": True, "enableSolutionsButton": True,
+        "map": {"showLabels": True, "roaming": "complete", "fog": "all"},
+    })
+    content.setdefault("endScreen", {
+        "noSuccess": {"endScreenTextNoSuccess": "<p></p>"},
+        "success": {"endScreenTextSuccess": "<p></p>"},
+        "overallFeedback": [{"from": 0, "to": 100}],
+    })
+    content.setdefault("l10n", {
+        "start": "Start", "continue": "Continue", "restart": "Restart",
+        "showSolutions": "Show solutions",
+        "completedMap": "You have completed the map!",
+        "fullScoreButnoLivesLeft": "Full score but no lives left!",
+        "confirmFinishHeader": "Finish map?",
+        "confirmFinishDialog": "If you finish now, you cannot explore further.",
+        "confirmFinishDialogSubmission": "Your score will be submitted.",
+        "confirmFinishDialogQuestion": "Do you really want to finish?",
+        "cancel": "Cancel", "confirm": "Confirm",
+    })
+    content.setdefault("a11y", {
+        "buttonFinish": "Finish the map",
+        "buttonAudioActive": "Mute audio.",
+        "buttonAudioInactive": "Unmute audio.",
+        "close": "Close",
+        "yourResult": "You got @score out of @total points",
+        "mapWasOpened": "The map was opened.",
+        "mapSolutionsWasOpened": "Solutions mode opened.",
+        "startScreenWasOpened": "Title screen opened.",
+        "endScreenWasOpened": "End screen opened.",
+        "exerciseLabel": ". Exercise for @stagelabel",
+    })
+ 
+    _save_json(work_dir, "content/content.json", content)
+ 
+    # ── Update h5p.json dependencies ────────────────────────────────────
+    h5p_path = os.path.join(work_dir, "h5p.json")
+    h5p_meta = json.loads(open(h5p_path, "r", encoding="utf-8").read())
+    required = [
+        {"machineName": "H5P.GameMap", "majorVersion": 1, "minorVersion": 5},
+        {"machineName": "H5P.AdvancedText", "majorVersion": 1, "minorVersion": 1},
+        {"machineName": "H5P.MultiChoice", "majorVersion": 1, "minorVersion": 16},
+        {"machineName": "H5P.TrueFalse", "majorVersion": 1, "minorVersion": 8},
+        {"machineName": "H5P.DragText", "majorVersion": 1, "minorVersion": 10},
+        {"machineName": "H5P.Blanks", "majorVersion": 1, "minorVersion": 14},
+    ]
+    existing = h5p_meta.get("preloadedDependencies") or []
+    names = {d.get("machineName") for d in existing}
+    for dep in required:
+        if dep["machineName"] not in names:
+            existing.append(dep)
+    h5p_meta["preloadedDependencies"] = existing
+    with open(h5p_path, "w", encoding="utf-8") as f:
+        json.dump(h5p_meta, f, ensure_ascii=False, indent=2)
+ 
+    return qa_items
+
+def update_summary_template(work_dir: str, title: str, groups: List[Dict[str, Any]], overall_feedback: Optional[List[Dict[str, Any]]] = None, introduction: Optional[str] = None) -> None:
+    update_h5p_title(work_dir, title)
+    content = _load_json(work_dir, "content/content.json")
+
+    # ── Force-set introduction text ("intro" is the key H5P Summary uses) ──
+    intro_text = (introduction or "").strip()
+    if intro_text:
+        intro_html = intro_text if intro_text.startswith("<") else f"<p>{intro_text}</p>"
+        content["intro"] = intro_html
+
+    # ── Force-set overall feedback ──────────────────────────────────────
+    if overall_feedback:
+        content["overallFeedback"] = overall_feedback
+        deep_find_set_all(content, ["overallFeedback"], overall_feedback)
+
+    # H5P Summary expects each group's "summary" to be a list of strings.
+    # The FIRST string is the correct answer; the rest are incorrect options.
+    summary_objs = []
+    for grp in groups:
+        correct = (grp.get("correct_statement") or "").strip()
+        incorrects = grp.get("incorrect_statements") or []
+        incorrects = [(s or "").strip() for s in incorrects if (s or "").strip()]
+        if not correct:
+            continue
+        statements = [correct] + incorrects
+        summary_objs.append({
+            "subContentId": random_subcontent_id(),
+            "tip": (grp.get("tip") or "").strip(),
+            "summary": statements,
+        })
+
+    if not summary_objs:
+        raise ValueError("No valid summary groups were generated.")
+
+    if not deep_find_set_first(content, ["summaries", "summary", "items"], summary_objs):
+        found = deep_find_first_key(content, ["summaries", "summary", "items"])
+        raise KeyError(f"Template missing summaries/items field. Nearest match: {found}")
+
+    _save_json(work_dir, "content/content.json", content)
 
 def _cornell_mime(url: str) -> str:
     u = (url or "").lower()
@@ -3492,6 +5197,179 @@ def _cornell_mime(url: str) -> str:
         return "video/Vimeo"
     return "video/YouTube"
 
+def update_information_wall_template(
+    work_dir,
+    title,
+    header,
+    properties,
+    panels,
+    course="",
+    pdf_headings=None,
+    pdf_keywords=None,
+):
+    """Populate an H5P Information Wall template with content and images.
+ 
+    Critical H5P.InfoWall requirements:
+    - propertiesGroup.properties defines the column labels
+    - Each panel MUST have an H5P.Image sub-content object (NOT null!)
+    - Each panel's entries array MUST have exactly len(properties) items
+    - Each entry is an HTML string ending with newline
+    """
+    pdf_headings = pdf_headings or []
+    pdf_keywords = pdf_keywords or []
+ 
+    update_h5p_title(work_dir, title)
+    content = _load_json(work_dir, "content/content.json")
+ 
+    images_dir = os.path.join(work_dir, "content", "images")
+    os.makedirs(images_dir, exist_ok=True)
+ 
+    # ── Build propertiesGroup ──────────────────────────────────────────
+    n_props = len(properties)
+    if n_props < 1:
+        raise ValueError("Information Wall requires at least 1 property.")
+ 
+    new_properties = []
+    for prop in properties:
+        new_properties.append({
+            "label": prop.get("label", "Info"),
+            "showLabel": prop.get("showLabel", False),
+            "searchInProperty": prop.get("searchInProperty", True),
+            "styling": {
+                "bold": prop.get("bold", False),
+                "italic": False,
+            },
+        })
+ 
+    # Navigate to the infoWall object
+    info_wall = content.get("infoWall")
+    if not isinstance(info_wall, dict):
+        content["infoWall"] = {
+            "propertiesGroup": {"properties": []},
+            "panels": [],
+            "behaviour": {
+                "useFallbackImage": False,
+                "imageWidth": 150,
+                "imageHeight": 150,
+                "alternateBackground": True,
+                "offerFilterField": True,
+                "modeFilterField": "and",
+            },
+            "l10n": {
+                "noEntriesError": "The author did not enter anything.",
+                "noMatchesForFilter": "There are no matches for @query.",
+                "enterToFilter": "Enter a query to filter the content for relevant entries.",
+                "listChanged": "List changed. Showing @visible of @total items.",
+            },
+        }
+        info_wall = content["infoWall"]
+ 
+    # Update properties
+    info_wall.setdefault("propertiesGroup", {})["properties"] = new_properties
+    # Update header
+    info_wall["header"] = header or title
+ 
+    # ── Remove old template images ─────────────────────────────────────
+    for old_img in os.listdir(images_dir):
+        old_path = os.path.join(images_dir, old_img)
+        if os.path.isfile(old_path):
+            os.remove(old_path)
+ 
+    # ── Build panels with images ───────────────────────────────────────
+    new_panels = []
+    qa_items = []
+ 
+    for i, panel in enumerate(panels, start=1):
+        panel_title = (panel.get("panelTitle") or f"Panel {i}").strip()
+        entries = panel.get("entries") or []
+        keywords = (panel.get("keywords") or "").strip()
+        img_query = (panel.get("image_query") or "").strip()
+        img_alt = (panel.get("image_alt") or panel_title).strip()
+        ev = panel.get("evidence") or {}
+ 
+        # ── Pad/trim entries to match properties count exactly ──────
+        while len(entries) < n_props:
+            entries.append("<p>&nbsp;</p>")
+        entries = entries[:n_props]
+ 
+        # ── Clean each entry as proper HTML ─────────────────────────
+        clean_entries = []
+        for entry in entries:
+            entry = (entry or "").strip()
+            if not entry:
+                entry = "<p>&nbsp;</p>"
+            if not entry.startswith("<"):
+                entry = f"<p>{entry}</p>"
+            if not entry.endswith("\n"):
+                entry = entry + "\n"
+            clean_entries.append(entry)
+ 
+        # ── Download image for this panel ───────────────────────────
+        context_for_img = f"{panel_title} {' '.join(entries)}"
+        context_for_img = re.sub(r"<[^>]+>", " ", context_for_img).strip()
+ 
+        queries = build_image_queries(
+            course=course,
+            pdf_headings=pdf_headings,
+            pdf_keywords=pdf_keywords,
+            context_text=context_for_img,
+            llm_image_query=img_query,
+        )
+        fallback = build_fallback_query(course, pdf_headings)
+        dl = ensure_image(
+            images_dir,
+            queries=queries,
+            stem=f"infowall_panel_{i}",
+            fallback_query=fallback,
+            prefer_vectors=True,
+        )
+ 
+        # ── Build H5P.Image sub-content (REQUIRED — NOT null) ──────
+        image_obj = {
+            "params": {
+                "decorative": False,
+                "contentName": "Image",
+                "file": {
+                    "path": dl["path"],
+                    "mime": dl["mime"],
+                    "copyright": {"license": "U"},
+                },
+                "alt": img_alt,
+            },
+            "library": "H5P.Image 1.1",
+            "subContentId": str(uuid.uuid4()),
+            "metadata": {
+                "contentType": "Image",
+                "license": "U",
+                "title": panel_title,
+            },
+        }
+ 
+        # ── Assemble panel object ───────────────────────────────────
+        panel_obj = {
+            "image": image_obj,
+            "panelTitle": panel_title,
+            "entries": clean_entries,
+        }
+        if keywords:
+            panel_obj["keywords"] = keywords
+ 
+        new_panels.append(panel_obj)
+ 
+        # QA tracking
+        qa_items.append({
+            "label": panel_title,
+            "content": re.sub(r"<[^>]+>", "", " ".join(clean_entries))[:500],
+            "expected": "",
+            "evidence": ev,
+        })
+ 
+    if not new_panels:
+        raise ValueError("No Information Wall panels were generated.")
+ 
+    info_wall["panels"] = new_panels
+    _save_json(work_dir, "content/content.json", content)
+    return qa_items
 
 def _normalise_video_url(url: str) -> str:
     """Strip /video/ from Vimeo URLs so H5P recognises them.
@@ -3629,40 +5507,6 @@ def update_cornell_notes_template(
     _save_json(work_dir, "content/content.json", content)
     return content
 
-
-def update_summary_template(work_dir: str, title: str, description: str, groups: List[Dict[str, Any]]) -> None:
-    update_h5p_title(work_dir, title)
-    content = _load_json(work_dir, "content/content.json")
-    deep_find_set_first(content, ["taskDescription", "introduction", "description", "instructions"], description)
-
-    # H5P Summary expects each group's "summary" to be a list of strings.
-    # The FIRST string is the correct answer; the rest are incorrect options.
-    summary_objs = []
-    for grp in groups:
-        correct = (grp.get("correct_statement") or "").strip()
-        incorrects = grp.get("incorrect_statements") or []
-        # Ensure we have strings
-        incorrects = [(s or "").strip() for s in incorrects if (s or "").strip()]
-        if not correct:
-            continue
-        # Build the statement list: correct first, then incorrects
-        statements = [correct] + incorrects
-        summary_objs.append({
-            "subContentId": random_subcontent_id(),
-            "tip": (grp.get("tip") or "").strip(),
-            "summary": statements,
-        })
-
-    if not summary_objs:
-        raise ValueError("No valid summary groups were generated.")
-
-    if not deep_find_set_first(content, ["summaries", "summary", "items"], summary_objs):
-        found = deep_find_first_key(content, ["summaries", "summary", "items"])
-        raise KeyError(f"Template missing summaries/items field. Nearest match: {found}")
-
-    _save_json(work_dir, "content/content.json", content)
-
-
 def build_question_set_truefalse(work_dir: str, title: str, description: str, tf_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
@@ -3716,6 +5560,133 @@ def build_question_set_truefalse(work_dir: str, title: str, description: str, tf
         qa.append({"label": f"Q{i}", "content": f"{it.get('statement','')} (answer: {it.get('correctAnswer')})", "evidence": it.get("evidence", {})})
     return qa
 
+def update_virtual_tour_template(
+    work_dir,
+    title,
+    image_bytes,
+    image_name,
+    hotspots=None,
+):
+    """Build a clean Virtual Tour (360) with a single scene and LLM-generated interactions.
+ 
+    Args:
+        work_dir:     Extracted H5P template directory.
+        title:        Activity title.
+        image_bytes:  Raw bytes of the 360° image.
+        image_name:   Original filename (used to determine extension).
+        hotspots:     List of dicts with 'label' and 'body_html' keys (from LLM).
+                      Each becomes a clickable text-popup interaction on the 360 scene.
+ 
+    Returns:
+        qa_items list for the QA evidence report.
+    """
+    hotspots = hotspots or []
+ 
+    update_h5p_title(work_dir, title)
+ 
+    # ── Determine file extension and MIME type ────────────────────────────
+    ext = image_name.rsplit(".", 1)[-1].lower() if "." in image_name else "jpg"
+    mime = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
+ 
+    # ── Clean out ALL old template images ─────────────────────────────────
+    images_dir = os.path.join(work_dir, "content", "images")
+    if os.path.isdir(images_dir):
+        shutil.rmtree(images_dir)
+    os.makedirs(images_dir, exist_ok=True)
+ 
+    # ── Save the user's 360 image ─────────────────────────────────────────
+    fname = f"scene360.{ext}"
+    rel_path = f"images/{fname}"
+    abs_path = os.path.join(images_dir, fname)
+ 
+    with open(abs_path, "wb") as f:
+        f.write(image_bytes)
+ 
+    # ── Build interactions from hotspots ───────────────────────────────────
+    # 360 scene positions use "yaw,pitch" in radians.
+    # Distribute hotspots evenly around the horizontal (yaw) axis,
+    # with slight vertical variation to avoid a flat line.
+    interactions = []
+    n = len(hotspots)
+ 
+    for i, hs in enumerate(hotspots):
+        label = (hs.get("label") or f"Info {i+1}").strip()
+        body = (hs.get("body_html") or "").strip()
+        if not body:
+            body = f"<p>{label}</p>"
+ 
+        # Distribute yaw evenly across full circle (-π to π)
+        yaw = -_math.pi + (2 * _math.pi * i / max(n, 1))
+        # Slight pitch variation so hotspots aren't all on the equator
+        pitch = 0.15 * ((-1) ** i) * ((i % 3) + 1) / 3.0
+ 
+        interactions.append({
+            "interactionpos": f"{yaw},{pitch}",
+            "action": {
+                "library": "H5P.AdvancedText 1.1",
+                "params": {
+                    "text": f"<h3>{label}</h3>\n{body}",
+                },
+                "subContentId": str(uuid.uuid4()),
+                "metadata": {
+                    "contentType": "Text",
+                    "license": "U",
+                    "title": label,
+                },
+            },
+        })
+ 
+    # ── Build a completely fresh content.json ──────────────────────────────
+    content = {
+        "threeImage": {
+            "scenes": [
+                {
+                    "sceneId": 0,
+                    "sceneType": "360",
+                    "showBackButton": False,
+                    "scenesrc": {
+                        "path": rel_path,
+                        "mime": mime,
+                        "copyright": {"license": "U"},
+                    },
+                    "scenename": title,
+                    "scenedescription": "",
+                    "cameraStartPosition": "0,0",
+                    "interactions": interactions,
+                }
+            ],
+            "startSceneId": 0,
+        },
+        "behaviour": {
+            "sceneRenderingQuality": "high",
+            "label": {
+                "showLabel": True,
+                "labelPosition": "right",
+            },
+        },
+    }
+ 
+    _save_json(work_dir, "content/content.json", content)
+ 
+    # ── Build QA items ────────────────────────────────────────────────────
+    qa_items = [{
+        "label": "360 Scene",
+        "content": f"Single 360° scene: {title} ({rel_path})",
+        "evidence": {},
+    }]
+ 
+    for i, hs in enumerate(hotspots, start=1):
+        ev = hs.get("evidence") or {}
+        label = (hs.get("label") or f"Hotspot {i}").strip()
+        body_plain = re.sub(r"<[^>]+>", "", hs.get("body_html") or "")
+        qa_items.append({
+            "label": f"Hotspot {i}: {label}",
+            "content": body_plain[:400],
+            "expected": "",
+            "evidence": ev,
+        })
+ 
+    return qa_items
 
 def write_qa_report_html(path: str, title: str, activity_type: str, qa_items: List[Dict[str, Any]]) -> None:
     def esc(s: str) -> str:
@@ -4001,7 +5972,7 @@ if st.session_state["suggestions"]:
     st.markdown("---")
     st.markdown("### Choose one suggested type")
 
-    other_label = "Other (choose from templates)"
+    other_label = "Other (choose from all types)"
 
     # Make a compact radio list with template availability (plus an "Other" option)
     options: List[str] = []
@@ -4154,6 +6125,126 @@ if st.session_state["suggestions"]:
         ib_activity_types = []
         ib_n_questions = 0
 
+    elif chosen["type"] == "Virtual Tour (360)":
+        st.markdown("#### Virtual Tour — 360° Panoramic Image")
+        st.info(
+            "**⚠️ This activity requires a 360° equirectangular panoramic image.**\\n\\n"
+            "A 360° image is a special wide photograph (typically **2:1 aspect ratio**, "
+            "e.g. 4096×2048 or 8192×4096) that wraps around the viewer to create an "
+            "immersive experience.\\n\\n"
+            "**Do NOT upload a regular photo** — it will appear stretched and distorted.\\n\\n"
+            "**How to get a 360° image:**\\n"
+            "- Use a **360° camera** (e.g. Insta360, Ricoh Theta, GoPro MAX)\\n"
+            "- Use a **phone app** that stitches panoramas (e.g. Google Street View app)\\n"
+            "- Download from a **360° image library** (e.g. Poly Haven, Flickr 360° group)\\n"
+            "- Export equirectangular images from **Google Street View**"
+        )
+        vt_360_file = st.file_uploader(
+            "Upload 360° panoramic image *",
+            type=["jpg", "jpeg", "png", "webp"],
+            help="Must be an equirectangular 360° panoramic image (2:1 aspect ratio recommended).",
+        )
+        if vt_360_file is not None:
+            try:
+                from PIL import Image as _PILImage
+                import io as _io
+                _pil = _PILImage.open(_io.BytesIO(vt_360_file.getvalue()))
+                _w, _h = _pil.size
+                _ratio = _w / _h if _h > 0 else 0
+                st.image(
+                    vt_360_file.getvalue(),
+                    caption=f"Preview — {_w}×{_h}px (ratio {_ratio:.2f}:1)",
+                    use_container_width=True,
+                )
+                if abs(_ratio - 2.0) > 0.3:
+                    st.warning(
+                        f"⚠️ This image has a **{_ratio:.2f}:1** aspect ratio. "
+                        f"360° panoramic images should be **2:1** (e.g. 4096×2048). "
+                        f"If this is not a 360° image, it will appear stretched/distorted."
+                    )
+                else:
+                    st.success(
+                        f"✅ Looks like a valid 360° panorama ({_w}×{_h}px, {_ratio:.1f}:1 ratio)."
+                    )
+            except ImportError:
+                st.caption("Install Pillow (`pip install Pillow`) for image preview & validation.")
+            except Exception:
+                st.caption("Could not preview image.")
+ 
+        vt_n_hotspots = st.number_input(
+            "Number of info hotspots",
+            min_value=2,
+            max_value=8,
+            value=4,
+            step=1,
+            help="Clickable points on the 360° image that show informational text from the PDF.",
+        )
+        st.caption(f"Will generate **{int(vt_n_hotspots)} clickable hotspots** with content from the uploaded PDFs.")
+ 
+        n_items = 1
+        cp_n_slides = None
+        cp_activity_types = []
+        cp_n_questions = 0
+        ib_n_pages = None
+        ib_activity_types = []
+        ib_n_questions = 0  
+
+    elif chosen["type"] == "Game Map":
+         st.markdown("#### Game Map — Background Image")
+         st.info(
+             "**Upload a background image** for your Game Map.\\n\\n"
+             "This can be any image — a map, floor plan, diagram, infographic, "
+             "or illustrated scene. Interactive stages (reading + quiz points) "
+             "will be placed as clickable dots across this image.\\n\\n"
+             "**Tips for good background images:**\\n"
+             "- Use a wide image (landscape, e.g. 3000×1700px)\\n"
+             "- Illustrated maps, floor plans, or diagrams work best\\n"
+             "- Avoid images with too much small text"
+         )
+         gm_bg_file = st.file_uploader(
+             "Upload background image *",
+             type=["jpg", "jpeg", "png", "webp"],
+             help="The background image on which game stages will be placed.",
+             key="gm_bg_upload",
+         )
+         if gm_bg_file is not None:
+             try:
+                 from PIL import Image as _PILImage
+                 import io as _io
+                 _pil = _PILImage.open(_io.BytesIO(gm_bg_file.getvalue()))
+                 _w, _h = _pil.size
+                 st.image(gm_bg_file.getvalue(),
+                          caption=f"Preview — {_w}×{_h}px",
+                          use_container_width=True)
+                 if _w < 1000:
+                     st.warning("Image width is below 1000px. A wider image (2000px+) produces better results.")
+             except ImportError:
+                 st.caption("Install Pillow for image preview.")
+             except Exception:
+                 st.caption("Could not preview image.")
+
+         gm_n_stages = st.number_input(
+             "Number of stages (points on the map)",
+             min_value=4,
+             max_value=12,
+             value=6,
+             step=2,
+             help="Total interactive points. Alternates reading and quiz stages. Even numbers recommended.",
+         )
+         st.caption(
+             f"Will generate **{int(gm_n_stages)} stages**: "
+             f"{int(gm_n_stages) // 2} reading + {int(gm_n_stages) - int(gm_n_stages) // 2} quiz stages "
+             f"(Multiple Choice, True/False, Drag the Words, Fill in the Blanks)"
+         )
+
+         n_items = gm_n_stages
+         cp_n_slides = None
+         cp_activity_types = []
+         cp_n_questions = 0
+         ib_n_pages = None
+         ib_activity_types = []
+         ib_n_questions = 0    
+
     # --- Interactive Book specific options ---
     elif chosen["type"] == "Interactive Book":
         # Page-count limits: 1 PDF → max 8 total (7 content + 1 activity)
@@ -4210,8 +6301,15 @@ if st.session_state["suggestions"]:
         ib_n_questions = 0
 
         # ── ESSAY: always 1 question, no number input needed ──
+        # ── ESSAY: always 1 question, no number input needed ──
         if chosen["type"] == "Essay":
             n_items = 1
+            st.info("Essay generates a single question/instruction for the learner to respond to. All content is taken directly from the uploaded PDF(s).")
+
+        # ── PAGE: fixed layout, no number input needed ──
+        elif chosen["type"] == "Page":
+            n_items = 3
+            st.info("Page generates content sections with images and a short True/False quiz from the uploaded PDF(s).")
             st.info("Essay generates a single question/instruction for the learner to respond to. All content is taken directly from the uploaded PDF(s).")
 
         # Enforce question limits for selected types
@@ -4371,10 +6469,45 @@ if st.session_state["suggestions"]:
                 elif typ == "Page":
                     work_dir = os.path.join(tmp, "_work_page")
                     unzip_h5p(templates["Page"], work_dir)
-
-                    gen_data = call_llm_page_content(chunks, n_sections=min(6, max(3, run_n // 2)), course=enriched_course)
-                    _gen_bar.progress(65, text="AI content generated — building template...")
+ 
+                    # Step 1: Generate content sections (3-4 sections)
+                    _gen_bar.progress(25, text="Generating page content from PDFs...")
+                    gen_data = call_llm_page_content(chunks, n_sections=4, course=enriched_course)
+ 
+                    # Step 2: Generate 1 True/False question
+                    _gen_bar.progress(40, text="Generating True/False question...")
+                    tf_data = call_llm_truefalse_statements(chunks, 1, enriched_course)
+ 
+                    # Step 3: Generate 1 Drag the Words question
+                    _gen_bar.progress(50, text="Generating Drag the Words question...")
+                    dw_data = call_llm_drag_words(chunks, 1, enriched_course)
+ 
+                    # Step 4: Generate 1 Multiple Choice question
+                    _gen_bar.progress(60, text="Generating Multiple Choice question...")
+                    mc_data = call_llm_multichoice_questions(chunks, 1, enriched_course)
+ 
+                    _gen_bar.progress(70, text="AI content generated — building template...")
                     title = gen_data.get("title", f"Page - {course_name.strip()}")
+ 
+                    # Build the activities list
+                    page_activities = []
+ 
+                    # True/False
+                    for it in (tf_data.get("items") or [])[:1]:
+                        page_activities.append({
+                            "type": "truefalse",
+                            "data": it,
+                            "evidence": it.get("evidence") or {},
+                        })
+ 
+                    # Multiple Choice
+                    for it in (mc_data.get("items") or [])[:1]:
+                        page_activities.append({
+                            "type": "multichoice",
+                            "data": it,
+                            "evidence": it.get("evidence") or {},
+                        })
+ 
                     qa_items = update_page_template_with_images(
                         work_dir,
                         title,
@@ -4382,11 +6515,12 @@ if st.session_state["suggestions"]:
                         course=course_name.strip(),
                         pdf_headings=st.session_state.get("pdf_headings_cache") or [],
                         pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
+                        activities=page_activities,
                     )
-
+ 
                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
                     zip_dir_to_file(work_dir, out_h5p)
-
+ 
                     out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
                     write_qa_report_html(out_qa, title, typ, qa_items)
 
@@ -4441,6 +6575,120 @@ if st.session_state["suggestions"]:
 
                     out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
                     write_qa_report_html(out_qa, title, typ, qa_items)
+
+                elif typ == "Virtual Tour (360)":
+                    if vt_360_file is None:
+                        raise ValueError("Please upload a 360° panoramic image for Virtual Tour (360).")
+ 
+                    work_dir = os.path.join(tmp, "_work_virtual_tour")
+                    unzip_h5p(templates["Virtual Tour (360)"], work_dir)
+ 
+                    title = f"Virtual Tour - {course_name.strip()}"
+ 
+                    # Generate hotspot interactions from PDF content
+                    _gen_bar.progress(30, text="Generating hotspot content from PDFs...")
+                    hotspot_data = call_llm_virtual_tour_interactions(
+                        chunks,
+                        n_hotspots=int(vt_n_hotspots),
+                        course=enriched_course,
+                    )
+                    hotspots = hotspot_data.get("hotspots") or []
+ 
+                    _gen_bar.progress(65, text=f"Building 360° tour with {len(hotspots)} hotspots...")
+                    qa_items = update_virtual_tour_template(
+                        work_dir,
+                        title,
+                        vt_360_file.getvalue(),
+                        vt_360_file.name,
+                        hotspots=hotspots,
+                    )
+ 
+                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                    zip_dir_to_file(work_dir, out_h5p)
+ 
+                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                    write_qa_report_html(out_qa, title, typ, qa_items)  
+
+
+                elif typ == "Information Wall":
+                    work_dir = os.path.join(tmp, "_work_information_wall")
+                    unzip_h5p(templates["Information Wall"], work_dir)
+ 
+                    _gen_bar.progress(30, text="Generating Information Wall content from PDFs...")
+                    gen_data = call_llm_information_wall(chunks, run_n, enriched_course)
+ 
+                    _gen_bar.progress(65, text="AI content generated — building template with images...")
+                    title = gen_data.get("title", f"Information Wall - {course_name.strip()}")
+                    header = gen_data.get("header", title)
+ 
+                    qa_items = update_information_wall_template(
+                        work_dir,
+                        title=title,
+                        header=header,
+                        properties=gen_data.get("properties", []),
+                        panels=gen_data.get("panels", []),
+                        course=course_name.strip(),
+                        pdf_headings=st.session_state.get("pdf_headings_cache") or [],
+                        pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
+                    )
+ 
+                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                    zip_dir_to_file(work_dir, out_h5p)
+ 
+                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                    write_qa_report_html(out_qa, title, typ, qa_items)  
+
+                elif typ == "Memory Game":
+                     work_dir = os.path.join(tmp, "_work_memory_game")
+                     unzip_h5p(templates["Memory Game"], work_dir)
+
+                     _gen_bar.progress(30, text="Generating Memory Game content from PDFs...")
+                     gen_data = call_llm_memory_game(chunks, run_n, enriched_course)
+
+                     _gen_bar.progress(65, text="AI content generated — downloading images...")
+                     title = gen_data.get("title", f"Memory Game - {course_name.strip()}")
+
+                     qa_items = update_memory_game_template(
+                         work_dir,
+                         title=title,
+                         cards=gen_data.get("cards", []),
+                         course=course_name.strip(),
+                         pdf_headings=st.session_state.get("pdf_headings_cache") or [],
+                         pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
+                     )
+
+                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                     zip_dir_to_file(work_dir, out_h5p)
+
+                     out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                     write_qa_report_html(out_qa, title, typ, qa_items)  
+
+                elif typ == "Game Map":
+                     if gm_bg_file is None:
+                         raise ValueError("Please upload a background image for the Game Map.")
+
+                     work_dir = os.path.join(tmp, "_work_game_map")
+                     unzip_h5p(templates["Game Map"], work_dir)
+
+                     _gen_bar.progress(30, text="Generating Game Map stages from PDFs...")
+                     gen_data = call_llm_game_map_stages(chunks, int(run_n), enriched_course)
+
+                     _gen_bar.progress(65, text="AI content generated — building Game Map template...")
+                     title = gen_data.get("title", f"Game Map - {course_name.strip()}")
+
+                     qa_items = update_game_map_template(
+                         work_dir,
+                         title=title,
+                         stages=gen_data.get("stages", []),
+                         bg_image_bytes=gm_bg_file.getvalue(),
+                         bg_image_name=gm_bg_file.name,
+                     )
+
+                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                     zip_dir_to_file(work_dir, out_h5p)
+
+                     out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                     write_qa_report_html(out_qa, title, typ, qa_items)         
 
                 elif typ == "Interactive Book":
                     work_dir = os.path.join(tmp, "_work_interactive_book")
@@ -4651,12 +6899,18 @@ if st.session_state["suggestions"]:
                     unzip_h5p(templates["Summary"], work_dir)
                     gen_data = call_llm_summary(chunks, run_n, enriched_course)
                     _gen_bar.progress(65, text="AI content generated — building template...")
-                    update_summary_template(work_dir, gen_data["title"], gen_data["description"], gen_data.get("groups", []))
+                    update_summary_template(
+                        work_dir,
+                        gen_data["title"],
+                        gen_data.get("groups", []),
+                        overall_feedback=gen_data.get("overall_feedback"),
+                        introduction=gen_data.get("introduction"),  # <-- NEW: pass introduction
+                    )
                     title = gen_data["title"]
-
+ 
                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
                     zip_dir_to_file(work_dir, out_h5p)
-
+ 
                     qa_items = []
                     for i, grp in enumerate(gen_data.get("groups", []), start=1):
                         correct = grp.get("correct_statement", "")
@@ -4666,7 +6920,7 @@ if st.session_state["suggestions"]:
                             "content": f"Correct: {correct}\nIncorrect: {'; '.join(incorrects)}",
                             "evidence": grp.get("evidence", {}),
                         })
-
+ 
                     out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
                     write_qa_report_html(out_qa, title, typ, qa_items)
 
