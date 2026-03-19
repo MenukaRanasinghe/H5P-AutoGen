@@ -6213,20 +6213,50 @@ def write_qa_report_html(path: str, title: str, activity_type: str, qa_items: Li
 
 # UI (very simple)
 # =========================
-st.set_page_config(page_title="H5P Activity Generator", layout="centered")
+st.set_page_config(page_title="H5P Activity Generator 🪄", page_icon="🪄", layout="centered")
 
 st.markdown(
     """
     <style>
+    /* Main container and text */
+    .stApp {
+        background-color: #f8f9fb;
+    }
+    h2, h3 {
+        color: #2c3e50;
+        font-weight: 700;
+    }
+    .stCaption {
+        color: #7f8c8d;
+    }
+
     /* Primary buttons */
     div.stButton > button, div.stDownloadButton > button, button[kind="primary"] {
         background-color: #4b70fb !important;
         border: 1px solid #4b70fb !important;
         color: white !important;
+        border-radius: 8px !important;
+        padding: 0.5rem 1rem !important;
+        font-weight: 600 !important;
+        transition: all 0.2s ease-in-out !important;
     }
     div.stButton > button:hover, div.stDownloadButton > button:hover, button[kind="primary"]:hover {
-        filter: brightness(0.95);
-        border: 1px solid #4b70fb !important;
+        background-color: #3b5bdb !important;
+        border-color: #3b5bdb !important;
+        transform: translateY(-1px);
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    }
+
+    /* Input fields styling */
+    .stTextInput > div > div > input, .stFileUploader > div > div > button {
+        border-radius: 8px !important;
+    }
+
+    /* Card-like containers */
+    [data-testid="stVerticalBlock"] > div > div > div > div.element-container {
+        background-color: white;
+        padding: 0.1rem;
+        border-radius: 12px;
     }
     </style>
     """,
@@ -6234,1249 +6264,1268 @@ st.markdown(
 )
 
 
-st.markdown("## H5P Activity Generator")
-st.caption("Fill in all required fields (*) → Get suggestions → Select one type → Generate H5P")
+st.markdown("## H5P Activity Generator 🪄")
 
-templates = discover_templates("templates")
+tabs = st.tabs(["🚀 Generator", "📖 Instructions"])
 
-# Keep state keys
-st.session_state.setdefault("pdf_fingerprints", None)
-st.session_state.setdefault("chunks_cache", None)
-st.session_state.setdefault("pdf_bytes_map", None)
-st.session_state.setdefault("pdf_headings_cache", None)
-st.session_state.setdefault("pdf_keywords_cache", None)
-st.session_state.setdefault("suggestions_cache_key", None)
-st.session_state.setdefault("suggestions", None)
-st.session_state.setdefault("busy", False)
-st.session_state.setdefault("qual_spec_text", "")
+with tabs[1]:
+    st.markdown("""
+    ### How to use this tool
+    1. **Upload Content**: Provide one or more PDF files containing the course material.
+    2. **Course Info**: Enter the course and unit names for better context.
+    3. **Qual Spec**: Upload the qualification specification if available.
+    4. **Suggest Types**: Click the suggest button to get AI-powered recommendations.
+    5. **Choose and Generate**: Select an activity type and generate your H5P file!
+    """)
 
-# Persist latest outputs across Streamlit reruns (download buttons remain visible)
-st.session_state.setdefault("last_h5p_bytes", None)
-st.session_state.setdefault("last_h5p_name", None)
-st.session_state.setdefault("last_qa_bytes", None)
-st.session_state.setdefault("last_qa_name", None)
+with tabs[0]:
+    st.caption("Fill in all required fields (*) → Get suggestions → Select one type → Generate H5P")
 
-uploads = st.file_uploader("Upload PDF file(s) *", type=["pdf"], accept_multiple_files=True)
-course_name = st.text_input("Course name *", placeholder="e.g., Level 5 Diploma in ...")
-unit_name = st.text_input("Unit name *", placeholder="e.g., Unit 1: Personal Development")
-qual_spec_file = st.file_uploader("Qualification specification file *", type=["pdf"], accept_multiple_files=False, key="qual_spec")
+    templates = discover_templates("templates")
 
-def compute_inputs_key(files: List[Any], course: str, unit: str = "", qual_file: Any = None) -> str:
-    parts = [course.strip(), unit.strip()]
-    for f in files:
-        b = f.getvalue()
-        parts.append(f.name)
-        parts.append(file_sha256(b))
-    if qual_file is not None:
-        parts.append(qual_file.name)
-        parts.append(file_sha256(qual_file.getvalue()))
-    return hashlib.sha256(("|".join(parts)).encode("utf-8")).hexdigest()
+    # Keep state keys
+    st.session_state.setdefault("pdf_fingerprints", None)
+    st.session_state.setdefault("chunks_cache", None)
+    st.session_state.setdefault("pdf_bytes_map", None)
+    st.session_state.setdefault("pdf_headings_cache", None)
+    st.session_state.setdefault("pdf_keywords_cache", None)
+    st.session_state.setdefault("suggestions_cache_key", None)
+    st.session_state.setdefault("suggestions", None)
+    st.session_state.setdefault("busy", False)
+    st.session_state.setdefault("qual_spec_text", "")
 
-def ensure_chunks(files: List[Any]) -> List[ContentChunk]:
-    fps = [(f.name, file_sha256(f.getvalue())) for f in files]
-    if (
-        st.session_state.get("pdf_fingerprints") == fps
-        and st.session_state.get("chunks_cache") is not None
-        and st.session_state.get("pdf_bytes_map") is not None
-    ):
-        return st.session_state["chunks_cache"]
+    # Persist latest outputs across Streamlit reruns (download buttons remain visible)
+    st.session_state.setdefault("last_h5p_bytes", None)
+    st.session_state.setdefault("last_h5p_name", None)
+    st.session_state.setdefault("last_qa_bytes", None)
+    st.session_state.setdefault("last_qa_name", None)
 
-    chunks: List[ContentChunk] = []
-    pdf_map: Dict[str, bytes] = {}
-    headings: List[str] = []
-    term_freq: Dict[str, int] = {}
+    with st.container(border=True):
+        st.markdown("### 📂 Step 1: Upload Content")
+        uploads = st.file_uploader("Upload PDF file(s) *", type=["pdf"], accept_multiple_files=True, help="Upload one or more PDF files containing the main course content.")
+        qual_spec_file = st.file_uploader("Qualification specification file *", type=["pdf"], accept_multiple_files=False, key="qual_spec", help="Optional: Upload the qualification specification to help the AI align activities with learning outcomes.")
 
-    for f in files:
-        b = f.getvalue()
-        pdf_map[f.name] = b
+    with st.container(border=True):
+        st.markdown("### 📝 Step 2: Course Information")
+        course_name = st.text_input("Course name *", placeholder="e.g., Level 5 Diploma in ...", help="Enter the full name of the course.")
+        unit_name = st.text_input("Unit name *", placeholder="e.g., Unit 1: Personal Development", help="Enter the specific unit name or number.")
 
-        file_chunks = extract_pdf_chunks_from_bytes(f.name, b)
-        chunks.extend(file_chunks)
+    def compute_inputs_key(files: List[Any], course: str, unit: str = "", qual_file: Any = None) -> str:
+        parts = [course.strip(), unit.strip()]
+        for f in files:
+            b = f.getvalue()
+            parts.append(f.name)
+            parts.append(file_sha256(b))
+        if qual_file is not None:
+            parts.append(qual_file.name)
+            parts.append(file_sha256(qual_file.getvalue()))
+        return hashlib.sha256(("|".join(parts)).encode("utf-8")).hexdigest()
 
-        # Headings help image searches feel "on topic"
-        headings.extend(extract_pdf_headings_from_bytes(f.name, b))
+    def ensure_chunks(files: List[Any]) -> List[ContentChunk]:
+        fps = [(f.name, file_sha256(f.getvalue())) for f in files]
+        if (
+            st.session_state.get("pdf_fingerprints") == fps
+            and st.session_state.get("chunks_cache") is not None
+            and st.session_state.get("pdf_bytes_map") is not None
+        ):
+            return st.session_state["chunks_cache"]
 
-        # Keywords (frequency-based, across PDFs) for better Freepik queries
-        for ch in file_chunks:
-            for t in _terms(ch.text):
-                term_freq[t] = term_freq.get(t, 0) + 1
+        chunks: List[ContentChunk] = []
+        pdf_map: Dict[str, bytes] = {}
+        headings: List[str] = []
+        term_freq: Dict[str, int] = {}
 
-    if not chunks:
-        raise RuntimeError("No readable text found in the uploaded PDF(s). (If PDFs are scanned images, use OCR PDFs.)")
+        for f in files:
+            b = f.getvalue()
+            pdf_map[f.name] = b
 
-    # Keep a compact list of high-signal keywords (used for image searches)
-    sorted_terms = sorted(term_freq.items(), key=lambda kv: (-kv[1], -len(kv[0]), kv[0]))
-    keywords = [t for t, _ in sorted_terms[:40]]
+            file_chunks = extract_pdf_chunks_from_bytes(f.name, b)
+            chunks.extend(file_chunks)
 
-    st.session_state["pdf_fingerprints"] = fps
-    st.session_state["chunks_cache"] = chunks
-    st.session_state["pdf_bytes_map"] = pdf_map
-    st.session_state["pdf_headings_cache"] = headings
-    st.session_state["pdf_keywords_cache"] = keywords
-    return chunks
+            # Headings help image searches feel "on topic"
+            headings.extend(extract_pdf_headings_from_bytes(f.name, b))
 
-colA, colB = st.columns(2)
-with colA:
-    suggest_clicked = st.button("Suggest H5P types", use_container_width=True, disabled=st.session_state["busy"])
-with colB:
-    clear_clicked = st.button("Clear", use_container_width=True, disabled=st.session_state["busy"])
+            # Keywords (frequency-based, across PDFs) for better Freepik queries
+            for ch in file_chunks:
+                for t in _terms(ch.text):
+                    term_freq[t] = term_freq.get(t, 0) + 1
 
-# Placeholder for suggest progress bar (appears directly under the buttons)
-suggest_progress_area = st.empty()
+        if not chunks:
+            raise RuntimeError("No readable text found in the uploaded PDF(s). (If PDFs are scanned images, use OCR PDFs.)")
 
-if clear_clicked:
-    st.session_state["pdf_fingerprints"] = None
-    st.session_state["chunks_cache"] = None
-    st.session_state["suggestions_cache_key"] = None
-    st.session_state["suggestions"] = None
-    st.session_state["pdf_bytes_map"] = None
-    st.session_state["pdf_headings_cache"] = None
-    st.session_state["pdf_keywords_cache"] = None
-    st.session_state["last_h5p_bytes"] = None
-    st.session_state["last_h5p_name"] = None
-    st.session_state["last_qa_bytes"] = None
-    st.session_state["last_qa_name"] = None
-    st.session_state["qual_spec_text"] = ""
-    st.session_state["busy"] = False
-    st.rerun()
+        # Keep a compact list of high-signal keywords (used for image searches)
+        sorted_terms = sorted(term_freq.items(), key=lambda kv: (-kv[1], -len(kv[0]), kv[0]))
+        keywords = [t for t, _ in sorted_terms[:40]]
 
-if suggest_clicked:
-    try:
-        st.session_state["busy"] = True
+        st.session_state["pdf_fingerprints"] = fps
+        st.session_state["chunks_cache"] = chunks
+        st.session_state["pdf_bytes_map"] = pdf_map
+        st.session_state["pdf_headings_cache"] = headings
+        st.session_state["pdf_keywords_cache"] = keywords
+        return chunks
 
-        if not uploads:
-            st.warning("Please upload at least one PDF.")
-            st.stop()
-        if not (course_name or "").strip():
-            st.warning("Please enter the course name.")
-            st.stop()
-        if not (unit_name or "").strip():
-            st.warning("Please enter the unit name.")
-            st.stop()
-        if qual_spec_file is None:
-            st.warning("Please upload a qualification specification file.")
-            st.stop()
-        if not os.environ.get("LLM_API_KEY"):
-            st.error("Missing API key. Set LLM_API_KEY.")
-            st.stop()
+    colA, colB = st.columns(2)
+    with colA:
+        suggest_clicked = st.button("Suggest H5P types", use_container_width=True, disabled=st.session_state["busy"])
+    with colB:
+        clear_clicked = st.button("Clear", use_container_width=True, disabled=st.session_state["busy"])
 
-        # Show progress bar under the button
-        _suggest_bar = suggest_progress_area.progress(0, text="Validating inputs...")
-        time.sleep(0.3)
+    # Placeholder for suggest progress bar (appears directly under the buttons)
+    suggest_progress_area = st.empty()
 
-        # Extract qualification spec text for LLM context
-        _suggest_bar.progress(10, text="Reading qualification specification...")
-        qual_spec_text = ""
-        try:
-            qual_spec_chunks = extract_pdf_chunks_from_bytes(qual_spec_file.name, qual_spec_file.getvalue())
-            qual_spec_text = join_chunks_for_prompt(qual_spec_chunks, max_chars=30000)
-        except Exception:
-            st.warning("Could not extract text from qualification specification file. Proceeding without it.")
-        st.session_state["qual_spec_text"] = qual_spec_text
-
-        key = compute_inputs_key(uploads, course_name, unit_name, qual_spec_file)
-        if st.session_state["suggestions_cache_key"] == key and st.session_state["suggestions"] is not None:
-            _suggest_bar.progress(100, text="Done ✓")
-            time.sleep(0.5)
-            suggest_progress_area.empty()
-        else:
-            _suggest_bar.progress(25, text="Extracting PDF content...")
-            chunks = ensure_chunks(uploads)
-            chunks_small = choose_representative_chunks(chunks, max_pages=18)
-            _suggest_bar.progress(40, text="Analysing content with AI...")
-            s = llm_suggest_activities(chunks_small, course_name.strip(), unit_name.strip(), qual_spec_text)
-            _suggest_bar.progress(90, text="Finalising suggestions...")
-            st.session_state["suggestions"] = s
-            st.session_state["suggestions_cache_key"] = key
-            _suggest_bar.progress(100, text="Done ✓")
-            time.sleep(0.5)
-            suggest_progress_area.empty()
-
-    except Exception as e:
-        suggest_progress_area.empty()
-        msg = str(e)
-        if "429" in msg or "Too Many Requests" in msg:
-            st.error(msg)
-        else:
-            st.error(msg)
-    finally:
+    if clear_clicked:
+        st.session_state["pdf_fingerprints"] = None
+        st.session_state["chunks_cache"] = None
+        st.session_state["suggestions_cache_key"] = None
+        st.session_state["suggestions"] = None
+        st.session_state["pdf_bytes_map"] = None
+        st.session_state["pdf_headings_cache"] = None
+        st.session_state["pdf_keywords_cache"] = None
+        st.session_state["last_h5p_bytes"] = None
+        st.session_state["last_h5p_name"] = None
+        st.session_state["last_qa_bytes"] = None
+        st.session_state["last_qa_name"] = None
+        st.session_state["qual_spec_text"] = ""
         st.session_state["busy"] = False
+        st.rerun()
 
-        # Show suggestions and generation
-if st.session_state["suggestions"]:
-    recs = (st.session_state["suggestions"].get("recommendations") or [])
-    allowed = set(BEST_H5P_TYPES)
-    recs = [r for r in recs if isinstance(r, dict) and (r.get("activity_type") in allowed)]
-
-    if not recs:
-        st.info("No suggestions returned. Try again.")
-        st.stop()
-
-    st.markdown("---")
-    st.markdown("### Choose one suggested type")
-
-    other_label = "Other (choose from all types)"
-
-    # Make a compact radio list with template availability (plus an "Other" option)
-    options: List[str] = []
-    meta: Dict[str, Dict[str, Any]] = {}
-
-    for r in recs:
-        typ = r.get("activity_type", "")
-        score = int(r.get("score_0_to_5", 0) or 0)
-        why = (r.get("why") or "").strip()
-        suggested_n = int(r.get("suggested_item_count", 5) or 5)
-        ev = r.get("evidence", {}) or {}
-
-        template_ok = (typ in templates) if typ not in ("Quiz", "Multiple Choice") else ("Quiz" in templates)
-        status = "" if template_ok else " (Missing template)"
-        label = f"{typ}{status}"
-
-        options.append(label)
-        meta[label] = {
-            "type": typ,
-            "why": why,
-            "n": suggested_n,
-            "ev": ev,
-            "template_ok": template_ok,
-            "score": score,
-        }
-
-    options.append(other_label)
-    meta[other_label] = {
-        "type": "__OTHER__",
-        "why": "",
-        "n": 4,
-        "ev": {},
-        "template_ok": True,
-        "score": 0,
-    }
-
-    choice = st.radio("Suggested types", options=options, index=0)
-    chosen = meta[choice]
-
-    # Resolve selected type (including Other)
-    resolved_type = chosen["type"]
-
-    if resolved_type == "__OTHER__":
-        st.markdown("#### Other type")
-
-        template_labels = sorted(list(templates.keys()))
-        resolved_type = st.selectbox(
-            "Pick an available template",
-            options=template_labels,
-            index=0
-        )
-
-        st.caption(f"Using template: **{resolved_type}**")
-
-    # Apply resolved type back to chosen and re-check template availability
-    chosen["type"] = resolved_type
-    chosen["template_ok"] = (resolved_type in templates) if resolved_type not in ("Quiz", "Multiple Choice") else ("Quiz" in templates)
-
-    st.markdown("---")
-    st.markdown("### Generate H5P")
-
-    cornell_video_url = ""
-    cornell_poster_bytes: Optional[bytes] = None
-    cornell_poster_ext: str = "jpg"
-
-    if chosen["type"] == "Cornell Notes":
-        st.markdown("#### Cornell Notes — Video URL")
-        cornell_video_url = st.text_input(
-            "Vimeo / YouTube video URL",
-            placeholder="https://vimeo.com/123456789",
-            help="Plain video page URL. Do NOT paste embed/iframe URLs.",
-        )
-        if cornell_video_url:
-            import re as _re2
-            _m = _re2.search(r"vimeo\.com(?:/video)?/(\d+)", cornell_video_url)
-            if _m:
-                _preview = f"https://vimeo.com/{_m.group(1)}"
-            else:
-                _preview = cornell_video_url
-            if "player.vimeo.com" in cornell_video_url or "/embed/" in cornell_video_url:
-                st.warning("\u26a0\ufe0f Embed URL detected — please use the plain page URL.")
-            else:
-                st.success(f"\u2705 Will use: `{_preview}`")
-        else:
-            st.info("\u2139\ufe0f No URL entered — template default video will be kept.")
-
-        st.markdown("#### Poster Image (optional)")
-        poster_upload = st.file_uploader(
-            "Upload cover / poster image (JPG or PNG)",
-            type=["jpg", "jpeg", "png"],
-            help="Shown as the video thumbnail. Tip: export your PDF cover page as an image.",
-        )
-        if poster_upload is not None:
-            cornell_poster_bytes = poster_upload.read()
-            cornell_poster_ext = poster_upload.name.rsplit(".", 1)[-1].lower()
-            st.image(cornell_poster_bytes, caption="Poster preview", use_container_width=True)
-
-        n_items = 1
-        cp_n_slides = None
-        cp_activity_types = []
-        cp_n_questions = 0
-        ib_n_pages = None
-        ib_activity_types = []
-        ib_n_questions = 0
-
-    # --- Course Presentation specific options ---
-    elif chosen["type"] == "Course Presentation":
-        # Slide-count limits: 1 PDF → max 8 total (7 content + 1 activity)
-        #                     multiple PDFs → max 12 total (11 content + 1 activity)
-        n_pdfs = len(uploads) if uploads else 1
-        if n_pdfs == 1:
-            max_content_slides = 7
-            help_note = "Max 8 slides total (7 content + 1 activity) for a single PDF."
-        else:
-            max_content_slides = 11
-            help_note = "Max 12 slides total (11 content + 1 activity) for multiple PDFs."
-
-        default_slides = min(max_content_slides, max(3, chosen["n"]))
-
-        cp_n_slides = st.number_input(
-            "Number of content slides",
-            min_value=3,
-            max_value=max_content_slides,
-            value=default_slides,
-            step=1,
-            help=help_note,
-        )
-
-        cp_activity_type = st.selectbox(
-            "Activity type for the last slide",
-            options=["Drag the Words", "Fill in the Blanks"],
-            index=0,
-            help="Select one activity type for the last slide.",
-        )
-        cp_activity_types = [cp_activity_type] if cp_activity_type else []
-
-        cp_n_questions = st.number_input(
-            "Number of questions (in the activity slide)",
-            min_value=2,
-            max_value=5,
-            value=3,
-            step=1,
-            help="Total questions for the selected activity type on the last slide.",
-        )
-
-        st.caption(f"Total slides: **{int(cp_n_slides) + 1}** ({int(cp_n_slides)} content + 1 activity)")
-
-        n_items = cp_n_slides  # n_items drives the rest of the pipeline
-        ib_n_pages = None
-        ib_activity_types = []
-        ib_n_questions = 0
-
-    elif chosen["type"] == "Virtual Tour (360)":
-        st.markdown("#### Virtual Tour — 360° Panoramic Image")
-        st.info(
-            "**⚠️ This activity requires a 360° equirectangular panoramic image.**\\n\\n"
-            "A 360° image is a special wide photograph (typically **2:1 aspect ratio**, "
-            "e.g. 4096×2048 or 8192×4096) that wraps around the viewer to create an "
-            "immersive experience.\\n\\n"
-            "**Do NOT upload a regular photo** — it will appear stretched and distorted.\\n\\n"
-            "**How to get a 360° image:**\\n"
-            "- Use a **360° camera** (e.g. Insta360, Ricoh Theta, GoPro MAX)\\n"
-            "- Use a **phone app** that stitches panoramas (e.g. Google Street View app)\\n"
-            "- Download from a **360° image library** (e.g. Poly Haven, Flickr 360° group)\\n"
-            "- Export equirectangular images from **Google Street View**"
-        )
-        vt_360_file = st.file_uploader(
-            "Upload 360° panoramic image *",
-            type=["jpg", "jpeg", "png", "webp"],
-            help="Must be an equirectangular 360° panoramic image (2:1 aspect ratio recommended).",
-        )
-        if vt_360_file is not None:
-            try:
-                from PIL import Image as _PILImage
-                import io as _io
-                _pil = _PILImage.open(_io.BytesIO(vt_360_file.getvalue()))
-                _w, _h = _pil.size
-                _ratio = _w / _h if _h > 0 else 0
-                st.image(
-                    vt_360_file.getvalue(),
-                    caption=f"Preview — {_w}×{_h}px (ratio {_ratio:.2f}:1)",
-                    use_container_width=True,
-                )
-                if abs(_ratio - 2.0) > 0.3:
-                    st.warning(
-                        f"⚠️ This image has a **{_ratio:.2f}:1** aspect ratio. "
-                        f"360° panoramic images should be **2:1** (e.g. 4096×2048). "
-                        f"If this is not a 360° image, it will appear stretched/distorted."
-                    )
-                else:
-                    st.success(
-                        f"✅ Looks like a valid 360° panorama ({_w}×{_h}px, {_ratio:.1f}:1 ratio)."
-                    )
-            except ImportError:
-                st.caption("Install Pillow (`pip install Pillow`) for image preview & validation.")
-            except Exception:
-                st.caption("Could not preview image.")
- 
-        vt_n_hotspots = st.number_input(
-            "Number of info hotspots",
-            min_value=2,
-            max_value=8,
-            value=4,
-            step=1,
-            help="Clickable points on the 360° image that show informational text from the PDF.",
-        )
-        st.caption(f"Will generate **{int(vt_n_hotspots)} clickable hotspots** with content from the uploaded PDFs.")
- 
-        n_items = 1
-        cp_n_slides = None
-        cp_activity_types = []
-        cp_n_questions = 0
-        ib_n_pages = None
-        ib_activity_types = []
-        ib_n_questions = 0  
-
-    elif chosen["type"] == "Find Multiple Hotspots":
-         n_items = st.number_input(
-             "Number of items in the grid",
-             min_value=6,
-             max_value=9,
-             value=9,
-             step=1,
-             help="Total items shown in a 3×3 grid (6 = 3×2, 9 = 3×3). "
-                  "About 1/3 will be correct answers.",
-         )
-         n_correct = max(2, n_items // 3)
-         st.caption(
-             f"Will generate a **{3 if n_items > 6 else 3}×{(n_items + 2) // 3}** grid "
-             f"with **{n_correct} correct** and **{n_items - n_correct} distractor** items."
-         )
-         cp_n_slides = None
-         cp_activity_types = []
-         cp_n_questions = 0
-         ib_n_pages = None
-         ib_activity_types = []
-         ib_n_questions = 0    
-
-    elif chosen["type"] == "Game Map":
-         st.markdown("#### Game Map — Background Image")
-         st.info(
-             "**Upload a background image** for your Game Map.\\n\\n"
-             "This can be any image — a map, floor plan, diagram, infographic, "
-             "or illustrated scene. Interactive stages (reading + quiz points) "
-             "will be placed as clickable dots across this image.\\n\\n"
-             "**Tips for good background images:**\\n"
-             "- Use a wide image (landscape, e.g. 3000×1700px)\\n"
-             "- Illustrated maps, floor plans, or diagrams work best\\n"
-             "- Avoid images with too much small text"
-         )
-         gm_bg_file = st.file_uploader(
-             "Upload background image *",
-             type=["jpg", "jpeg", "png", "webp"],
-             help="The background image on which game stages will be placed.",
-             key="gm_bg_upload",
-         )
-         if gm_bg_file is not None:
-             try:
-                 from PIL import Image as _PILImage
-                 import io as _io
-                 _pil = _PILImage.open(_io.BytesIO(gm_bg_file.getvalue()))
-                 _w, _h = _pil.size
-                 st.image(gm_bg_file.getvalue(),
-                          caption=f"Preview — {_w}×{_h}px",
-                          use_container_width=True)
-                 if _w < 1000:
-                     st.warning("Image width is below 1000px. A wider image (2000px+) produces better results.")
-             except ImportError:
-                 st.caption("Install Pillow for image preview.")
-             except Exception:
-                 st.caption("Could not preview image.")
-
-         gm_n_stages = st.number_input(
-             "Number of stages (points on the map)",
-             min_value=4,
-             max_value=12,
-             value=6,
-             step=2,
-             help="Total interactive points. Alternates reading and quiz stages. Even numbers recommended.",
-         )
-         st.caption(
-             f"Will generate **{int(gm_n_stages)} stages**: "
-             f"{int(gm_n_stages) // 2} reading + {int(gm_n_stages) - int(gm_n_stages) // 2} quiz stages "
-             f"(Multiple Choice, True/False, Drag the Words, Fill in the Blanks)"
-         )
-
-         n_items = gm_n_stages
-         cp_n_slides = None
-         cp_activity_types = []
-         cp_n_questions = 0
-         ib_n_pages = None
-         ib_activity_types = []
-         ib_n_questions = 0    
-
-    # --- Interactive Book specific options ---
-    elif chosen["type"] == "Interactive Book":
-        # Page-count limits: 1 PDF → max 8 total (7 content + 1 activity)
-        #                    multiple PDFs → max 12 total (11 content + 1 activity)
-        n_pdfs = len(uploads) if uploads else 1
-        if n_pdfs == 1:
-            max_content_pages = 7
-            help_note = "Max 8 pages total (7 content + 1 activity) for a single PDF."
-        else:
-            max_content_pages = 11
-            help_note = "Max 12 pages total (11 content + 1 activity) for multiple PDFs."
-
-        default_pages = min(max_content_pages, max(3, chosen["n"]))
-
-        ib_n_pages = st.number_input(
-            "Number of content pages",
-            min_value=3,
-            max_value=max_content_pages,
-            value=default_pages,
-            step=1,
-            help=help_note,
-        )
-
-        ib_activity_type = st.selectbox(
-            "Activity type for the last page",
-            options=["Drag the Words", "Fill in the Blanks"],
-            index=0,
-            help="Select one activity type for the last page.",
-        )
-        ib_activity_types = [ib_activity_type] if ib_activity_type else []
-
-        ib_n_questions = st.number_input(
-            "Number of questions (in the activity page)",
-            min_value=2,
-            max_value=5,
-            value=3,
-            step=1,
-            help="Total questions for the selected activity type on the last page.",
-        )
-
-        st.caption(f"Total pages: **{int(ib_n_pages) + 1}** ({int(ib_n_pages)} content + 1 activity)")
-
-        n_items = ib_n_pages  # n_items drives the rest of the pipeline
-        cp_n_slides = None
-        cp_activity_types = []
-        cp_n_questions = 0
-
-    else:
-        cp_n_slides = None
-        cp_activity_types = []
-        cp_n_questions = 0
-        ib_n_pages = None
-        ib_activity_types = []
-        ib_n_questions = 0
-
-        # ── ESSAY: always 1 question, no number input needed ──
-        # ── ESSAY: always 1 question, no number input needed ──
-        if chosen["type"] == "Essay":
-            n_items = 1
-            st.info("Essay generates a single question/instruction for the learner to respond to. All content is taken directly from the uploaded PDF(s).")
-
-        # ── PAGE: fixed layout, no number input needed ──
-        elif chosen["type"] == "Page":
-            n_items = 3
-            st.info("Page generates content sections with images and a short True/False quiz from the uploaded PDF(s).")
-            st.info("Essay generates a single question/instruction for the learner to respond to. All content is taken directly from the uploaded PDF(s).")
-
-        # Enforce question limits for selected types
-        elif chosen["type"] in LIMITED_Q_TYPES:
-            n_pdfs = len(uploads) if uploads else 1
-            max_q = LIMITED_Q_MAX_SINGLE_PDF if n_pdfs == 1 else LIMITED_Q_MAX_MULTI_PDF
-            default_n = LIMITED_Q_MIN  # default display should start at 4
-            n_items = st.number_input(
-                "Number of items/questions",
-                min_value=LIMITED_Q_MIN,
-                max_value=int(max_q),
-                value=int(default_n),
-                step=1,
-                key=f"n_items_limited_{chosen['type']}_{n_pdfs}",
-                help=f"Allowed range: {LIMITED_Q_MIN}–{int(max_q)} ({n_pdfs} PDF{'s' if n_pdfs != 1 else ''}).",
-            )
-        else:
-            default_n = max(5, chosen["n"]) if chosen["type"] in ("Quiz", "Multiple Choice") else max(3, chosen["n"])
-
-            # Dialog Cards: keep a tight range (3–5) to avoid low-quality/duplicated cards
-            if chosen["type"] == "Dialog Cards":
-                default_cards = int(min(5, max(3, default_n)))
-                n_items = st.number_input("Number of cards", min_value=3, max_value=5, value=default_cards, step=1)
-            else:
-                n_items = st.number_input("Number of items/questions", min_value=3, max_value=30, value=int(default_n), step=1)
-
-    gen = st.button("Generate H5P file", type="primary", use_container_width=True, disabled=st.session_state["busy"])
-
-    # Placeholder for generate progress bar (appears directly under the button)
-    gen_progress_area = st.empty()
-
-    if gen:
+    if suggest_clicked:
         try:
             st.session_state["busy"] = True
 
-            if not chosen["template_ok"]:
-                if chosen["type"] in ("Quiz", "Multiple Choice"):
-                    st.error("Missing template: templates/Quiz.h5p (required for Question Set generation).")
-                else:
-                    st.error(f"Missing template: templates/{chosen['type']}.h5p")
+            if not uploads:
+                st.warning("Please upload at least one PDF.")
+                st.stop()
+            if not (course_name or "").strip():
+                st.warning("Please enter the course name.")
+                st.stop()
+            if not (unit_name or "").strip():
+                st.warning("Please enter the unit name.")
+                st.stop()
+            if qual_spec_file is None:
+                st.warning("Please upload a qualification specification file.")
+                st.stop()
+            if not os.environ.get("LLM_API_KEY"):
+                st.error("Missing API key. Set LLM_API_KEY.")
                 st.stop()
 
-            _gen_bar = gen_progress_area.progress(0, text="Preparing content...")
+            # Show progress bar under the button
+            _suggest_bar = suggest_progress_area.progress(0, text="Validating inputs...")
             time.sleep(0.3)
 
-            _gen_bar.progress(10, text="Extracting PDF content...")
-            chunks = ensure_chunks(uploads)
-
-            # Build enriched course context for LLM prompts
-            _gen_bar.progress(15, text="Building course context...")
-            _qs_text = st.session_state.get("qual_spec_text", "")
-            _course_label = course_name.strip()
-            _unit_label = (unit_name or "").strip()
-            _context_parts = [_course_label]
-            if _unit_label:
-                _context_parts.append(f"Unit: {_unit_label}")
-            if _qs_text:
-                _context_parts.append(f"Qualification Specification excerpt:\n{_qs_text[:12000]}")
-            enriched_course = "\n".join(_context_parts)
-
-            with tempfile.TemporaryDirectory() as tmp:
-                typ = chosen["type"]
-                run_n = int(n_items)
-
-                # Enforce question limits for selected types
-                if typ in LIMITED_Q_TYPES:
-                    n_pdfs = len(uploads) if uploads else 1
-                    max_q = LIMITED_Q_MAX_SINGLE_PDF if n_pdfs == 1 else LIMITED_Q_MAX_MULTI_PDF
-                    run_n = max(LIMITED_Q_MIN, min(run_n, int(max_q)))
-
-                _gen_bar.progress(25, text=f"Generating {typ} content with AI...")
-
-                if typ == "Quiz":
-                    tf = call_llm_truefalse_statements(chunks, run_n, enriched_course)
-                    _gen_bar.progress(65, text="AI content generated — building template...")
-
-                    qs_dir = os.path.join(tmp, "_work_qs_tf")
-                    unzip_h5p(templates["Quiz"], qs_dir)
-
-                    title = tf.get("title", f"True/False Quiz - {course_name.strip()}")
-                    desc = tf.get("description", "Answer the True/False questions.")
-                    qa_items = build_question_set_truefalse(qs_dir, title, desc, tf.get("items", []))
-
-                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                    zip_dir_to_file(qs_dir, out_h5p)
-
-                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                    write_qa_report_html(out_qa, title, "Quiz (Question Set) — True/False", qa_items)
-
-                elif typ == "Multiple Choice":
-                    mc = call_llm_multichoice_questions(chunks, run_n, enriched_course)
-                    _gen_bar.progress(65, text="AI content generated — building template...")
-
-                    qs_dir = os.path.join(tmp, "_work_qs_mc")
-                    unzip_h5p(templates["Quiz"], qs_dir)
-
-                    title = mc.get("title", f"Multiple Choice Quiz - {course_name.strip()}")
-                    desc = mc.get("description", "Answer the multiple choice questions.")
-                    qa_items = build_question_set_multichoice(qs_dir, title, desc, mc.get("items", []))
-
-                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                    zip_dir_to_file(qs_dir, out_h5p)
-
-                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                    write_qa_report_html(out_qa, title, "Quiz (Question Set) — Multiple Choice", qa_items)
-
-                elif typ == "Dialog Cards":
-                    work_dir = os.path.join(tmp, "_work_dialog")
-                    unzip_h5p(templates["Dialog Cards"], work_dir)
-
-                    # Dialog Cards are validated strictly against the extracted PDF text.
-                    # Keep the context minimal to avoid pulling in anything outside the PDFs.
-                    dialog_context = f"{course_name.strip()}\nUnit: {(unit_name or '').strip()}"
-                    gen_data = generate_dialog_cards_strict(chunks, run_n, dialog_context)
-                    _gen_bar.progress(65, text="AI content generated & validated — building template...")
-                    title = gen_data.get("title", f"Dialog Cards - {course_name.strip()}")
-                    desc = gen_data.get("description", "")
-
-                    qa_items = update_dialog_cards_template(
-                        work_dir,
-                        title,
-                        desc,
-                        gen_data.get("cards", []),
-                        course=course_name.strip(),
-                        pdf_headings=st.session_state.get("pdf_headings_cache") or [],
-                        pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
-                    )
-
-                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                    zip_dir_to_file(work_dir, out_h5p)
-
-                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                    write_qa_report_html(out_qa, title, typ, qa_items)
-
-                elif typ == "Dictation":
-                    work_dir = os.path.join(tmp, "_work_dictation")
-                    unzip_h5p(templates["Dictation"], work_dir)
-
-                    gen_data = call_llm_dictation(chunks, run_n, enriched_course)
-                    title = gen_data.get("title", f"Dictation - {course_name.strip()}")
-                    desc = gen_data.get("description", "Listen carefully and type what you hear.")
-
-                    qa_items = update_dictation_template(
-                        work_dir,
-                        title=title,
-                        description=desc,
-                        sentences=gen_data.get("sentences", []),
-                        progress_callback=lambda pct, txt: _gen_bar.progress(pct, text=txt),
-                    )
-
-                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                    zip_dir_to_file(work_dir, out_h5p)
-
-                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                    write_qa_report_html(out_qa, title, typ, qa_items)
-
-                elif typ == "Page":
-                    work_dir = os.path.join(tmp, "_work_page")
-                    unzip_h5p(templates["Page"], work_dir)
- 
-                    # Step 1: Generate content sections (3-4 sections)
-                    _gen_bar.progress(25, text="Generating page content from PDFs...")
-                    gen_data = call_llm_page_content(chunks, n_sections=4, course=enriched_course)
- 
-                    # Step 2: Generate 1 True/False question
-                    _gen_bar.progress(40, text="Generating True/False question...")
-                    tf_data = call_llm_truefalse_statements(chunks, 1, enriched_course)
- 
-                    # Step 3: Generate 1 Drag the Words question
-                    _gen_bar.progress(50, text="Generating Drag the Words question...")
-                    dw_data = call_llm_drag_words(chunks, 1, enriched_course)
- 
-                    # Step 4: Generate 1 Multiple Choice question
-                    _gen_bar.progress(60, text="Generating Multiple Choice question...")
-                    mc_data = call_llm_multichoice_questions(chunks, 1, enriched_course)
- 
-                    _gen_bar.progress(70, text="AI content generated — building template...")
-                    title = gen_data.get("title", f"Page - {course_name.strip()}")
- 
-                    # Build the activities list
-                    page_activities = []
- 
-                    # True/False
-                    for it in (tf_data.get("items") or [])[:1]:
-                        page_activities.append({
-                            "type": "truefalse",
-                            "data": it,
-                            "evidence": it.get("evidence") or {},
-                        })
- 
-                    # Multiple Choice
-                    for it in (mc_data.get("items") or [])[:1]:
-                        page_activities.append({
-                            "type": "multichoice",
-                            "data": it,
-                            "evidence": it.get("evidence") or {},
-                        })
- 
-                    qa_items = update_page_template_with_images(
-                        work_dir,
-                        title,
-                        gen_data.get("sections", []),
-                        course=course_name.strip(),
-                        pdf_headings=st.session_state.get("pdf_headings_cache") or [],
-                        pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
-                        activities=page_activities,
-                    )
- 
-                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                    zip_dir_to_file(work_dir, out_h5p)
- 
-                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                    write_qa_report_html(out_qa, title, typ, qa_items)
-
-                elif typ == "Course Presentation":
-                    work_dir = os.path.join(tmp, "_work_course_presentation")
-                    unzip_h5p(templates["Course Presentation"], work_dir)
-
-                    # Step 1: Generate content slides
-                    _gen_bar.progress(30, text="Generating content slides from PDFs...")
-                    gen_data = call_llm_course_presentation(chunks, n_slides=run_n, course=enriched_course)
-
-                    # Step 2: Generate activity questions for each selected type
-                    act_groups: Dict[str, List[Dict[str, Any]]] = {}
-                    if cp_activity_types and cp_n_questions and cp_n_questions > 0:
-                        n_types = len(cp_activity_types)
-                        base_per_type = int(cp_n_questions) // n_types
-                        remainder = int(cp_n_questions) % n_types
-
-                        for ti, atype in enumerate(cp_activity_types):
-                            n_q = base_per_type + (1 if ti < remainder else 0)
-                            if n_q < 1:
-                                continue
-                            _gen_bar.progress(
-                                40 + (ti * 20 // n_types),
-                                text=f"Generating {n_q} {atype} questions..."
-                            )
-                            q_data = call_llm_cp_activity_questions(
-                                chunks,
-                                activity_type=atype,
-                                n_questions=n_q,
-                                course=enriched_course,
-                            )
-                            act_groups[atype] = q_data.get("questions") or []
-
-                    _gen_bar.progress(65, text="Building presentation template...")
-                    title = gen_data.get("title", f"Course Presentation - {course_name.strip()}")
-                    desc = gen_data.get("description", "")
-
-                    qa_items = update_course_presentation_template_with_images(
-                        work_dir,
-                        title=title,
-                        description=desc,
-                        slides=gen_data.get("slides", []),
-                        course=course_name.strip(),
-                        pdf_headings=st.session_state.get("pdf_headings_cache") or [],
-                        pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
-                        activity_groups=act_groups,
-                    )
-
-                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                    zip_dir_to_file(work_dir, out_h5p)
-
-                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                    write_qa_report_html(out_qa, title, typ, qa_items)
-
-                elif typ == "Virtual Tour (360)":
-                    if vt_360_file is None:
-                        raise ValueError("Please upload a 360° panoramic image for Virtual Tour (360).")
- 
-                    work_dir = os.path.join(tmp, "_work_virtual_tour")
-                    unzip_h5p(templates["Virtual Tour (360)"], work_dir)
- 
-                    title = f"Virtual Tour - {course_name.strip()}"
- 
-                    # Generate hotspot interactions from PDF content
-                    _gen_bar.progress(30, text="Generating hotspot content from PDFs...")
-                    hotspot_data = call_llm_virtual_tour_interactions(
-                        chunks,
-                        n_hotspots=int(vt_n_hotspots),
-                        course=enriched_course,
-                    )
-                    hotspots = hotspot_data.get("hotspots") or []
- 
-                    _gen_bar.progress(65, text=f"Building 360° tour with {len(hotspots)} hotspots...")
-                    qa_items = update_virtual_tour_template(
-                        work_dir,
-                        title,
-                        vt_360_file.getvalue(),
-                        vt_360_file.name,
-                        hotspots=hotspots,
-                    )
- 
-                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                    zip_dir_to_file(work_dir, out_h5p)
- 
-                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                    write_qa_report_html(out_qa, title, typ, qa_items)  
-
-
-                elif typ == "Information Wall":
-                    work_dir = os.path.join(tmp, "_work_information_wall")
-                    unzip_h5p(templates["Information Wall"], work_dir)
- 
-                    _gen_bar.progress(30, text="Generating Information Wall content from PDFs...")
-                    gen_data = call_llm_information_wall(chunks, run_n, enriched_course)
- 
-                    _gen_bar.progress(65, text="AI content generated — building template with images...")
-                    title = gen_data.get("title", f"Information Wall - {course_name.strip()}")
-                    header = gen_data.get("header", title)
- 
-                    qa_items = update_information_wall_template(
-                        work_dir,
-                        title=title,
-                        header=header,
-                        properties=gen_data.get("properties", []),
-                        panels=gen_data.get("panels", []),
-                        course=course_name.strip(),
-                        pdf_headings=st.session_state.get("pdf_headings_cache") or [],
-                        pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
-                    )
- 
-                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                    zip_dir_to_file(work_dir, out_h5p)
- 
-                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                    write_qa_report_html(out_qa, title, typ, qa_items)  
-
-                elif typ == "Memory Game":
-                     work_dir = os.path.join(tmp, "_work_memory_game")
-                     unzip_h5p(templates["Memory Game"], work_dir)
-
-                     _gen_bar.progress(30, text="Generating Memory Game content from PDFs...")
-                     gen_data = call_llm_memory_game(chunks, run_n, enriched_course)
-
-                     _gen_bar.progress(65, text="AI content generated — downloading images...")
-                     title = gen_data.get("title", f"Memory Game - {course_name.strip()}")
-
-                     qa_items = update_memory_game_template(
-                         work_dir,
-                         title=title,
-                         cards=gen_data.get("cards", []),
-                         course=course_name.strip(),
-                         pdf_headings=st.session_state.get("pdf_headings_cache") or [],
-                         pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
-                     )
-
-                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                     zip_dir_to_file(work_dir, out_h5p)
-
-                     out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                     write_qa_report_html(out_qa, title, typ, qa_items)  
-
-                elif typ == "Game Map":
-                     if gm_bg_file is None:
-                         raise ValueError("Please upload a background image for the Game Map.")
-
-                     work_dir = os.path.join(tmp, "_work_game_map")
-                     unzip_h5p(templates["Game Map"], work_dir)
-
-                     _gen_bar.progress(30, text="Generating Game Map stages from PDFs...")
-                     gen_data = call_llm_game_map_stages(chunks, int(run_n), enriched_course)
-
-                     _gen_bar.progress(65, text="AI content generated — building Game Map template...")
-                     title = gen_data.get("title", f"Game Map - {course_name.strip()}")
-
-                     qa_items = update_game_map_template(
-                         work_dir,
-                         title=title,
-                         stages=gen_data.get("stages", []),
-                         bg_image_bytes=gm_bg_file.getvalue(),
-                         bg_image_name=gm_bg_file.name,
-                     )
-
-                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                     zip_dir_to_file(work_dir, out_h5p)
-
-                     out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                     write_qa_report_html(out_qa, title, typ, qa_items)  
-
-                elif typ == "Find Multiple Hotspots":
-                    work_dir = os.path.join(tmp, "_work_find_hotspots")
-                    unzip_h5p(templates["Find Multiple Hotspots"], work_dir)
- 
-                    _gen_bar.progress(30, text="Generating hotspot items from PDFs...")
-                    gen_data = call_llm_find_multiple_hotspots(
-                        chunks, run_n, enriched_course
-                    )
- 
-                    _gen_bar.progress(50, text="Creating grid image with downloaded images...")
-                    title = gen_data.get(
-                        "title",
-                        f"Find Multiple Hotspots - {course_name.strip()}",
-                    )
-                    question_title = gen_data.get(
-                        "questionTitle", "Find all the correct items"
-                    )
-                    hotspot_name = gen_data.get("hotspotName", "correct items")
- 
-                    qa_items = update_find_multiple_hotspots_template(
-                        work_dir,
-                        title=title,
-                        question_title=question_title,
-                        hotspot_name=hotspot_name,
-                        items=gen_data.get("items", []),
-                        course=course_name.strip(),
-                        pdf_headings=st.session_state.get("pdf_headings_cache") or [],
-                        pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
-                    )
- 
-                    _gen_bar.progress(85, text="Packaging H5P file...")
-                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                    zip_dir_to_file(work_dir, out_h5p)
- 
-                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                    write_qa_report_html(out_qa, title, typ, qa_items)            
-
-
-                elif typ == "Interactive Book":
-                    work_dir = os.path.join(tmp, "_work_interactive_book")
-                    unzip_h5p(templates["Interactive Book"], work_dir)
-
-                    # Step 1: Generate content chapters/pages
-                    _gen_bar.progress(30, text="Generating content pages from PDFs...")
-                    gen_data = call_llm_interactive_book(chunks, n_chapters=max(2, min(run_n, run_n)), course=enriched_course)
-
-                    # Step 2: Generate activity questions for each selected type
-                    ib_act_groups: Dict[str, List[Dict[str, Any]]] = {}
-                    if ib_activity_types and ib_n_questions and ib_n_questions > 0:
-                        n_types = len(ib_activity_types)
-                        base_per_type = int(ib_n_questions) // n_types
-                        remainder = int(ib_n_questions) % n_types
-
-                        for ti, atype in enumerate(ib_activity_types):
-                            n_q = base_per_type + (1 if ti < remainder else 0)
-                            if n_q < 1:
-                                continue
-                            _gen_bar.progress(
-                                40 + (ti * 20 // n_types),
-                                text=f"Generating {n_q} {atype} questions..."
-                            )
-                            q_data = call_llm_cp_activity_questions(
-                                chunks,
-                                activity_type=atype,
-                                n_questions=n_q,
-                                course=enriched_course,
-                            )
-                            ib_act_groups[atype] = q_data.get("questions") or []
-
-                    _gen_bar.progress(65, text="AI content generated — building template...")
-                    title = gen_data.get("title", f"Interactive Book - {course_name.strip()}")
-                    desc = gen_data.get("description", "")
-
-                    qa_items = update_interactive_book_template_with_images(
-                        work_dir,
-                        title=title,
-                        description=desc,
-                        chapters=gen_data.get("chapters", []),
-                        course=course_name.strip(),
-                        pdf_headings=st.session_state.get("pdf_headings_cache") or [],
-                        pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
-                        activity_groups=ib_act_groups,
-                    )
-
-                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                    zip_dir_to_file(work_dir, out_h5p)
-
-                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                    write_qa_report_html(out_qa, title, typ, qa_items)
-
-                elif typ in BUILTIN_TEXT_TYPES:
-                    meta_t = BUILTIN_TEXT_TYPES[typ]
-                    work_dir = os.path.join(tmp, "_work_text")
-                    unzip_h5p(templates[typ], work_dir)
-
-                    if meta_t["mode"] == "dragtext":
-                        gen_data = call_llm_drag_words(chunks, run_n, enriched_course)
-                        _gen_bar.progress(65, text="AI content generated — building template...")
-                        textfield = make_dragtext_textfield(gen_data["items"])
-                        update_text_based_template(
-                            work_dir,
-                            gen_data["title"],
-                            gen_data["description"],
-                            textfield,
-                            gen_data.get("overall_feedback"),
-                            meta_t["textfield_keys"],
-                        )
-                        title = gen_data["title"]
-                        all_dis = []
-                        for it in gen_data.get("items", []):
-                            all_dis.extend(it.get("distractors") or [])
-                        maybe_set_distractors(work_dir, all_dis)
-                        qa_items = [
-                            {
-                                "label": "Drag the Words",
-                                "content": it.get("sentence", ""),
-                                "expected": it.get("missing_word", ""),
-                                "evidence": it.get("evidence", {}),
-                            }
-                            for it in gen_data.get("items", [])
-                        ]
-
-                    elif meta_t["mode"] == "blanks":
-                        gen_data = call_llm_fill_blanks(chunks, run_n, enriched_course)
-                        _gen_bar.progress(65, text="AI content generated — building template...")
-                        textfield = make_blanks_textfield(gen_data["items"])
-                        desc = (gen_data.get("description") or "").strip() or "Read each sentence and type the missing word."
-
-                        update_fill_in_the_blanks_template(
-                            work_dir,
-                            gen_data["title"],
-                            desc,
-                            textfield,
-                            gen_data.get("overall_feedback"),
-                        )
-
-                        title = gen_data["title"]
-                        qa_items = [
-                            {
-                                "label": f"Item {i + 1}",
-                                "content": f"{it.get('sentence', '')} (answer: {it.get('answer', '')})",
-                                "evidence": it.get("evidence", {}),
-                            }
-                            for i, it in enumerate(gen_data.get("items", []))
-                        ]
-
-                    elif meta_t["mode"] == "markwords":
-                        gen_data = call_llm_mark_words(chunks, run_n, enriched_course)
-                        _gen_bar.progress(65, text="AI content generated — building template...")
-                        textfield = make_mark_words_textfield(gen_data["items"])
-                        update_text_based_template(
-                            work_dir,
-                            gen_data["title"],
-                            gen_data["description"],
-                            textfield,
-                            None,
-                            meta_t["textfield_keys"],
-                        )
-                        title = gen_data["title"]
-                        qa_items = [
-        {
-            "label": f"Item {i + 1}",
-            "content": f"{it.get('sentence', '')} (marked: {it.get('marked_word', '')}, hint: {it.get('hint', '')})",
-            "evidence": it.get("evidence", {}),
-        }
-        for i, it in enumerate(gen_data.get("items", []))
-    ]
-
-                    else:
-                        raise ValueError(f"Unsupported BUILTIN_TEXT_TYPES mode: {meta_t['mode']}")
-
-                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                    zip_dir_to_file(work_dir, out_h5p)
-
-                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                    write_qa_report_html(out_qa, title, typ, qa_items)
-
-                elif typ == "Cornell Notes":
-                    work_dir = os.path.join(tmp, "_work_cornell_notes")
-                    unzip_h5p(templates["Cornell Notes"], work_dir)
-
-                    # ── Read raw template content.json BEFORE patching ────────
-                    raw_before = _load_json(work_dir, "content/content.json")
-
-                    _gen_bar.progress(30, text="Generating Cornell Notes content with AI...")
-                    cn_gen = call_llm_cornell_notes(chunks, enriched_course)
-
-                    _gen_bar.progress(65, text="Injecting video URL into template...")
-                    title = cn_gen.get("title") or f"Cornell Notes - {course_name.strip()}"
-                    patched = update_cornell_notes_template(
-                        work_dir,
-                        title=title,
-                        video_url=cornell_video_url,
-                        gen_data=cn_gen,
-                        poster_image_bytes=cornell_poster_bytes,
-                        poster_image_ext=cornell_poster_ext,
-                    )
-
-                    # ── Debug expander: show template JSON so dev can verify ──
-                    with st.expander("\U0001f50d Debug: Cornell Notes content.json (click to inspect)", expanded=False):
-                        st.caption("**Before patching** (template original):")
-                        st.json(raw_before)
-                        st.caption("**After patching** (what goes into the .h5p):")
-                        st.json(patched)
-
-                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                    zip_dir_to_file(work_dir, out_h5p)
-
-                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                    qa_items = [
-                        {"label": "Video URL used", "content": _normalise_video_url(cornell_video_url) if cornell_video_url else "(template default)", "evidence": {}},
-                        {"label": "Body", "content": cn_gen.get("body", ""), "evidence": {}},
-                        {"label": "Cue placeholder", "content": cn_gen.get("cue_placeholder", ""), "evidence": {}},
-                        {"label": "Notes placeholder", "content": cn_gen.get("notes_placeholder", ""), "evidence": {}},
-                        {"label": "Summary placeholder", "content": cn_gen.get("summary_placeholder", ""), "evidence": {}},
-                    ]
-                    write_qa_report_html(out_qa, title, typ, qa_items)
-
-                elif typ == "Essay":
-                    work_dir = os.path.join(tmp, "_work_essay")
-                    unzip_h5p(templates["Essay"], work_dir)
-
-                    # Always generate exactly 1 essay question
-                    gen_data = call_llm_essay(chunks, enriched_course)
-                    _gen_bar.progress(65, text="AI content generated — building template...")
-
-                    title = gen_data.get("title", f"Essay - {course_name.strip()}")
-                    desc = gen_data.get("description", "Read the question and write your answer below.")
-
-                    qa_items = update_essay_template(
-                        work_dir,
-                        title=title,
-                        description=desc,
-                        essays=gen_data.get("essays", []),
-                    )
-
-                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                    zip_dir_to_file(work_dir, out_h5p)
-
-                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                    write_qa_report_html(out_qa, title, typ, qa_items)
-
-                elif typ == "Summary":
-                    work_dir = os.path.join(tmp, "_work_summary")
-                    unzip_h5p(templates["Summary"], work_dir)
-                    gen_data = call_llm_summary(chunks, run_n, enriched_course)
-                    _gen_bar.progress(65, text="AI content generated — building template...")
-                    update_summary_template(
-                        work_dir,
-                        gen_data["title"],
-                        gen_data.get("groups", []),
-                        overall_feedback=gen_data.get("overall_feedback"),
-                        introduction=gen_data.get("introduction"),  # <-- NEW: pass introduction
-                    )
-                    title = gen_data["title"]
- 
-                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                    zip_dir_to_file(work_dir, out_h5p)
- 
-                    qa_items = []
-                    for i, grp in enumerate(gen_data.get("groups", []), start=1):
-                        correct = grp.get("correct_statement", "")
-                        incorrects = grp.get("incorrect_statements", [])
-                        qa_items.append({
-                            "label": f"Group {i}",
-                            "content": f"Correct: {correct}\nIncorrect: {'; '.join(incorrects)}",
-                            "evidence": grp.get("evidence", {}),
-                        })
- 
-                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                    write_qa_report_html(out_qa, title, typ, qa_items)
-
-                else:
-                    work_dir = os.path.join(tmp, "_work_generic")
-                    unzip_h5p(templates[typ], work_dir)
-
-                    tpl_h5p = json.loads(open(os.path.join(work_dir, "h5p.json"), "r", encoding="utf-8").read())
-                    tpl_content = json.loads(open(os.path.join(work_dir, "content", "content.json"), "r", encoding="utf-8").read())
-
-                    gen_data = call_llm_generic_patch(
-                        chunks=chunks,
-                        course_name=enriched_course,
-                        activity_type=typ,
-                        template_h5p_json=tpl_h5p,
-                        template_content_json=tpl_content,
-                        item_count=run_n,
-                    )
-                    _gen_bar.progress(65, text="AI content generated — building template...")
-
-                    update_h5p_title(work_dir, gen_data["title"])
-                    _save_json(work_dir, "content/content.json", gen_data["patched_content_json"])
-
-                    title = gen_data["title"]
-                    out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
-                    zip_dir_to_file(work_dir, out_h5p)
-
-                    out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
-                    write_qa_report_html(out_qa, title, typ, gen_data.get("qa_items", []))
-
-                _gen_bar.progress(90, text="Packaging H5P file...")
-                st.success("Done.")
-                _gen_bar.progress(100, text="Done ✓")
-                time.sleep(0.8)
-                gen_progress_area.empty()
-
-                # Persist outputs in session state so downloads remain available after reruns
-                with open(out_h5p, "rb") as f:
-                    st.session_state["last_h5p_bytes"] = f.read()
-                with open(out_qa, "rb") as f:
-                    st.session_state["last_qa_bytes"] = f.read()
-                st.session_state["last_h5p_name"] = os.path.basename(out_h5p)
-                st.session_state["last_qa_name"] = os.path.basename(out_qa)
+            # Extract qualification spec text for LLM context
+            _suggest_bar.progress(10, text="Reading qualification specification...")
+            qual_spec_text = ""
+            try:
+                qual_spec_chunks = extract_pdf_chunks_from_bytes(qual_spec_file.name, qual_spec_file.getvalue())
+                qual_spec_text = join_chunks_for_prompt(qual_spec_chunks, max_chars=30000)
+            except Exception:
+                st.warning("Could not extract text from qualification specification file. Proceeding without it.")
+            st.session_state["qual_spec_text"] = qual_spec_text
+
+            key = compute_inputs_key(uploads, course_name, unit_name, qual_spec_file)
+            if st.session_state["suggestions_cache_key"] == key and st.session_state["suggestions"] is not None:
+                _suggest_bar.progress(100, text="Done ✓")
+                time.sleep(0.5)
+                suggest_progress_area.empty()
+            else:
+                _suggest_bar.progress(25, text="Extracting PDF content...")
+                chunks = ensure_chunks(uploads)
+                chunks_small = choose_representative_chunks(chunks, max_pages=18)
+                _suggest_bar.progress(40, text="Analysing content with AI...")
+                s = llm_suggest_activities(chunks_small, course_name.strip(), unit_name.strip(), qual_spec_text)
+                _suggest_bar.progress(90, text="Finalising suggestions...")
+                st.session_state["suggestions"] = s
+                st.session_state["suggestions_cache_key"] = key
+                _suggest_bar.progress(100, text="Done ✓")
+                time.sleep(0.5)
+                suggest_progress_area.empty()
 
         except Exception as e:
-            gen_progress_area.empty()
+            suggest_progress_area.empty()
             msg = str(e)
             if "429" in msg or "Too Many Requests" in msg:
-                st.error("Rate limit reached while generating. Please wait a minute and try again.")
+                st.error(msg)
             else:
                 st.error(msg)
         finally:
             st.session_state["busy"] = False
+
+            # Show suggestions and generation
+    if st.session_state["suggestions"]:
+        recs = (st.session_state["suggestions"].get("recommendations") or [])
+        allowed = set(BEST_H5P_TYPES)
+        recs = [r for r in recs if isinstance(r, dict) and (r.get("activity_type") in allowed)]
+
+        if not recs:
+            st.info("No suggestions returned. Try again.")
+            st.stop()
+
+        st.markdown("---")
+        st.markdown("### Choose one suggested type")
+
+        other_label = "Other (choose from all types)"
+
+        # Make a compact radio list with template availability (plus an "Other" option)
+        options: List[str] = []
+        meta: Dict[str, Dict[str, Any]] = {}
+
+        for r in recs:
+            typ = r.get("activity_type", "")
+            score = int(r.get("score_0_to_5", 0) or 0)
+            why = (r.get("why") or "").strip()
+            suggested_n = int(r.get("suggested_item_count", 5) or 5)
+            ev = r.get("evidence", {}) or {}
+
+            template_ok = (typ in templates) if typ not in ("Quiz", "Multiple Choice") else ("Quiz" in templates)
+            status = "" if template_ok else " (Missing template)"
+            label = f"{typ}{status}"
+
+            options.append(label)
+            meta[label] = {
+                "type": typ,
+                "why": why,
+                "n": suggested_n,
+                "ev": ev,
+                "template_ok": template_ok,
+                "score": score,
+            }
+
+        options.append(other_label)
+        meta[other_label] = {
+            "type": "__OTHER__",
+            "why": "",
+            "n": 4,
+            "ev": {},
+            "template_ok": True,
+            "score": 0,
+        }
+
+        choice = st.radio("Suggested types", options=options, index=0)
+        chosen = meta[choice]
+
+        # Resolve selected type (including Other)
+        resolved_type = chosen["type"]
+
+        if resolved_type == "__OTHER__":
+            st.markdown("#### Other type")
+
+            template_labels = sorted(list(templates.keys()))
+            resolved_type = st.selectbox(
+                "Pick an available template",
+                options=template_labels,
+                index=0
+            )
+
+            st.caption(f"Using template: **{resolved_type}**")
+
+        # Apply resolved type back to chosen and re-check template availability
+        chosen["type"] = resolved_type
+        chosen["template_ok"] = (resolved_type in templates) if resolved_type not in ("Quiz", "Multiple Choice") else ("Quiz" in templates)
+
+        st.markdown("---")
+        st.markdown("### Generate H5P")
+
+        cornell_video_url = ""
+        cornell_poster_bytes: Optional[bytes] = None
+        cornell_poster_ext: str = "jpg"
+
+        if chosen["type"] == "Cornell Notes":
+            st.markdown("#### Cornell Notes — Video URL")
+            cornell_video_url = st.text_input(
+                "Vimeo / YouTube video URL",
+                placeholder="https://vimeo.com/123456789",
+                help="Plain video page URL. Do NOT paste embed/iframe URLs.",
+            )
+            if cornell_video_url:
+                import re as _re2
+                _m = _re2.search(r"vimeo\.com(?:/video)?/(\d+)", cornell_video_url)
+                if _m:
+                    _preview = f"https://vimeo.com/{_m.group(1)}"
+                else:
+                    _preview = cornell_video_url
+                if "player.vimeo.com" in cornell_video_url or "/embed/" in cornell_video_url:
+                    st.warning("\u26a0\ufe0f Embed URL detected — please use the plain page URL.")
+                else:
+                    st.success(f"\u2705 Will use: `{_preview}`")
+            else:
+                st.info("\u2139\ufe0f No URL entered — template default video will be kept.")
+
+            st.markdown("#### Poster Image (optional)")
+            poster_upload = st.file_uploader(
+                "Upload cover / poster image (JPG or PNG)",
+                type=["jpg", "jpeg", "png"],
+                help="Shown as the video thumbnail. Tip: export your PDF cover page as an image.",
+            )
+            if poster_upload is not None:
+                cornell_poster_bytes = poster_upload.read()
+                cornell_poster_ext = poster_upload.name.rsplit(".", 1)[-1].lower()
+                st.image(cornell_poster_bytes, caption="Poster preview", use_container_width=True)
+
+            n_items = 1
+            cp_n_slides = None
+            cp_activity_types = []
+            cp_n_questions = 0
+            ib_n_pages = None
+            ib_activity_types = []
+            ib_n_questions = 0
+
+        # --- Course Presentation specific options ---
+        elif chosen["type"] == "Course Presentation":
+            # Slide-count limits: 1 PDF → max 8 total (7 content + 1 activity)
+            #                     multiple PDFs → max 12 total (11 content + 1 activity)
+            n_pdfs = len(uploads) if uploads else 1
+            if n_pdfs == 1:
+                max_content_slides = 7
+                help_note = "Max 8 slides total (7 content + 1 activity) for a single PDF."
+            else:
+                max_content_slides = 11
+                help_note = "Max 12 slides total (11 content + 1 activity) for multiple PDFs."
+
+            default_slides = min(max_content_slides, max(3, chosen["n"]))
+
+            cp_n_slides = st.number_input(
+                "Number of content slides",
+                min_value=3,
+                max_value=max_content_slides,
+                value=default_slides,
+                step=1,
+                help=help_note,
+            )
+
+            cp_activity_type = st.selectbox(
+                "Activity type for the last slide",
+                options=["Drag the Words", "Fill in the Blanks"],
+                index=0,
+                help="Select one activity type for the last slide.",
+            )
+            cp_activity_types = [cp_activity_type] if cp_activity_type else []
+
+            cp_n_questions = st.number_input(
+                "Number of questions (in the activity slide)",
+                min_value=2,
+                max_value=5,
+                value=3,
+                step=1,
+                help="Total questions for the selected activity type on the last slide.",
+            )
+
+            st.caption(f"Total slides: **{int(cp_n_slides) + 1}** ({int(cp_n_slides)} content + 1 activity)")
+
+            n_items = cp_n_slides  # n_items drives the rest of the pipeline
+            ib_n_pages = None
+            ib_activity_types = []
+            ib_n_questions = 0
+
+        elif chosen["type"] == "Virtual Tour (360)":
+            st.markdown("#### Virtual Tour — 360° Panoramic Image")
+            st.info(
+                "**⚠️ This activity requires a 360° equirectangular panoramic image.**\\n\\n"
+                "A 360° image is a special wide photograph (typically **2:1 aspect ratio**, "
+                "e.g. 4096×2048 or 8192×4096) that wraps around the viewer to create an "
+                "immersive experience.\\n\\n"
+                "**Do NOT upload a regular photo** — it will appear stretched and distorted.\\n\\n"
+                "**How to get a 360° image:**\\n"
+                "- Use a **360° camera** (e.g. Insta360, Ricoh Theta, GoPro MAX)\\n"
+                "- Use a **phone app** that stitches panoramas (e.g. Google Street View app)\\n"
+                "- Download from a **360° image library** (e.g. Poly Haven, Flickr 360° group)\\n"
+                "- Export equirectangular images from **Google Street View**"
+            )
+            vt_360_file = st.file_uploader(
+                "Upload 360° panoramic image *",
+                type=["jpg", "jpeg", "png", "webp"],
+                help="Must be an equirectangular 360° panoramic image (2:1 aspect ratio recommended).",
+            )
+            if vt_360_file is not None:
+                try:
+                    from PIL import Image as _PILImage
+                    import io as _io
+                    _pil = _PILImage.open(_io.BytesIO(vt_360_file.getvalue()))
+                    _w, _h = _pil.size
+                    _ratio = _w / _h if _h > 0 else 0
+                    st.image(
+                        vt_360_file.getvalue(),
+                        caption=f"Preview — {_w}×{_h}px (ratio {_ratio:.2f}:1)",
+                        use_container_width=True,
+                    )
+                    if abs(_ratio - 2.0) > 0.3:
+                        st.warning(
+                            f"⚠️ This image has a **{_ratio:.2f}:1** aspect ratio. "
+                            f"360° panoramic images should be **2:1** (e.g. 4096×2048). "
+                            f"If this is not a 360° image, it will appear stretched/distorted."
+                        )
+                    else:
+                        st.success(
+                            f"✅ Looks like a valid 360° panorama ({_w}×{_h}px, {_ratio:.1f}:1 ratio)."
+                        )
+                except ImportError:
+                    st.caption("Install Pillow (`pip install Pillow`) for image preview & validation.")
+                except Exception:
+                    st.caption("Could not preview image.")
+
+            vt_n_hotspots = st.number_input(
+                "Number of info hotspots",
+                min_value=2,
+                max_value=8,
+                value=4,
+                step=1,
+                help="Clickable points on the 360° image that show informational text from the PDF.",
+            )
+            st.caption(f"Will generate **{int(vt_n_hotspots)} clickable hotspots** with content from the uploaded PDFs.")
+
+            n_items = 1
+            cp_n_slides = None
+            cp_activity_types = []
+            cp_n_questions = 0
+            ib_n_pages = None
+            ib_activity_types = []
+            ib_n_questions = 0
+
+        elif chosen["type"] == "Find Multiple Hotspots":
+             n_items = st.number_input(
+                 "Number of items in the grid",
+                 min_value=6,
+                 max_value=9,
+                 value=9,
+                 step=1,
+                 help="Total items shown in a 3×3 grid (6 = 3×2, 9 = 3×3). "
+                      "About 1/3 will be correct answers.",
+             )
+             n_correct = max(2, n_items // 3)
+             st.caption(
+                 f"Will generate a **{3 if n_items > 6 else 3}×{(n_items + 2) // 3}** grid "
+                 f"with **{n_correct} correct** and **{n_items - n_correct} distractor** items."
+             )
+             cp_n_slides = None
+             cp_activity_types = []
+             cp_n_questions = 0
+             ib_n_pages = None
+             ib_activity_types = []
+             ib_n_questions = 0
+
+        elif chosen["type"] == "Game Map":
+             st.markdown("#### Game Map — Background Image")
+             st.info(
+                 "**Upload a background image** for your Game Map.\\n\\n"
+                 "This can be any image — a map, floor plan, diagram, infographic, "
+                 "or illustrated scene. Interactive stages (reading + quiz points) "
+                 "will be placed as clickable dots across this image.\\n\\n"
+                 "**Tips for good background images:**\\n"
+                 "- Use a wide image (landscape, e.g. 3000×1700px)\\n"
+                 "- Illustrated maps, floor plans, or diagrams work best\\n"
+                 "- Avoid images with too much small text"
+             )
+             gm_bg_file = st.file_uploader(
+                 "Upload background image *",
+                 type=["jpg", "jpeg", "png", "webp"],
+                 help="The background image on which game stages will be placed.",
+                 key="gm_bg_upload",
+             )
+             if gm_bg_file is not None:
+                 try:
+                     from PIL import Image as _PILImage
+                     import io as _io
+                     _pil = _PILImage.open(_io.BytesIO(gm_bg_file.getvalue()))
+                     _w, _h = _pil.size
+                     st.image(gm_bg_file.getvalue(),
+                              caption=f"Preview — {_w}×{_h}px",
+                              use_container_width=True)
+                     if _w < 1000:
+                         st.warning("Image width is below 1000px. A wider image (2000px+) produces better results.")
+                 except ImportError:
+                     st.caption("Install Pillow for image preview.")
+                 except Exception:
+                     st.caption("Could not preview image.")
+
+             gm_n_stages = st.number_input(
+                 "Number of stages (points on the map)",
+                 min_value=4,
+                 max_value=12,
+                 value=6,
+                 step=2,
+                 help="Total interactive points. Alternates reading and quiz stages. Even numbers recommended.",
+             )
+             st.caption(
+                 f"Will generate **{int(gm_n_stages)} stages**: "
+                 f"{int(gm_n_stages) // 2} reading + {int(gm_n_stages) - int(gm_n_stages) // 2} quiz stages "
+                 f"(Multiple Choice, True/False, Drag the Words, Fill in the Blanks)"
+             )
+
+             n_items = gm_n_stages
+             cp_n_slides = None
+             cp_activity_types = []
+             cp_n_questions = 0
+             ib_n_pages = None
+             ib_activity_types = []
+             ib_n_questions = 0
+
+        # --- Interactive Book specific options ---
+        elif chosen["type"] == "Interactive Book":
+            # Page-count limits: 1 PDF → max 8 total (7 content + 1 activity)
+            #                    multiple PDFs → max 12 total (11 content + 1 activity)
+            n_pdfs = len(uploads) if uploads else 1
+            if n_pdfs == 1:
+                max_content_pages = 7
+                help_note = "Max 8 pages total (7 content + 1 activity) for a single PDF."
+            else:
+                max_content_pages = 11
+                help_note = "Max 12 pages total (11 content + 1 activity) for multiple PDFs."
+
+            default_pages = min(max_content_pages, max(3, chosen["n"]))
+
+            ib_n_pages = st.number_input(
+                "Number of content pages",
+                min_value=3,
+                max_value=max_content_pages,
+                value=default_pages,
+                step=1,
+                help=help_note,
+            )
+
+            ib_activity_type = st.selectbox(
+                "Activity type for the last page",
+                options=["Drag the Words", "Fill in the Blanks"],
+                index=0,
+                help="Select one activity type for the last page.",
+            )
+            ib_activity_types = [ib_activity_type] if ib_activity_type else []
+
+            ib_n_questions = st.number_input(
+                "Number of questions (in the activity page)",
+                min_value=2,
+                max_value=5,
+                value=3,
+                step=1,
+                help="Total questions for the selected activity type on the last page.",
+            )
+
+            st.caption(f"Total pages: **{int(ib_n_pages) + 1}** ({int(ib_n_pages)} content + 1 activity)")
+
+            n_items = ib_n_pages  # n_items drives the rest of the pipeline
+            cp_n_slides = None
+            cp_activity_types = []
+            cp_n_questions = 0
+
+        else:
+            cp_n_slides = None
+            cp_activity_types = []
+            cp_n_questions = 0
+            ib_n_pages = None
+            ib_activity_types = []
+            ib_n_questions = 0
+
+            # ── ESSAY: always 1 question, no number input needed ──
+            # ── ESSAY: always 1 question, no number input needed ──
+            if chosen["type"] == "Essay":
+                n_items = 1
+                st.info("Essay generates a single question/instruction for the learner to respond to. All content is taken directly from the uploaded PDF(s).")
+
+            # ── PAGE: fixed layout, no number input needed ──
+            elif chosen["type"] == "Page":
+                n_items = 3
+                st.info("Page generates content sections with images and a short True/False quiz from the uploaded PDF(s).")
+                st.info("Essay generates a single question/instruction for the learner to respond to. All content is taken directly from the uploaded PDF(s).")
+
+            # Enforce question limits for selected types
+            elif chosen["type"] in LIMITED_Q_TYPES:
+                n_pdfs = len(uploads) if uploads else 1
+                max_q = LIMITED_Q_MAX_SINGLE_PDF if n_pdfs == 1 else LIMITED_Q_MAX_MULTI_PDF
+                default_n = LIMITED_Q_MIN  # default display should start at 4
+                n_items = st.number_input(
+                    "Number of items/questions",
+                    min_value=LIMITED_Q_MIN,
+                    max_value=int(max_q),
+                    value=int(default_n),
+                    step=1,
+                    key=f"n_items_limited_{chosen['type']}_{n_pdfs}",
+                    help=f"Allowed range: {LIMITED_Q_MIN}–{int(max_q)} ({n_pdfs} PDF{'s' if n_pdfs != 1 else ''}).",
+                )
+            else:
+                default_n = max(5, chosen["n"]) if chosen["type"] in ("Quiz", "Multiple Choice") else max(3, chosen["n"])
+
+                # Dialog Cards: keep a tight range (3–5) to avoid low-quality/duplicated cards
+                if chosen["type"] == "Dialog Cards":
+                    default_cards = int(min(5, max(3, default_n)))
+                    n_items = st.number_input("Number of cards", min_value=3, max_value=5, value=default_cards, step=1)
+                else:
+                    n_items = st.number_input("Number of items/questions", min_value=3, max_value=30, value=int(default_n), step=1)
+
+        gen = st.button("Generate H5P file", type="primary", use_container_width=True, disabled=st.session_state["busy"])
+
+        # Placeholder for generate progress bar (appears directly under the button)
+        gen_progress_area = st.empty()
+
+        if gen:
+            try:
+                st.session_state["busy"] = True
+
+                if not chosen["template_ok"]:
+                    if chosen["type"] in ("Quiz", "Multiple Choice"):
+                        st.error("Missing template: templates/Quiz.h5p (required for Question Set generation).")
+                    else:
+                        st.error(f"Missing template: templates/{chosen['type']}.h5p")
+                    st.stop()
+
+                _gen_bar = gen_progress_area.progress(0, text="Preparing content...")
+                time.sleep(0.3)
+
+                _gen_bar.progress(10, text="Extracting PDF content...")
+                chunks = ensure_chunks(uploads)
+
+                # Build enriched course context for LLM prompts
+                _gen_bar.progress(15, text="Building course context...")
+                _qs_text = st.session_state.get("qual_spec_text", "")
+                _course_label = course_name.strip()
+                _unit_label = (unit_name or "").strip()
+                _context_parts = [_course_label]
+                if _unit_label:
+                    _context_parts.append(f"Unit: {_unit_label}")
+                if _qs_text:
+                    _context_parts.append(f"Qualification Specification excerpt:\n{_qs_text[:12000]}")
+                enriched_course = "\n".join(_context_parts)
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    typ = chosen["type"]
+                    run_n = int(n_items)
+
+                    # Enforce question limits for selected types
+                    if typ in LIMITED_Q_TYPES:
+                        n_pdfs = len(uploads) if uploads else 1
+                        max_q = LIMITED_Q_MAX_SINGLE_PDF if n_pdfs == 1 else LIMITED_Q_MAX_MULTI_PDF
+                        run_n = max(LIMITED_Q_MIN, min(run_n, int(max_q)))
+
+                    _gen_bar.progress(25, text=f"Generating {typ} content with AI...")
+
+                    if typ == "Quiz":
+                        tf = call_llm_truefalse_statements(chunks, run_n, enriched_course)
+                        _gen_bar.progress(65, text="AI content generated — building template...")
+
+                        qs_dir = os.path.join(tmp, "_work_qs_tf")
+                        unzip_h5p(templates["Quiz"], qs_dir)
+
+                        title = tf.get("title", f"True/False Quiz - {course_name.strip()}")
+                        desc = tf.get("description", "Answer the True/False questions.")
+                        qa_items = build_question_set_truefalse(qs_dir, title, desc, tf.get("items", []))
+
+                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                        zip_dir_to_file(qs_dir, out_h5p)
+
+                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                        write_qa_report_html(out_qa, title, "Quiz (Question Set) — True/False", qa_items)
+
+                    elif typ == "Multiple Choice":
+                        mc = call_llm_multichoice_questions(chunks, run_n, enriched_course)
+                        _gen_bar.progress(65, text="AI content generated — building template...")
+
+                        qs_dir = os.path.join(tmp, "_work_qs_mc")
+                        unzip_h5p(templates["Quiz"], qs_dir)
+
+                        title = mc.get("title", f"Multiple Choice Quiz - {course_name.strip()}")
+                        desc = mc.get("description", "Answer the multiple choice questions.")
+                        qa_items = build_question_set_multichoice(qs_dir, title, desc, mc.get("items", []))
+
+                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                        zip_dir_to_file(qs_dir, out_h5p)
+
+                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                        write_qa_report_html(out_qa, title, "Quiz (Question Set) — Multiple Choice", qa_items)
+
+                    elif typ == "Dialog Cards":
+                        work_dir = os.path.join(tmp, "_work_dialog")
+                        unzip_h5p(templates["Dialog Cards"], work_dir)
+
+                        # Dialog Cards are validated strictly against the extracted PDF text.
+                        # Keep the context minimal to avoid pulling in anything outside the PDFs.
+                        dialog_context = f"{course_name.strip()}\nUnit: {(unit_name or '').strip()}"
+                        gen_data = generate_dialog_cards_strict(chunks, run_n, dialog_context)
+                        _gen_bar.progress(65, text="AI content generated & validated — building template...")
+                        title = gen_data.get("title", f"Dialog Cards - {course_name.strip()}")
+                        desc = gen_data.get("description", "")
+
+                        qa_items = update_dialog_cards_template(
+                            work_dir,
+                            title,
+                            desc,
+                            gen_data.get("cards", []),
+                            course=course_name.strip(),
+                            pdf_headings=st.session_state.get("pdf_headings_cache") or [],
+                            pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
+                        )
+
+                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                        zip_dir_to_file(work_dir, out_h5p)
+
+                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                        write_qa_report_html(out_qa, title, typ, qa_items)
+
+                    elif typ == "Dictation":
+                        work_dir = os.path.join(tmp, "_work_dictation")
+                        unzip_h5p(templates["Dictation"], work_dir)
+
+                        gen_data = call_llm_dictation(chunks, run_n, enriched_course)
+                        title = gen_data.get("title", f"Dictation - {course_name.strip()}")
+                        desc = gen_data.get("description", "Listen carefully and type what you hear.")
+
+                        qa_items = update_dictation_template(
+                            work_dir,
+                            title=title,
+                            description=desc,
+                            sentences=gen_data.get("sentences", []),
+                            progress_callback=lambda pct, txt: _gen_bar.progress(pct, text=txt),
+                        )
+
+                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                        zip_dir_to_file(work_dir, out_h5p)
+
+                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                        write_qa_report_html(out_qa, title, typ, qa_items)
+
+                    elif typ == "Page":
+                        work_dir = os.path.join(tmp, "_work_page")
+                        unzip_h5p(templates["Page"], work_dir)
+
+                        # Step 1: Generate content sections (3-4 sections)
+                        _gen_bar.progress(25, text="Generating page content from PDFs...")
+                        gen_data = call_llm_page_content(chunks, n_sections=4, course=enriched_course)
+
+                        # Step 2: Generate 1 True/False question
+                        _gen_bar.progress(40, text="Generating True/False question...")
+                        tf_data = call_llm_truefalse_statements(chunks, 1, enriched_course)
+
+                        # Step 3: Generate 1 Drag the Words question
+                        _gen_bar.progress(50, text="Generating Drag the Words question...")
+                        dw_data = call_llm_drag_words(chunks, 1, enriched_course)
+
+                        # Step 4: Generate 1 Multiple Choice question
+                        _gen_bar.progress(60, text="Generating Multiple Choice question...")
+                        mc_data = call_llm_multichoice_questions(chunks, 1, enriched_course)
+
+                        _gen_bar.progress(70, text="AI content generated — building template...")
+                        title = gen_data.get("title", f"Page - {course_name.strip()}")
+
+                        # Build the activities list
+                        page_activities = []
+
+                        # True/False
+                        for it in (tf_data.get("items") or [])[:1]:
+                            page_activities.append({
+                                "type": "truefalse",
+                                "data": it,
+                                "evidence": it.get("evidence") or {},
+                            })
+
+                        # Multiple Choice
+                        for it in (mc_data.get("items") or [])[:1]:
+                            page_activities.append({
+                                "type": "multichoice",
+                                "data": it,
+                                "evidence": it.get("evidence") or {},
+                            })
+
+                        qa_items = update_page_template_with_images(
+                            work_dir,
+                            title,
+                            gen_data.get("sections", []),
+                            course=course_name.strip(),
+                            pdf_headings=st.session_state.get("pdf_headings_cache") or [],
+                            pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
+                            activities=page_activities,
+                        )
+
+                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                        zip_dir_to_file(work_dir, out_h5p)
+
+                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                        write_qa_report_html(out_qa, title, typ, qa_items)
+
+                    elif typ == "Course Presentation":
+                        work_dir = os.path.join(tmp, "_work_course_presentation")
+                        unzip_h5p(templates["Course Presentation"], work_dir)
+
+                        # Step 1: Generate content slides
+                        _gen_bar.progress(30, text="Generating content slides from PDFs...")
+                        gen_data = call_llm_course_presentation(chunks, n_slides=run_n, course=enriched_course)
+
+                        # Step 2: Generate activity questions for each selected type
+                        act_groups: Dict[str, List[Dict[str, Any]]] = {}
+                        if cp_activity_types and cp_n_questions and cp_n_questions > 0:
+                            n_types = len(cp_activity_types)
+                            base_per_type = int(cp_n_questions) // n_types
+                            remainder = int(cp_n_questions) % n_types
+
+                            for ti, atype in enumerate(cp_activity_types):
+                                n_q = base_per_type + (1 if ti < remainder else 0)
+                                if n_q < 1:
+                                    continue
+                                _gen_bar.progress(
+                                    40 + (ti * 20 // n_types),
+                                    text=f"Generating {n_q} {atype} questions..."
+                                )
+                                q_data = call_llm_cp_activity_questions(
+                                    chunks,
+                                    activity_type=atype,
+                                    n_questions=n_q,
+                                    course=enriched_course,
+                                )
+                                act_groups[atype] = q_data.get("questions") or []
+
+                        _gen_bar.progress(65, text="Building presentation template...")
+                        title = gen_data.get("title", f"Course Presentation - {course_name.strip()}")
+                        desc = gen_data.get("description", "")
+
+                        qa_items = update_course_presentation_template_with_images(
+                            work_dir,
+                            title=title,
+                            description=desc,
+                            slides=gen_data.get("slides", []),
+                            course=course_name.strip(),
+                            pdf_headings=st.session_state.get("pdf_headings_cache") or [],
+                            pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
+                            activity_groups=act_groups,
+                        )
+
+                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                        zip_dir_to_file(work_dir, out_h5p)
+
+                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                        write_qa_report_html(out_qa, title, typ, qa_items)
+
+                    elif typ == "Virtual Tour (360)":
+                        if vt_360_file is None:
+                            raise ValueError("Please upload a 360° panoramic image for Virtual Tour (360).")
+
+                        work_dir = os.path.join(tmp, "_work_virtual_tour")
+                        unzip_h5p(templates["Virtual Tour (360)"], work_dir)
+
+                        title = f"Virtual Tour - {course_name.strip()}"
+
+                        # Generate hotspot interactions from PDF content
+                        _gen_bar.progress(30, text="Generating hotspot content from PDFs...")
+                        hotspot_data = call_llm_virtual_tour_interactions(
+                            chunks,
+                            n_hotspots=int(vt_n_hotspots),
+                            course=enriched_course,
+                        )
+                        hotspots = hotspot_data.get("hotspots") or []
+
+                        _gen_bar.progress(65, text=f"Building 360° tour with {len(hotspots)} hotspots...")
+                        qa_items = update_virtual_tour_template(
+                            work_dir,
+                            title,
+                            vt_360_file.getvalue(),
+                            vt_360_file.name,
+                            hotspots=hotspots,
+                        )
+
+                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                        zip_dir_to_file(work_dir, out_h5p)
+
+                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                        write_qa_report_html(out_qa, title, typ, qa_items)
+
+
+                    elif typ == "Information Wall":
+                        work_dir = os.path.join(tmp, "_work_information_wall")
+                        unzip_h5p(templates["Information Wall"], work_dir)
+
+                        _gen_bar.progress(30, text="Generating Information Wall content from PDFs...")
+                        gen_data = call_llm_information_wall(chunks, run_n, enriched_course)
+
+                        _gen_bar.progress(65, text="AI content generated — building template with images...")
+                        title = gen_data.get("title", f"Information Wall - {course_name.strip()}")
+                        header = gen_data.get("header", title)
+
+                        qa_items = update_information_wall_template(
+                            work_dir,
+                            title=title,
+                            header=header,
+                            properties=gen_data.get("properties", []),
+                            panels=gen_data.get("panels", []),
+                            course=course_name.strip(),
+                            pdf_headings=st.session_state.get("pdf_headings_cache") or [],
+                            pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
+                        )
+
+                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                        zip_dir_to_file(work_dir, out_h5p)
+
+                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                        write_qa_report_html(out_qa, title, typ, qa_items)
+
+                    elif typ == "Memory Game":
+                         work_dir = os.path.join(tmp, "_work_memory_game")
+                         unzip_h5p(templates["Memory Game"], work_dir)
+
+                         _gen_bar.progress(30, text="Generating Memory Game content from PDFs...")
+                         gen_data = call_llm_memory_game(chunks, run_n, enriched_course)
+
+                         _gen_bar.progress(65, text="AI content generated — downloading images...")
+                         title = gen_data.get("title", f"Memory Game - {course_name.strip()}")
+
+                         qa_items = update_memory_game_template(
+                             work_dir,
+                             title=title,
+                             cards=gen_data.get("cards", []),
+                             course=course_name.strip(),
+                             pdf_headings=st.session_state.get("pdf_headings_cache") or [],
+                             pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
+                         )
+
+                         out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                         zip_dir_to_file(work_dir, out_h5p)
+
+                         out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                         write_qa_report_html(out_qa, title, typ, qa_items)
+
+                    elif typ == "Game Map":
+                         if gm_bg_file is None:
+                             raise ValueError("Please upload a background image for the Game Map.")
+
+                         work_dir = os.path.join(tmp, "_work_game_map")
+                         unzip_h5p(templates["Game Map"], work_dir)
+
+                         _gen_bar.progress(30, text="Generating Game Map stages from PDFs...")
+                         gen_data = call_llm_game_map_stages(chunks, int(run_n), enriched_course)
+
+                         _gen_bar.progress(65, text="AI content generated — building Game Map template...")
+                         title = gen_data.get("title", f"Game Map - {course_name.strip()}")
+
+                         qa_items = update_game_map_template(
+                             work_dir,
+                             title=title,
+                             stages=gen_data.get("stages", []),
+                             bg_image_bytes=gm_bg_file.getvalue(),
+                             bg_image_name=gm_bg_file.name,
+                         )
+
+                         out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                         zip_dir_to_file(work_dir, out_h5p)
+
+                         out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                         write_qa_report_html(out_qa, title, typ, qa_items)
+
+                    elif typ == "Find Multiple Hotspots":
+                        work_dir = os.path.join(tmp, "_work_find_hotspots")
+                        unzip_h5p(templates["Find Multiple Hotspots"], work_dir)
+
+                        _gen_bar.progress(30, text="Generating hotspot items from PDFs...")
+                        gen_data = call_llm_find_multiple_hotspots(
+                            chunks, run_n, enriched_course
+                        )
+
+                        _gen_bar.progress(50, text="Creating grid image with downloaded images...")
+                        title = gen_data.get(
+                            "title",
+                            f"Find Multiple Hotspots - {course_name.strip()}",
+                        )
+                        question_title = gen_data.get(
+                            "questionTitle", "Find all the correct items"
+                        )
+                        hotspot_name = gen_data.get("hotspotName", "correct items")
+
+                        qa_items = update_find_multiple_hotspots_template(
+                            work_dir,
+                            title=title,
+                            question_title=question_title,
+                            hotspot_name=hotspot_name,
+                            items=gen_data.get("items", []),
+                            course=course_name.strip(),
+                            pdf_headings=st.session_state.get("pdf_headings_cache") or [],
+                            pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
+                        )
+
+                        _gen_bar.progress(85, text="Packaging H5P file...")
+                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                        zip_dir_to_file(work_dir, out_h5p)
+
+                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                        write_qa_report_html(out_qa, title, typ, qa_items)
+
+
+                    elif typ == "Interactive Book":
+                        work_dir = os.path.join(tmp, "_work_interactive_book")
+                        unzip_h5p(templates["Interactive Book"], work_dir)
+
+                        # Step 1: Generate content chapters/pages
+                        _gen_bar.progress(30, text="Generating content pages from PDFs...")
+                        gen_data = call_llm_interactive_book(chunks, n_chapters=max(2, min(run_n, run_n)), course=enriched_course)
+
+                        # Step 2: Generate activity questions for each selected type
+                        ib_act_groups: Dict[str, List[Dict[str, Any]]] = {}
+                        if ib_activity_types and ib_n_questions and ib_n_questions > 0:
+                            n_types = len(ib_activity_types)
+                            base_per_type = int(ib_n_questions) // n_types
+                            remainder = int(ib_n_questions) % n_types
+
+                            for ti, atype in enumerate(ib_activity_types):
+                                n_q = base_per_type + (1 if ti < remainder else 0)
+                                if n_q < 1:
+                                    continue
+                                _gen_bar.progress(
+                                    40 + (ti * 20 // n_types),
+                                    text=f"Generating {n_q} {atype} questions..."
+                                )
+                                q_data = call_llm_cp_activity_questions(
+                                    chunks,
+                                    activity_type=atype,
+                                    n_questions=n_q,
+                                    course=enriched_course,
+                                )
+                                ib_act_groups[atype] = q_data.get("questions") or []
+
+                        _gen_bar.progress(65, text="AI content generated — building template...")
+                        title = gen_data.get("title", f"Interactive Book - {course_name.strip()}")
+                        desc = gen_data.get("description", "")
+
+                        qa_items = update_interactive_book_template_with_images(
+                            work_dir,
+                            title=title,
+                            description=desc,
+                            chapters=gen_data.get("chapters", []),
+                            course=course_name.strip(),
+                            pdf_headings=st.session_state.get("pdf_headings_cache") or [],
+                            pdf_keywords=st.session_state.get("pdf_keywords_cache") or [],
+                            activity_groups=ib_act_groups,
+                        )
+
+                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                        zip_dir_to_file(work_dir, out_h5p)
+
+                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                        write_qa_report_html(out_qa, title, typ, qa_items)
+
+                    elif typ in BUILTIN_TEXT_TYPES:
+                        meta_t = BUILTIN_TEXT_TYPES[typ]
+                        work_dir = os.path.join(tmp, "_work_text")
+                        unzip_h5p(templates[typ], work_dir)
+
+                        if meta_t["mode"] == "dragtext":
+                            gen_data = call_llm_drag_words(chunks, run_n, enriched_course)
+                            _gen_bar.progress(65, text="AI content generated — building template...")
+                            textfield = make_dragtext_textfield(gen_data["items"])
+                            update_text_based_template(
+                                work_dir,
+                                gen_data["title"],
+                                gen_data["description"],
+                                textfield,
+                                gen_data.get("overall_feedback"),
+                                meta_t["textfield_keys"],
+                            )
+                            title = gen_data["title"]
+                            all_dis = []
+                            for it in gen_data.get("items", []):
+                                all_dis.extend(it.get("distractors") or [])
+                            maybe_set_distractors(work_dir, all_dis)
+                            qa_items = [
+                                {
+                                    "label": "Drag the Words",
+                                    "content": it.get("sentence", ""),
+                                    "expected": it.get("missing_word", ""),
+                                    "evidence": it.get("evidence", {}),
+                                }
+                                for it in gen_data.get("items", [])
+                            ]
+
+                        elif meta_t["mode"] == "blanks":
+                            gen_data = call_llm_fill_blanks(chunks, run_n, enriched_course)
+                            _gen_bar.progress(65, text="AI content generated — building template...")
+                            textfield = make_blanks_textfield(gen_data["items"])
+                            desc = (gen_data.get("description") or "").strip() or "Read each sentence and type the missing word."
+
+                            update_fill_in_the_blanks_template(
+                                work_dir,
+                                gen_data["title"],
+                                desc,
+                                textfield,
+                                gen_data.get("overall_feedback"),
+                            )
+
+                            title = gen_data["title"]
+                            qa_items = [
+                                {
+                                    "label": f"Item {i + 1}",
+                                    "content": f"{it.get('sentence', '')} (answer: {it.get('answer', '')})",
+                                    "evidence": it.get("evidence", {}),
+                                }
+                                for i, it in enumerate(gen_data.get("items", []))
+                            ]
+
+                        elif meta_t["mode"] == "markwords":
+                            gen_data = call_llm_mark_words(chunks, run_n, enriched_course)
+                            _gen_bar.progress(65, text="AI content generated — building template...")
+                            textfield = make_mark_words_textfield(gen_data["items"])
+                            update_text_based_template(
+                                work_dir,
+                                gen_data["title"],
+                                gen_data["description"],
+                                textfield,
+                                None,
+                                meta_t["textfield_keys"],
+                            )
+                            title = gen_data["title"]
+                            qa_items = [
+            {
+                "label": f"Item {i + 1}",
+                "content": f"{it.get('sentence', '')} (marked: {it.get('marked_word', '')}, hint: {it.get('hint', '')})",
+                "evidence": it.get("evidence", {}),
+            }
+            for i, it in enumerate(gen_data.get("items", []))
+        ]
+
+                        else:
+                            raise ValueError(f"Unsupported BUILTIN_TEXT_TYPES mode: {meta_t['mode']}")
+
+                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                        zip_dir_to_file(work_dir, out_h5p)
+
+                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                        write_qa_report_html(out_qa, title, typ, qa_items)
+
+                    elif typ == "Cornell Notes":
+                        work_dir = os.path.join(tmp, "_work_cornell_notes")
+                        unzip_h5p(templates["Cornell Notes"], work_dir)
+
+                        # ── Read raw template content.json BEFORE patching ────────
+                        raw_before = _load_json(work_dir, "content/content.json")
+
+                        _gen_bar.progress(30, text="Generating Cornell Notes content with AI...")
+                        cn_gen = call_llm_cornell_notes(chunks, enriched_course)
+
+                        _gen_bar.progress(65, text="Injecting video URL into template...")
+                        title = cn_gen.get("title") or f"Cornell Notes - {course_name.strip()}"
+                        patched = update_cornell_notes_template(
+                            work_dir,
+                            title=title,
+                            video_url=cornell_video_url,
+                            gen_data=cn_gen,
+                            poster_image_bytes=cornell_poster_bytes,
+                            poster_image_ext=cornell_poster_ext,
+                        )
+
+                        # ── Debug expander: show template JSON so dev can verify ──
+                        with st.expander("\U0001f50d Debug: Cornell Notes content.json (click to inspect)", expanded=False):
+                            st.caption("**Before patching** (template original):")
+                            st.json(raw_before)
+                            st.caption("**After patching** (what goes into the .h5p):")
+                            st.json(patched)
+
+                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                        zip_dir_to_file(work_dir, out_h5p)
+
+                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                        qa_items = [
+                            {"label": "Video URL used", "content": _normalise_video_url(cornell_video_url) if cornell_video_url else "(template default)", "evidence": {}},
+                            {"label": "Body", "content": cn_gen.get("body", ""), "evidence": {}},
+                            {"label": "Cue placeholder", "content": cn_gen.get("cue_placeholder", ""), "evidence": {}},
+                            {"label": "Notes placeholder", "content": cn_gen.get("notes_placeholder", ""), "evidence": {}},
+                            {"label": "Summary placeholder", "content": cn_gen.get("summary_placeholder", ""), "evidence": {}},
+                        ]
+                        write_qa_report_html(out_qa, title, typ, qa_items)
+
+                    elif typ == "Essay":
+                        work_dir = os.path.join(tmp, "_work_essay")
+                        unzip_h5p(templates["Essay"], work_dir)
+
+                        # Always generate exactly 1 essay question
+                        gen_data = call_llm_essay(chunks, enriched_course)
+                        _gen_bar.progress(65, text="AI content generated — building template...")
+
+                        title = gen_data.get("title", f"Essay - {course_name.strip()}")
+                        desc = gen_data.get("description", "Read the question and write your answer below.")
+
+                        qa_items = update_essay_template(
+                            work_dir,
+                            title=title,
+                            description=desc,
+                            essays=gen_data.get("essays", []),
+                        )
+
+                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                        zip_dir_to_file(work_dir, out_h5p)
+
+                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                        write_qa_report_html(out_qa, title, typ, qa_items)
+
+                    elif typ == "Summary":
+                        work_dir = os.path.join(tmp, "_work_summary")
+                        unzip_h5p(templates["Summary"], work_dir)
+                        gen_data = call_llm_summary(chunks, run_n, enriched_course)
+                        _gen_bar.progress(65, text="AI content generated — building template...")
+                        update_summary_template(
+                            work_dir,
+                            gen_data["title"],
+                            gen_data.get("groups", []),
+                            overall_feedback=gen_data.get("overall_feedback"),
+                            introduction=gen_data.get("introduction"),  # <-- NEW: pass introduction
+                        )
+                        title = gen_data["title"]
+
+                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                        zip_dir_to_file(work_dir, out_h5p)
+
+                        qa_items = []
+                        for i, grp in enumerate(gen_data.get("groups", []), start=1):
+                            correct = grp.get("correct_statement", "")
+                            incorrects = grp.get("incorrect_statements", [])
+                            qa_items.append({
+                                "label": f"Group {i}",
+                                "content": f"Correct: {correct}\nIncorrect: {'; '.join(incorrects)}",
+                                "evidence": grp.get("evidence", {}),
+                            })
+
+                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                        write_qa_report_html(out_qa, title, typ, qa_items)
+
+                    else:
+                        work_dir = os.path.join(tmp, "_work_generic")
+                        unzip_h5p(templates[typ], work_dir)
+
+                        tpl_h5p = json.loads(open(os.path.join(work_dir, "h5p.json"), "r", encoding="utf-8").read())
+                        tpl_content = json.loads(open(os.path.join(work_dir, "content", "content.json"), "r", encoding="utf-8").read())
+
+                        gen_data = call_llm_generic_patch(
+                            chunks=chunks,
+                            course_name=enriched_course,
+                            activity_type=typ,
+                            template_h5p_json=tpl_h5p,
+                            template_content_json=tpl_content,
+                            item_count=run_n,
+                        )
+                        _gen_bar.progress(65, text="AI content generated — building template...")
+
+                        update_h5p_title(work_dir, gen_data["title"])
+                        _save_json(work_dir, "content/content.json", gen_data["patched_content_json"])
+
+                        title = gen_data["title"]
+                        out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
+                        zip_dir_to_file(work_dir, out_h5p)
+
+                        out_qa = os.path.join(tmp, f"QA_{safe_filename(title)}.html")
+                        write_qa_report_html(out_qa, title, typ, gen_data.get("qa_items", []))
+
+                    _gen_bar.progress(90, text="Packaging H5P file...")
+                    st.success("Done.")
+                    _gen_bar.progress(100, text="Done ✓")
+                    time.sleep(0.8)
+                    gen_progress_area.empty()
+
+                    # Persist outputs in session state so downloads remain available after reruns
+                    with open(out_h5p, "rb") as f:
+                        st.session_state["last_h5p_bytes"] = f.read()
+                    with open(out_qa, "rb") as f:
+                        st.session_state["last_qa_bytes"] = f.read()
+                    st.session_state["last_h5p_name"] = os.path.basename(out_h5p)
+                    st.session_state["last_qa_name"] = os.path.basename(out_qa)
+
+            except Exception as e:
+                gen_progress_area.empty()
+                msg = str(e)
+                if "429" in msg or "Too Many Requests" in msg:
+                    st.error("Rate limit reached while generating. Please wait a minute and try again.")
+                else:
+                    st.error(msg)
+            finally:
+                st.session_state["busy"] = False
 
 # Persistent downloads (visible even after button click reruns)
 if st.session_state.get("last_h5p_bytes"):
