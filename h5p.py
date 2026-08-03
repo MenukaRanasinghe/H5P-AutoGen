@@ -5,6 +5,7 @@ import re
 import json
 import copy
 import glob
+import base64
 # Image sourcing: Wikimedia Commons (no API key required)
 
 import shutil
@@ -1113,6 +1114,97 @@ def _source_text_for_validation(chunks: List[ContentChunk]) -> str:
     # Normalise whitespace to make quote checks robust to PDF extraction quirks
     return _norm_ws("\n\n".join([c.text for c in chunks if c.text]))
 
+_GROUNDING_SOURCE_TEXT: str = ""
+_GROUNDING_SOURCE_CANON: str = ""
+
+
+def _canon(s: str) -> str:
+    """Strip to letters+digits only. Immune to PDF hyphenation, ligatures,
+    curly quotes, double spaces and punctuation drift."""
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
+def _set_grounding_source(chunks: List[ContentChunk]) -> None:
+    global _GROUNDING_SOURCE_TEXT, _GROUNDING_SOURCE_CANON
+    try:
+        _GROUNDING_SOURCE_TEXT = _source_text_for_validation(chunks)
+    except Exception:
+        _GROUNDING_SOURCE_TEXT = ""
+    _GROUNDING_SOURCE_CANON = _canon(_GROUNDING_SOURCE_TEXT)
+
+
+def _quote_in_source(quote: str, source_text: Optional[str] = None) -> bool:
+    src = source_text if source_text is not None else _GROUNDING_SOURCE_TEXT
+    qn = _norm_ws(quote or "")
+    if not qn or not src:
+        return False
+    if qn.lower() in src.lower():
+        return True
+    qc = _canon(qn)
+    if not qc:
+        return False
+    sc = _GROUNDING_SOURCE_CANON if source_text is None else _canon(src)
+    if qc in sc:
+        return True
+    # LLM trimmed/joined the quote — accept if a long head or tail matches
+    if len(qc) > 40 and (qc[:40] in sc or qc[-40:] in sc):
+        return True
+    return False
+
+
+def _answer_in_quote(answer: str, quote: str) -> bool:
+    a = (answer or "").strip()
+    qn = _norm_ws(quote or "")
+    if not a or not qn:
+        return False
+    if re.search(r"\b" + re.escape(a) + r"\b", qn, re.IGNORECASE):
+        return True
+    ac = _canon(a)
+    return bool(ac) and ac in _canon(qn)
+
+
+def _filter_grounded_items(
+    items: List[Dict[str, Any]],
+    answer_keys: Optional[List[str]] = None,
+    require_answer_in_quote: bool = True,
+    target_n: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Rank items by PDF grounding, but ALWAYS return target_n items when that
+    many exist — grounded first, topped up with ungrounded ones. The QA report
+    still flags the ungrounded ones honestly."""
+    if not items:
+        return items
+
+    if target_n is None:
+        target_n = len(items)
+
+    if not _GROUNDING_SOURCE_TEXT:
+        return items[:target_n]
+
+    answer_keys = answer_keys or []
+    grounded: List[Dict[str, Any]] = []
+    ungrounded: List[Dict[str, Any]] = []
+
+    for it in items:
+        ev = it.get("evidence") or {}
+        quote = (ev.get("quote") or "").strip()
+        ok = _quote_in_source(quote)
+        if ok and require_answer_in_quote and answer_keys:
+            ans = ""
+            for k in answer_keys:
+                v = it.get(k)
+                if isinstance(v, str) and v.strip():
+                    ans = v.strip()
+                    break
+            if ans and not _answer_in_quote(ans, quote):
+                ok = False
+        (grounded if ok else ungrounded).append(it)
+
+    out = grounded[:target_n]
+    if len(out) < target_n:
+        out.extend(ungrounded[: target_n - len(out)])
+    return out or items
+
 def validate_dialog_card(card: Dict[str, Any], source_text: str) -> Tuple[bool, str]:
     """Hard validation to keep Dialog Cards 100% grounded in PDF text."""
     front = (card.get("front") or card.get("text") or "").strip()
@@ -1415,11 +1507,18 @@ JSON:
 {{
   "title":"string",
   "description":"string",
+  "overall_feedback":[
+    {{"from":0,"to":40,"feedback":"low-score feedback mentioning the actual topic"}},
+    {{"from":41,"to":80,"feedback":"mid-score feedback mentioning the topic"}},
+    {{"from":81,"to":100,"feedback":"high-score feedback mentioning the topic"}}
+  ],
   "items":[
     {{
       "question":"string",
       "options":["string","string","string"],
       "correctIndex":0,
+      "feedback_correct":"1 sentence confirming why this option is right, from SOURCE",
+      "feedback_incorrect":"1 sentence stating the correct fact, from SOURCE",
       "evidence":{{"source_file":"string","locator":"PDF p.X/Y","quote":"short exact quote"}}
     }}
   ]
@@ -1431,7 +1530,13 @@ SOURCE:
     return call_openai_chat_json(system, user)
 
 
-def build_question_set_multichoice(work_dir: str, title: str, description: str, mc_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def build_question_set_multichoice(
+    work_dir: str,
+    title: str,
+    description: str,
+    mc_items: List[Dict[str, Any]],
+    overall_feedback: Optional[List[Dict[str, Any]]] = None,   # FIX: 5th param — matches the call site
+) -> List[Dict[str, Any]]:
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
 
@@ -1460,19 +1565,53 @@ def build_question_set_multichoice(work_dir: str, title: str, description: str, 
     if questions_container is None:
         raise KeyError("Could not locate 'questions' list in Question Set template content.json")
 
-    def _mc_question(question: str, options: List[str], correct_index: int) -> Dict[str, Any]:
-        answers = [{"text": opt, "correct": (j == correct_index)} for j, opt in enumerate(options)]
+    # FIX: drop items whose evidence quote isn't in the PDF (fail-open).
+    # Requires the FIX 0 helpers (_filter_grounded_items) to be in app.py.
+    mc_items = _filter_grounded_items(mc_items, answer_keys=[], require_answer_in_quote=False)
+
+    def _mc_question(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        q = (item.get("question") or "").strip()
+        opts = item.get("options") or []
+        if not q or not isinstance(opts, list) or len(opts) < 2:
+            return None
+        correct = int(item.get("correctIndex", 0) or 0)
+        correct = max(0, min(correct, len(opts) - 1))
+
+        fb_ok = (item.get("feedback_correct") or "").strip()
+        fb_no = (item.get("feedback_incorrect") or "").strip()
+
+        answers = []
+        for j, opt in enumerate(opts):
+            is_correct = (j == correct)
+            answers.append({
+                "text": f"<div>{opt}</div>",
+                "correct": is_correct,
+                # FIX: per-answer feedback goes here in H5P.MultiChoice 1.16
+                "tipsAndFeedback": {
+                    "tip": "",
+                    "chosenFeedback": (fb_ok if is_correct else fb_no) or "",
+                    "notChosenFeedback": "",
+                },
+            })
+
         return {
             "library": "H5P.MultiChoice 1.16",
+            "subContentId": random_subcontent_id(),
             "params": {
-                "question": question,
+                "question": f"<p>{q}</p>",
                 "answers": answers,
+                "overallFeedback": [{"from": 0, "to": 100}],
                 "behaviour": {
                     "enableRetry": True,
                     "enableSolutionsButton": True,
+                    "enableCheckButton": True,
+                    "type": "auto",
                     "autoCheck": False,
                     "singlePoint": True,
                     "randomAnswers": False,
+                    "showSolutionsRequiresInput": True,
+                    "confirmCheckDialog": False,
+                    "confirmRetryDialog": False,
                 },
             },
             "metadata": {"title": "Multiple Choice", "license": "U"},
@@ -1482,18 +1621,17 @@ def build_question_set_multichoice(work_dir: str, title: str, description: str, 
     qa: List[Dict[str, Any]] = []
 
     for i, it in enumerate(mc_items, start=1):
-        q = (it.get("question") or "").strip()
-        opts = it.get("options") or []
-        if not q or not isinstance(opts, list) or len(opts) < 2:
+        qobj = _mc_question(it)
+        if qobj is None:
             continue
-        correct = int(it.get("correctIndex", 0))
-        correct = max(0, min(correct, len(opts) - 1))
-        new_questions.append(_mc_question(q, opts, correct))
+        new_questions.append(qobj)
 
+        opts = it.get("options") or []
+        ci = max(0, min(int(it.get("correctIndex", 0) or 0), len(opts) - 1))
         qa.append({
             "label": f"{i}) Multiple Choice",
-            "content": q,
-            "expected": opts[correct] if opts else "",
+            "content": (it.get("question") or "").strip(),
+            "expected": opts[ci] if opts else "",
             "evidence": it.get("evidence", {}) or {},
         })
 
@@ -1501,6 +1639,11 @@ def build_question_set_multichoice(work_dir: str, title: str, description: str, 
         raise ValueError("No Multiple Choice items were generated.")
 
     questions_container[:] = new_questions
+
+    # FIX: apply Question-Set-level overall feedback (topic-aware fallback),
+    # overwriting any stale template feedback everywhere in the tree.
+    _apply_overall_feedback(content, overall_feedback, title)
+
     _save_json(work_dir, "content/content.json", content)
     return qa
 
@@ -1858,7 +2001,7 @@ def update_fill_in_the_blanks_template(work_dir: str, title: str, description: s
             raise KeyError(f"Fill in the Blanks template missing a usable question field. Nearest match: {found}")
 
     if overall_feedback is not None:
-        deep_find_set_first(content, ["overallFeedback"], overall_feedback)
+        _apply_overall_feedback(content, overall_feedback, title)
 
     _save_json(work_dir, "content/content.json", content)
 
@@ -2164,45 +2307,63 @@ def _html_bullets(heading: str, bullets: List[str], max_bullets: int = 4) -> str
     return f"<ul>{li}</ul>"
 
 def _set_presentation_description_safe(content: dict, description: str, title: str = "", slides_data: list = None) -> None:
-    """Set Course Presentation / Interactive Book description at SAFE locations only.
- 
-    CRITICAL: Ignores the LLM-generated description (which is often hallucinated).
-    Instead, builds a factual description from the title + first slide heading.
-    """
-    # Build description from ACTUAL content, not LLM output
-    desc = ""
-    if slides_data:
-        first_heading = ""
-        for s in (slides_data or []):
-            h = (s.get("heading") or s.get("chapter_title") or s.get("title") or "").strip()
-            if h:
+    """Set Course Presentation / Interactive Book description at SAFE
+    locations only. Keeps the LLM description if it passes a grounding check
+    against the actual generated slides; otherwise builds a factual fallback
+    from the title + first slide heading."""
+    slides_data = slides_data or []
+
+    # FIX: collect text from the actual generated slides/chapters so we can
+    # test the LLM description against it (covers both CP and IB shapes).
+    slide_text_parts = [title or ""]
+    first_heading = ""
+    for s in slides_data:
+        h = (s.get("heading") or s.get("chapter_title") or s.get("title") or "").strip()
+        if h:
+            slide_text_parts.append(h)
+            if not first_heading:
                 first_heading = h
-                break
+        for b in (s.get("bullets") or []):
+            if isinstance(b, str):
+                slide_text_parts.append(b)
+        for sec in (s.get("sections") or []):
+            if isinstance(sec, dict):
+                slide_text_parts.append(sec.get("heading") or "")
+    slide_terms = set(_terms(" ".join(slide_text_parts)))
+
+    desc = ""
+    # FIX: instead of always discarding the LLM description, keep it when it
+    # is grounded in the generated content (term overlap >= 2).
+    llm_desc = re.sub(r"<[^>]+>", " ", (description or "")).strip()
+    if llm_desc:
+        overlap = len(set(_terms(llm_desc)) & slide_terms)
+        if overlap >= 2:
+            desc = f"<p>{llm_desc}</p>"
+
+    if not desc:
+        # Fallback: factual description from title + first heading (old behaviour).
         if title and first_heading:
             desc = f"<p>{title} — {first_heading}</p>"
         elif title:
             desc = f"<p>{title}</p>"
- 
-    if not desc and title:
-        desc = f"<p>{title}</p>"
- 
+
     if not desc:
         return
- 
+
     _DESC_KEYS = ["introduction", "description", "taskDescription"]
- 
+
     for key in _DESC_KEYS:
         if key in content:
             content[key] = desc
             return
- 
+
     pres = content.get("presentation")
     if isinstance(pres, dict):
         for key in _DESC_KEYS:
             if key in pres:
                 pres[key] = desc
                 return
- 
+
     content["introduction"] = desc
 
 
@@ -3206,6 +3367,20 @@ def update_activity_description_fields(content, description):
  
     return count
 
+def _default_overall_feedback(topic: str) -> List[Dict[str, Any]]:
+    t = (topic or "this topic").strip()
+    return [
+        {"from": 0, "to": 40, "feedback": f"Keep practising — review the material on {t} and try again."},
+        {"from": 41, "to": 80, "feedback": f"Good attempt. Revisit the key points about {t} to improve."},
+        {"from": 81, "to": 100, "feedback": f"Well done! You have a strong understanding of {t}."},
+    ]
+
+
+def _apply_overall_feedback(content: Dict[str, Any], feedback: Optional[List[Dict[str, Any]]], topic: str) -> None:
+    """Force-set overallFeedback everywhere, with a topic-aware fallback."""
+    fb = feedback if (isinstance(feedback, list) and feedback) else _default_overall_feedback(topic)
+    if deep_find_set_all(content, ["overallFeedback"], fb) == 0:
+        content["overallFeedback"] = fb
 
 def deep_find_first_key(d: Any, key_candidates: List[str]) -> Optional[Tuple[str, Any]]:
     if isinstance(d, dict):
@@ -3379,47 +3554,144 @@ def make_dragtext_textfield(items: List[Dict[str, Any]]) -> str:
         for it in items
     ])
 
-def make_blanks_textfield(items: List[Dict[str, Any]]) -> str:
+# Set to True if you want clickable tip bubbles: *answer:tip*
+BLANKS_INCLUDE_HINT = False
+BLANKS_HINT_MAX_CHARS = 40
+
+
+def _make_blank_markup_with_hint(sentence: str, answer: str, hint: str = "") -> str:
+    """Build H5P.Blanks markup for one sentence.
+
+    Produces *answer* by default. H5P only supports tips via the
+    *answer:tip* syntax — a hint placed outside the asterisks would render
+    as visible sentence text and give the answer away — so tips are opt-in
+    and truncated to stay readable in the editor.
+    """
+    s = (sentence or "").strip()
+    a = (answer or "").strip()
+    if not s or not a:
+        raise ValueError("Sentence and answer cannot be empty.")
+
+    # Colons/asterisks inside the answer or hint would corrupt the markup.
+    a_clean = a.replace("*", "").replace(":", " ").strip()
+    a_clean = re.sub(r"\s+", " ", a_clean)
+
+    blank = f"*{a_clean}*"
+    if BLANKS_INCLUDE_HINT:
+        h_clean = (hint or "").replace("*", "").replace(":", " ").strip()
+        h_clean = re.sub(r"\s+", " ", h_clean)
+        if h_clean and len(h_clean) <= BLANKS_HINT_MAX_CHARS:
+            blank = f"*{a_clean}:{h_clean}*"
+
+    # Prefer replacing an explicit blank marker (____ / [blank] / ... etc.)
+    for bp in _BLANK_PATTERNS:
+        if re.search(bp, s):
+            return re.sub(bp, blank, s, count=1)
+
+    # Otherwise blank out the first occurrence of the answer itself.
+    new_s, n = re.subn(r"\b" + re.escape(a_clean) + r"\b", blank, s, count=1)
+    if n:
+        return new_s
+
+    # Case-insensitive retry before falling back to appending.
+    new_s, n = re.subn(r"\b" + re.escape(a_clean) + r"\b", blank, s,
+                       count=1, flags=re.IGNORECASE)
+    if n:
+        return new_s
+
+    return f"{s} ({blank})"
+
+_BLANK_ANSWER_MAX_WORDS = 2
+_BLANK_ANSWER_BAD_WORDS = {"and", "or", "the", "a", "an", "of", "to", "at", "in", "etc"}
+
+
+def _blank_answer_ok(answer: str) -> bool:
+    """True if the answer is a clean 1–2 word blank.
+
+    Rejects lists ('policies, procedures and practices'), conjunctions
+    ('toilet and washing') and long phrases ('Health and Safety at Work etc.').
+    """
+    a = (answer or "").strip().strip(".,;:!?")
+    if not a:
+        return False
+    if any(c in a for c in ",;/"):
+        return False
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'\-]*", a)
+    if not (1 <= len(words) <= _BLANK_ANSWER_MAX_WORDS):
+        return False
+    if any(w.lower() in _BLANK_ANSWER_BAD_WORDS for w in words):
+        return False
+    return True
+
+def make_blanks_textfield(items: List[Dict[str, Any]], target_n: Optional[int] = None) -> str:    # FIX: drop items whose answer isn't in their quote / quote isn't in the PDF.
+    # Enforce 1–2 word answers first so the grounding rank only picks from
+    # usable items. Fail-open if the model returned nothing acceptable.
+    short = [it for it in (items or []) if _blank_answer_ok(it.get("answer"))]
+    items = short or items
+    items = _filter_grounded_items(
+        items, answer_keys=["answer"],
+        require_answer_in_quote=True, target_n=target_n,
+    )
+
     lines = []
-    for i, it in enumerate(items, start=1):
+    n = 0
+    for it in items:
         sentence = (it.get("sentence") or "").strip()
         answer = (it.get("answer") or "").strip()
         hint = (it.get("hint") or "").strip()
-
-        text = make_single_blank_markup(sentence, answer)
-        block = f"{i}. {text}"
-
-        if hint:
-            block += f"\n({hint})"
-
-        lines.append(block)
+        if not sentence or not answer:
+            continue
+        lines.append(_make_blank_markup_with_hint(sentence, answer, hint))
 
     return "\n\n".join(lines)
-def make_mark_words_textfield(items: List[Dict[str, Any]]) -> str:
-    lines = []
 
-    for i, it in enumerate(items, start=1):
+def _mark_word_in_sentence(sentence: str, word: str) -> Optional[str]:
+    """Wrap the first occurrence of `word` in asterisks. Falls back to a
+    stem match, then to the longest content word, so an item is never lost
+    just because the LLM returned a plural or different casing."""
+    s = (sentence or "").replace("*", "").strip()
+    if not s:
+        return None
+    w = (word or "").strip().strip(".,;:!?")
+    if w:
+        w = w.split()[0]
+        m = re.search(r"\b" + re.escape(w) + r"\b", s, re.IGNORECASE)
+        if not m:
+            stem = w[: max(4, len(w) - 2)]
+            m = re.search(r"\b" + re.escape(stem) + r"[A-Za-z]*\b", s, re.IGNORECASE)
+        if m:
+            return s[:m.start()] + f"*{m.group(0)}*" + s[m.end():]
+    cands = [t for t in re.findall(r"\b[A-Za-z][A-Za-z\-']{3,}\b", s)
+             if t.lower() not in _STOPWORDS]
+    if not cands:
+        return None
+    best = max(cands, key=len)
+    m = re.search(r"\b" + re.escape(best) + r"\b", s)
+    return s[:m.start()] + f"*{m.group(0)}*" + s[m.end():]
+
+def make_mark_words_textfield(items: List[Dict[str, Any]], target_n: Optional[int] = None) -> str:
+    # Rank by PDF grounding, but keep target_n items so the count is honoured.
+    items = _filter_grounded_items(
+        items, answer_keys=["marked_word"],
+        require_answer_in_quote=True, target_n=target_n,
+    )
+
+    lines = []
+    for it in items:
         sentence = (it.get("sentence") or it.get("paragraph") or "").strip()
         marked_word = (it.get("marked_word") or "").strip()
-        hint = (it.get("hint") or "").strip()
-
-        if not sentence or not marked_word:
+        if not sentence:
             continue
 
-        # Force single-word markable word
-        marked_word = marked_word.split()[0].strip()
+        # Marks the word; falls back to a stem or the longest content word
+        # rather than dropping the item when the LLM's word doesn't match.
+        sentence_marked = _mark_word_in_sentence(sentence, marked_word)
+        if not sentence_marked:
+            continue
 
-        # Mark only the first exact occurrence
-        sentence_marked, n = _wrap_first_word_occurrence(sentence, marked_word)
-        if n == 0:
-            sentence_marked = f"{sentence} (*{marked_word}*)"
-
-        block = f"{i}. {sentence_marked}"
-
-        if hint:
-            block += f" ({hint})"
-
-        lines.append(block)
+        # No numbering prefix and no inline hint — in MarkTheWords every word
+        # in the textField is clickable, so both polluted the activity.
+        lines.append(sentence_marked)
 
     return "<br><br>".join(lines)
 
@@ -3492,6 +3764,12 @@ Rules:
 - description must mention the actual topic or concept from the SOURCE.
 - do not reuse wording from any template.
 - sentence must contain one blank marker such as ____ where the answer belongs.
+- answer must be ONE or TWO words maximum — never a phrase, list, or clause.
+- answer must NOT contain commas, slashes, or the words "and"/"or".
+- answer must be a single key term (e.g. "ventilation", "risk assessments", "COSHH"),
+  NOT a full concept name like "Health and Safety at Work etc. Act 1974".
+- If the key term in a sentence is longer than two words, pick a DIFFERENT
+  sentence rather than shortening it.
 - answer must be the exact missing word or phrase from the source.
 - hint must be a simple sentence that helps identify the missing answer.
 - Keep the hint short, clear, and learner-friendly.
@@ -3516,6 +3794,11 @@ Return JSON:
 {{
   "title":"string",
   "description":"string",
+  "overall_feedback":[
+    {{"from":0,"to":40,"feedback":"string — encouraging feedback for low scores that mentions the actual topic"}},
+    {{"from":41,"to":80,"feedback":"string — mid-score feedback referencing the topic"}},
+    {{"from":81,"to":100,"feedback":"string — congratulatory feedback referencing the topic"}}
+  ],
   "items":[
     {{
       "sentence":"string",
@@ -3535,6 +3818,12 @@ Rules:
 - hint must help the learner identify the markable word.
 - Keep the hint short and display-friendly.
 - Everything must be directly supported by SOURCE.
+
+"overall_feedback":[
+    {{"from":0,"to":40,"feedback":"string — encouraging feedback for low scores that mentions the actual topic"}},
+    {{"from":41,"to":80,"feedback":"string — mid-score feedback referencing the topic"}},
+    {{"from":81,"to":100,"feedback":"string — congratulatory feedback referencing the topic"}}
+  ],
 
 Course: {course}
 Source:
@@ -3785,10 +4074,22 @@ Create {n} True/False statements grounded in the source.
 JSON:
 {{
  "title":"string","description":"string",
+ "overall_feedback":[
+   {{"from":0,"to":40,"feedback":"low-score feedback mentioning the actual topic"}},
+   {{"from":41,"to":80,"feedback":"mid-score feedback mentioning the topic"}},
+   {{"from":81,"to":100,"feedback":"high-score feedback mentioning the topic"}}
+ ],
  "items":[
-   {{"statement":"string","correctAnswer":true,"evidence":{{"source_file":"string","locator":"Page X","quote":"string"}}}}
+   {{"statement":"string","correctAnswer":true,
+     "feedback_correct":"1 sentence confirming WHY this answer is right, using facts from SOURCE",
+     "feedback_incorrect":"1 sentence explaining the correct fact from SOURCE",
+     "evidence":{{"source_file":"string","locator":"Page X","quote":"string"}}}}
  ]
 }}
+
+Rules:
+- feedback_correct / feedback_incorrect MUST reference the specific fact being tested, grounded in SOURCE.
+- overall_feedback MUST mention the actual topic — no generic phrases.
 
 Course: {course}
 Source:
@@ -4089,7 +4390,11 @@ def _force_set_task_description(content, desc_html):
     return count
 
 def maybe_set_distractors(work_dir: str, distractors: List[str]) -> None:
-    """If the template supports distractors, set them (H5P Drag the Words)."""
+    """If the template supports distractors, set them (H5P Drag the Words).
+
+    H5P.DragText parses the distractors field by extracting *asterisk-wrapped*
+    tokens, one per distractor — the same markup as the answers in textField.
+    """
     if not distractors:
         return
     content = _load_json(work_dir, "content/content.json")
@@ -4099,16 +4404,23 @@ def maybe_set_distractors(work_dir: str, distractors: List[str]) -> None:
         d = (d or "").strip()
         if not d:
             continue
+        # FIX: an asterisk inside a distractor would break the markup — strip it.
+        d = d.replace("*", "").strip()
+        if not d:
+            continue
         key = d.lower()
         if key in seen:
             continue
         seen.add(key)
         uniq.append(d)
-    # Common keys used by DragText
-    deep_find_set_first(content, ["distractors", "distractor"], "\n".join(uniq))
+
+    if not uniq:
+        return
+
+    # FIX: correct H5P.DragText markup — each distractor wrapped in asterisks.
+    markup = "\n".join(f"*{d}*" for d in uniq)
+    deep_find_set_first(content, ["distractors", "distractor"], markup)
     _save_json(work_dir, "content/content.json", content)
-
-
 
 def call_llm_cornell_notes(chunks: List[ContentChunk], course: str) -> Dict[str, Any]:
     """Generate Cornell Notes instructional text from PDF content."""
@@ -5950,7 +6262,13 @@ def update_cornell_notes_template(
     _save_json(work_dir, "content/content.json", content)
     return content
 
-def build_question_set_truefalse(work_dir: str, title: str, description: str, tf_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def build_question_set_truefalse(
+    work_dir: str,
+    title: str,
+    description: str,
+    tf_items: List[Dict[str, Any]],
+    overall_feedback: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     update_h5p_title(work_dir, title)
     content = _load_json(work_dir, "content/content.json")
 
@@ -5977,30 +6295,68 @@ def build_question_set_truefalse(work_dir: str, title: str, description: str, tf
 
     questions_container = find_questions_ref(content)
     if questions_container is None:
-        raise KeyError("Question Set template missing a 'questions' array. Make a blank Question Set with one sample question, export it, and use as template.")
+        raise KeyError(
+            "Question Set template missing a 'questions' array. Make a blank "
+            "Question Set with one sample question, export it, and use as template."
+        )
+
+    # FIX: drop items whose evidence quote isn't in the PDF (fail-open).
+    # Requires the FIX 0 helpers (_filter_grounded_items) to be in app.py.
+    tf_items = _filter_grounded_items(tf_items, answer_keys=[], require_answer_in_quote=False)
 
     new_questions = []
     for it in tf_items:
+        fb_ok = (it.get("feedback_correct") or "").strip() or "Correct."
+        fb_no = (it.get("feedback_incorrect") or "").strip() or "Incorrect."
+
         new_questions.append({
             "library": "H5P.TrueFalse 1.8",
             "subContentId": random_subcontent_id(),
             "params": {
-                "question": it.get("statement", ""),
+                "question": f"<p>{it.get('statement', '')}</p>",
                 "correct": "true" if it.get("correctAnswer", True) else "false",
-                "feedbackCorrect": {"text": "Correct."},
-                "feedbackIncorrect": {"text": "Incorrect."},
-                "behaviour": {"enableRetry": True, "enableSolutionsButton": True, "autoCheck": False},
-                "l10n": {"checkAnswer": "Check", "showSolutionButton": "Show solution", "tryAgainButton": "Retry"},
+                "behaviour": {
+                    "enableRetry": True,
+                    "enableSolutionsButton": True,
+                    "enableCheckButton": True,
+                    "confirmCheckDialog": False,
+                    "confirmRetryDialog": False,
+                    "autoCheck": False,
+                    # FIX: H5P.TrueFalse 1.8 reads these from the behaviour group,
+                    # not from the top level of params.
+                    "feedbackOnCorrect": fb_ok,
+                    "feedbackOnWrong": fb_no,
+                },
+                "l10n": {
+                    "trueText": "True",
+                    "falseText": "False",
+                    "score": "You got @score of @total points",
+                    "checkAnswer": "Check",
+                    "showSolutionButton": "Show solution",
+                    "tryAgain": "Retry",
+                    "wrongAnswerMessage": "Wrong answer",
+                    "correctAnswerMessage": "Correct answer",
+                    "scoreBarLabel": "You got :num out of :total points",
+                },
             },
             "metadata": {"title": "True/False", "license": "U"}
         })
 
+    if not new_questions:
+        raise ValueError("No True/False items were generated.")
+
     questions_container[:] = new_questions
+    _apply_overall_feedback(content, overall_feedback, title)
     _save_json(work_dir, "content/content.json", content)
 
     qa = []
     for i, it in enumerate(tf_items, start=1):
-        qa.append({"label": f"Q{i}", "content": f"{it.get('statement','')} (answer: {it.get('correctAnswer')})", "evidence": it.get("evidence", {})})
+        qa.append({
+            "label": f"Q{i}",
+            "content": f"{it.get('statement','')} (answer: {it.get('correctAnswer')})",
+            "expected": str(it.get("correctAnswer", True)),
+            "evidence": it.get("evidence", {}),
+        })
     return qa
 
 def update_virtual_tour_template(
@@ -6158,7 +6514,7 @@ def write_qa_report_html(path: str, title: str, activity_type: str, qa_items: Li
 
     def item_status(it: Dict[str, Any]) -> str:
         ev = it.get("evidence", {}) or {}
-        quote = ev.get("quote", "") or ""
+        quote = (ev.get("quote") or "").strip()
         expected = (it.get("expected") or "").strip()
         content = (it.get("content") or "").strip()
         if expected:
@@ -6177,6 +6533,7 @@ def write_qa_report_html(path: str, title: str, activity_type: str, qa_items: Li
         ev = it.get("evidence", {}) or {}
         expected = (it.get("expected") or "").strip()
         quote = ev.get("quote", "") or ""
+        color = "#0a7d24" if stt.startswith(("Verified", "Match")) else ("#b00020" if stt in ("Quote not found in PDF", "Answer not in quote") else "#a06000")
         rows.append(
             f"<div style='padding:12px;border:1px solid #e7e7e7;border-radius:10px;margin:10px 0;'>"
             f"<div style='font-weight:600'>{esc(it.get('label','Item'))}</div>"
@@ -6184,7 +6541,7 @@ def write_qa_report_html(path: str, title: str, activity_type: str, qa_items: Li
             + (f"<div style='margin-top:6px'><b>Expected answer:</b> {esc(expected)}</div>" if expected else "")
             + f"<div style='margin-top:6px'><b>Source in PDF:</b> {esc(ev.get('source_file',''))} — {esc(ev.get('locator',''))}</div>"
             + f"<div style='margin-top:6px'><b>Relevant text (PDF):</b> <i>{esc(quote)}</i></div>"
-            + f"<div style='margin-top:6px'><b>Status:</b> {esc(stt)}</div>"
+            + f"<div style='margin-top:6px'><b>Status:</b> <span style='color:{color};font-weight:600'>{esc(stt)}</span></div>"
             + f"</div>"
         )
 
@@ -6199,10 +6556,10 @@ def write_qa_report_html(path: str, title: str, activity_type: str, qa_items: Li
   <div style='font-weight:700'>Overall report</div>
   <div style='margin-top:6px'><b>Overall status:</b> {esc(overall)}</div>
   <div style='margin-top:6px'><b>Total items:</b> {total}</div>
-  <div style='margin-top:6px'><b>Matches:</b> {match_count} &nbsp;&nbsp; <b>No match:</b> {no_match_count} &nbsp;&nbsp; <b>Needs review:</b> {review_count}</div>
+  <div style='margin-top:6px'><b>Verified:</b> {match_count} &nbsp;&nbsp; <b>Failed verification:</b> {no_match_count} &nbsp;&nbsp; <b>Needs review:</b> {review_count}</div>
 </div>
 
-<p><b>Evidence per item (source page references and supporting text):</b></p>
+<p><b>Evidence per item (verified against the extracted PDF text):</b></p>
 {''.join(rows) if rows else '<p>No QA items.</p>'}
 </body></html>"""
     with open(path, "w", encoding="utf-8") as f:
@@ -6279,7 +6636,9 @@ def ensure_chunks(files: List[Any]) -> List[ContentChunk]:
         and st.session_state.get("chunks_cache") is not None
         and st.session_state.get("pdf_bytes_map") is not None
     ):
-        return st.session_state["chunks_cache"]
+        cached = st.session_state["chunks_cache"]
+        _set_grounding_source(cached)  # FIX: keep grounding cache in sync on reruns
+        return cached
 
     chunks: List[ContentChunk] = []
     pdf_map: Dict[str, bytes] = {}
@@ -6313,6 +6672,8 @@ def ensure_chunks(files: List[Any]) -> List[ContentChunk]:
     st.session_state["pdf_bytes_map"] = pdf_map
     st.session_state["pdf_headings_cache"] = headings
     st.session_state["pdf_keywords_cache"] = keywords
+
+    _set_grounding_source(chunks)  # FIX: cache PDF text for verification
     return chunks
 
 colA, colB = st.columns(2)
@@ -6856,7 +7217,11 @@ if st.session_state["suggestions"]:
 
                     title = tf.get("title", f"True/False Quiz - {course_name.strip()}")
                     desc = tf.get("description", "Answer the True/False questions.")
-                    qa_items = build_question_set_truefalse(qs_dir, title, desc, tf.get("items", []))
+                    qa_items = build_question_set_truefalse(
+                        qs_dir, title, desc,
+                        tf.get("items", []),
+                        tf.get("overall_feedback"),
+                    )
 
                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
                     zip_dir_to_file(qs_dir, out_h5p)
@@ -6873,7 +7238,11 @@ if st.session_state["suggestions"]:
 
                     title = mc.get("title", f"Multiple Choice Quiz - {course_name.strip()}")
                     desc = mc.get("description", "Answer the multiple choice questions.")
-                    qa_items = build_question_set_multichoice(qs_dir, title, desc, mc.get("items", []))
+                    qa_items = build_question_set_multichoice(
+                     qs_dir, title, desc,
+                     mc.get("items", []),
+                     mc.get("overall_feedback"),
+                    )
 
                     out_h5p = os.path.join(tmp, f"{safe_filename(title)}.h5p")
                     zip_dir_to_file(qs_dir, out_h5p)
@@ -7278,9 +7647,9 @@ if st.session_state["suggestions"]:
                         ]
 
                     elif meta_t["mode"] == "blanks":
-                        gen_data = call_llm_fill_blanks(chunks, run_n, enriched_course)
+                        gen_data = call_llm_fill_blanks(chunks, run_n + 3, enriched_course)
                         _gen_bar.progress(65, text="AI content generated — building template...")
-                        textfield = make_blanks_textfield(gen_data["items"])
+                        textfield = make_blanks_textfield(gen_data["items"], target_n=run_n)
                         desc = (gen_data.get("description") or "").strip() or "Read each sentence and type the missing word."
 
                         update_fill_in_the_blanks_template(
@@ -7298,19 +7667,19 @@ if st.session_state["suggestions"]:
                                 "content": f"{it.get('sentence', '')} (answer: {it.get('answer', '')})",
                                 "evidence": it.get("evidence", {}),
                             }
-                            for i, it in enumerate(gen_data.get("items", []))
+                            for i, it in enumerate(gen_data.get("items", [])[:run_n])
                         ]
 
                     elif meta_t["mode"] == "markwords":
                         gen_data = call_llm_mark_words(chunks, run_n, enriched_course)
                         _gen_bar.progress(65, text="AI content generated — building template...")
-                        textfield = make_mark_words_textfield(gen_data["items"])
+                        textfield = make_mark_words_textfield(gen_data["items"], target_n=run_n)
                         update_text_based_template(
                             work_dir,
                             gen_data["title"],
                             gen_data["description"],
                             textfield,
-                            None,
+                            gen_data.get("overall_feedback"),
                             meta_t["textfield_keys"],
                         )
                         title = gen_data["title"]
