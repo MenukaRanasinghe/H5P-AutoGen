@@ -6259,7 +6259,7 @@ st.session_state.setdefault("last_qa_name", None)
 uploads = st.file_uploader("Upload PDF file(s) *", type=["pdf"], accept_multiple_files=True)
 course_name = st.text_input("Course name *", placeholder="e.g., Level 5 Diploma in ...")
 unit_name = st.text_input("Unit name *", placeholder="e.g., Unit 1: Personal Development")
-qual_spec_file = st.file_uploader("Qualification specification file *", type=["pdf"], accept_multiple_files=False, key="qual_spec")
+qual_spec_file = st.file_uploader("Qualification specification file (optional)", type=["pdf"], accept_multiple_files=False, key="qual_spec")
 
 def compute_inputs_key(files: List[Any], course: str, unit: str = "", qual_file: Any = None) -> str:
     parts = [course.strip(), unit.strip()]
@@ -6353,9 +6353,6 @@ if suggest_clicked:
         if not (unit_name or "").strip():
             st.warning("Please enter the unit name.")
             st.stop()
-        if qual_spec_file is None:
-            st.warning("Please upload a qualification specification file.")
-            st.stop()
         if not os.environ.get("LLM_API_KEY"):
             st.error("Missing API key. Set LLM_API_KEY.")
             st.stop()
@@ -6364,14 +6361,17 @@ if suggest_clicked:
         _suggest_bar = suggest_progress_area.progress(0, text="Validating inputs...")
         time.sleep(0.3)
 
-        # Extract qualification spec text for LLM context
-        _suggest_bar.progress(10, text="Reading qualification specification...")
+        # Extract qualification spec text for LLM context (optional)
         qual_spec_text = ""
-        try:
-            qual_spec_chunks = extract_pdf_chunks_from_bytes(qual_spec_file.name, qual_spec_file.getvalue())
-            qual_spec_text = join_chunks_for_prompt(qual_spec_chunks, max_chars=30000)
-        except Exception:
-            st.warning("Could not extract text from qualification specification file. Proceeding without it.")
+        if qual_spec_file is not None:
+            _suggest_bar.progress(10, text="Reading qualification specification...")
+            try:
+                qual_spec_chunks = extract_pdf_chunks_from_bytes(qual_spec_file.name, qual_spec_file.getvalue())
+                qual_spec_text = join_chunks_for_prompt(qual_spec_chunks, max_chars=30000)
+            except Exception:
+                st.warning("Could not extract text from qualification specification file. Proceeding without it.")
+        else:
+            _suggest_bar.progress(10, text="No qualification specification uploaded — skipping...")
         st.session_state["qual_spec_text"] = qual_spec_text
 
         key = compute_inputs_key(uploads, course_name, unit_name, qual_spec_file)
