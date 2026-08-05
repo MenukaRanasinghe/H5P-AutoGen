@@ -1,2 +1,2 @@
-streamlit
-pypdf
+streamlit==1.46.1
+pypdf==5.8.0
