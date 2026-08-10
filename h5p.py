@@ -3554,52 +3554,93 @@ def make_dragtext_textfield(items: List[Dict[str, Any]]) -> str:
         for it in items
     ])
 
-# Set to True if you want clickable tip bubbles: *answer:tip*
-BLANKS_INCLUDE_HINT = False
-BLANKS_HINT_MAX_CHARS = 40
+# Append a plain-text hint in brackets after each sentence, e.g.
+#   "... and *active experimentation*. (It is the stage where one tests new ideas in practice.)"
+# Set to False to fall back to bare blanks (*answer*) with no hint.
+BLANKS_INCLUDE_HINT = True
+# Bracketed hints are visible full sentences, so allow a generous length.
+BLANKS_HINT_MAX_CHARS = 160
+
+
+def _clean_blank_hint(hint: str, answer: str = "") -> str:
+    """Normalise a hint for display as bracketed text after the sentence.
+
+    Asterisks would be re-parsed by H5P as blank markers, so they are
+    stripped. Any brackets the model already wrapped the hint in are removed
+    to avoid double parentheses. If the hint literally spells out the answer
+    it is dropped (a hint that gives the answer away is worse than none).
+    """
+    h = (hint or "").replace("*", "").strip()
+    # Drop brackets the model may have added so we don't double them up.
+    h = h.strip("()[]").strip()
+    h = re.sub(r"\s+", " ", h)
+    if not h:
+        return ""
+    a = (answer or "").strip()
+    if a and re.search(r"\b" + re.escape(a) + r"\b", h, flags=re.IGNORECASE):
+        return ""  # hint reveals the answer — skip it
+    if len(h) > BLANKS_HINT_MAX_CHARS:
+        h = h[:BLANKS_HINT_MAX_CHARS].rstrip() + "…"
+    return h
+
+
+def _append_blank_hint(text: str, hint: str, answer: str = "") -> str:
+    """Append a bracketed hint after the sentence, matching the editor format
+    '<sentence with *answer*>. (hint)'. Ensures the sentence ends with
+    terminal punctuation before the hint so it reads cleanly."""
+    if not BLANKS_INCLUDE_HINT:
+        return text
+    h = _clean_blank_hint(hint, answer)
+    if not h:
+        return text
+    s = text.rstrip()
+    if s and s[-1] not in ".!?":
+        s = s + "."
+    return f"{s} ({h})"
 
 
 def _make_blank_markup_with_hint(sentence: str, answer: str, hint: str = "") -> str:
     """Build H5P.Blanks markup for one sentence.
 
-    Produces *answer* by default. H5P only supports tips via the
-    *answer:tip* syntax — a hint placed outside the asterisks would render
-    as visible sentence text and give the answer away — so tips are opt-in
-    and truncated to stay readable in the editor.
+    Produces the answer as an in-place blank ``*answer*`` and, when a hint is
+    available, appends it in brackets after the sentence — e.g.
+    ``... and *active experimentation*. (It is the stage where one tests new
+    ideas in practice.)`` — matching the format used in the H5P editor.
+
+    The hint is placed *outside* the asterisks so it renders as a visible
+    clue rather than as the tooltip form ``*answer:tip*``. Hints that would
+    give the answer away are dropped in ``_clean_blank_hint``.
     """
     s = (sentence or "").strip()
     a = (answer or "").strip()
     if not s or not a:
         raise ValueError("Sentence and answer cannot be empty.")
 
-    # Colons/asterisks inside the answer or hint would corrupt the markup.
+    # Colons/asterisks inside the answer would corrupt the blank markup.
     a_clean = a.replace("*", "").replace(":", " ").strip()
     a_clean = re.sub(r"\s+", " ", a_clean)
 
     blank = f"*{a_clean}*"
-    if BLANKS_INCLUDE_HINT:
-        h_clean = (hint or "").replace("*", "").replace(":", " ").strip()
-        h_clean = re.sub(r"\s+", " ", h_clean)
-        if h_clean and len(h_clean) <= BLANKS_HINT_MAX_CHARS:
-            blank = f"*{a_clean}:{h_clean}*"
 
     # Prefer replacing an explicit blank marker (____ / [blank] / ... etc.)
     for bp in _BLANK_PATTERNS:
         if re.search(bp, s):
-            return re.sub(bp, blank, s, count=1)
+            marked = re.sub(bp, blank, s, count=1)
+            return _append_blank_hint(marked, hint, a_clean)
 
     # Otherwise blank out the first occurrence of the answer itself.
     new_s, n = re.subn(r"\b" + re.escape(a_clean) + r"\b", blank, s, count=1)
     if n:
-        return new_s
+        return _append_blank_hint(new_s, hint, a_clean)
 
     # Case-insensitive retry before falling back to appending.
     new_s, n = re.subn(r"\b" + re.escape(a_clean) + r"\b", blank, s,
                        count=1, flags=re.IGNORECASE)
     if n:
-        return new_s
+        return _append_blank_hint(new_s, hint, a_clean)
 
-    return f"{s} ({blank})"
+    # Answer not found in the sentence: append the blank so the item survives.
+    return _append_blank_hint(f"{s} ({blank})", hint, a_clean)
 
 _BLANK_ANSWER_MAX_WORDS = 2
 _BLANK_ANSWER_BAD_WORDS = {"and", "or", "the", "a", "an", "of", "to", "at", "in", "etc"}
@@ -3669,6 +3710,15 @@ def _mark_word_in_sentence(sentence: str, word: str) -> Optional[str]:
     m = re.search(r"\b" + re.escape(best) + r"\b", s)
     return s[:m.start()] + f"*{m.group(0)}*" + s[m.end():]
 
+# Append the same bracketed hint used by Fill in the Blanks after each
+# Mark the Words sentence, e.g.
+#   "... and *equity*. (This is the other main source of capital besides debt.)"
+# NOTE: in H5P.MarkTheWords every word in the textField is selectable, so the
+# words inside the hint are clickable too (harmless distractors — not correct
+# answers). Set to False to revert to bare marked sentences.
+MARK_WORDS_INCLUDE_HINT = True
+
+
 def make_mark_words_textfield(items: List[Dict[str, Any]], target_n: Optional[int] = None) -> str:
     # Rank by PDF grounding, but keep target_n items so the count is honoured.
     items = _filter_grounded_items(
@@ -3680,6 +3730,7 @@ def make_mark_words_textfield(items: List[Dict[str, Any]], target_n: Optional[in
     for it in items:
         sentence = (it.get("sentence") or it.get("paragraph") or "").strip()
         marked_word = (it.get("marked_word") or "").strip()
+        hint = (it.get("hint") or "").strip()
         if not sentence:
             continue
 
@@ -3689,8 +3740,20 @@ def make_mark_words_textfield(items: List[Dict[str, Any]], target_n: Optional[in
         if not sentence_marked:
             continue
 
-        # No numbering prefix and no inline hint — in MarkTheWords every word
-        # in the textField is clickable, so both polluted the activity.
+        # Append a bracketed hint after the sentence (matching Fill in the
+        # Blanks). Guard against the word that was ACTUALLY marked so the hint
+        # never gives the answer away. Every word in a MarkTheWords textField
+        # is clickable, so the hint words become harmless distractors.
+        if MARK_WORDS_INCLUDE_HINT and hint:
+            m = re.search(r"\*([^*]+)\*", sentence_marked)
+            actual_word = m.group(1) if m else marked_word
+            h = _clean_blank_hint(hint, actual_word)
+            if h:
+                s = sentence_marked.rstrip()
+                if s and s[-1] not in ".!?":
+                    s = s + "."
+                sentence_marked = f"{s} ({h})"
+
         lines.append(sentence_marked)
 
     return "<br><br>".join(lines)
