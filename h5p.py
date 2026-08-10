@@ -6580,6 +6580,13 @@ def write_qa_report_html(path: str, title: str, activity_type: str, qa_items: Li
         quote = (ev.get("quote") or "").strip()
         expected = (it.get("expected") or "").strip()
         content = (it.get("content") or "").strip()
+        # For True/False items the expected answer is the boolean word
+        # ("True"/"False"), which never appears literally in the source PDF.
+        # Checking the literal word against the quote would always fail, so
+        # fall back to verifying that the statement content is supported by
+        # the quote instead.
+        if expected and expected.lower() in ("true", "false"):
+            return "Match" if content_supported(content, quote) else "Needs review"
         if expected:
             return "Match" if expected_in_quote(expected, quote) else "No match"
         return "Match" if content_supported(content, quote) else "Needs review"
